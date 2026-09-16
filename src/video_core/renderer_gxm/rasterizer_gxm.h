@@ -4,92 +4,144 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+#include <vector>
+#include <psp2/gxm.h>
+#include "common/common_types.h"
+#include "video_core/pica/output_vertex.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_gxm/gxm_memory.h"
+
+namespace Memory {
+class MemorySystem;
+}
+
+namespace Pica {
+class PicaCore;
+struct RegsInternal;
+} // namespace Pica
 
 namespace Gxm {
 
 /**
  * Rasterizador del backend GXM.
  *
- * FASE 2: este objeto todavia no rasteriza nada. Reenvia entera su interfaz al
- * rasterizador por software que vive dentro de RendererGXM, para que la PICA se
- * siga emulando exactamente igual que hasta ahora mientras cambia el camino de
- * presentacion. Es lo que el plan llamaba "DrawTriangles puede delegar de
- * momento".
+ * FASE 3, PRIMER TRAMO. La PICA sigue ejecutando su shader de vertices en la
+ * CPU (el interprete de siempre); lo que se lleva a la GPU es el RASTERIZADO Y
+ * EL SOMBREADO DE FRAGMENTOS: los triangulos que salen del pipeline de
+ * geometria se acumulan, se suben a un buffer de vertices y se dibujan con
+ * sceGxmDraw usando el shader de fragmentos generado en Cg para la
+ * configuracion TEV vigente.
  *
- * POR QUE EXISTE EN VEZ DE DEVOLVER DIRECTAMENTE EL DE SOFTWARE.
+ * COMO ENCAJA SIN TOCAR EL CAMINO DE SOFTWARE. DrawArrays, cuando no puede
+ * acelerar el lote entero, ejecuta el shader de vertices por software y llama
+ * a AddTriangle por triangulo; este rasterizador NO dibuja en ese momento, solo
+ * apunta el triangulo. En DrawTriangles decide: si la configuracion esta
+ * soportada, sube el lote a GXM y lo dibuja de una vez; si no, lo reenvia al
+ * rasterizador de software (que rasteriza al vuelo), que sigue siendo la
+ * referencia de correccion. Antes de dejar que el software toque memoria o
+ * estado, la escena GXM se cierra y se vuelca.
  *
- * Porque la PICA ata su rasterizador UNA vez, al arrancar el emulador
- * (PicaCore::BindRasterizer), y a partir de ahi todo pasa por ese puntero. Si el
- * backend GXM devolviese el de software, la Fase 3 tendria que cambiar por
- * dentro el rasterizador de software -- que es la referencia de correccion y no
- * se toca -- o reconstruir la PICA entera. Con esta capa, la Fase 3 sustituye
- * metodo a metodo (DrawTriangles primero, luego los aceleradores, ver abajo)
- * sin que nada de fuera se entere.
- *
- * QUE DELEGA HOY Y QUE NO.
- *
- * Todo lo obligatorio (triangulos, vaciados y invalidaciones de cache) se
- * reenvia tal cual. Los aceleradores -- AccelerateDisplayTransfer, AccelerateFill
- * y AccelerateDrawBatch -- NO se sobrescriben a proposito: se quedan con el
- * "false" de la interfaz, que es lo que manda el trabajo al blitter de software.
- * Cuando la Fase 3 sepa hacerlos en el chip, se anaden aqui uno a uno y el
- * camino de software se queda como red de seguridad.
- *
- * SetAccurateMul SI se reenvia, y por eso en la interfaz es virtual: sin eso,
- * una llamada a traves de un RasterizerInterface* iria a la version base y
- * activaria la multiplicacion exacta en ESTE objeto en vez de en el que de
- * verdad sombrea, dejando al rasterizador de software con el valor contrario al
- * que pide el juego. Ver rasterizer_interface.h.
+ * QUE NO SOPORTA TODAVIA (cae a software, por tanto correcto pero sin ganancia):
+ * texturas en el shader (falta el cache de texturas), framebuffers que no sean
+ * RGBA8 (el volcado al invitado necesita copia byte a byte), iluminacion,
+ * niebla, texturas procedurales, shadow maps, scissor, W-buffering, y logic op.
  */
 class RasterizerGXM final : public VideoCore::RasterizerInterface {
 public:
-    explicit RasterizerGXM(VideoCore::RasterizerInterface& delegate_) : delegate{delegate_} {}
+    RasterizerGXM(VideoCore::RasterizerInterface& software_, Memory::MemorySystem& memory_,
+                  Pica::PicaCore& pica_);
+    ~RasterizerGXM() override;
 
     void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
-                     const Pica::OutputVertex& v2) override {
-        delegate.AddTriangle(v0, v1, v2);
-    }
+                     const Pica::OutputVertex& v2) override;
+    void DrawTriangles() override;
 
-    void DrawTriangles() override {
-        delegate.DrawTriangles();
-    }
-
-    void FlushAll() override {
-        delegate.FlushAll();
-    }
-
-    void FlushRegion(PAddr addr, u32 size) override {
-        delegate.FlushRegion(addr, size);
-    }
-
-    void InvalidateRegion(PAddr addr, u32 size) override {
-        delegate.InvalidateRegion(addr, size);
-    }
-
-    void FlushAndInvalidateRegion(PAddr addr, u32 size) override {
-        delegate.FlushAndInvalidateRegion(addr, size);
-    }
-
-    void ClearAll(bool flush) override {
-        delegate.ClearAll(flush);
-    }
+    void FlushAll() override;
+    void FlushRegion(PAddr addr, u32 size) override;
+    void InvalidateRegion(PAddr addr, u32 size) override;
+    void FlushAndInvalidateRegion(PAddr addr, u32 size) override;
+    void ClearAll(bool flush) override;
 
     void SetAccurateMul(bool accurate_mul) override {
-        delegate.SetAccurateMul(accurate_mul);
+        software.SetAccurateMul(accurate_mul);
     }
 
     void LoadDefaultDiskResources(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) override {
-        delegate.LoadDefaultDiskResources(stop_loading, callback);
+        software.LoadDefaultDiskResources(stop_loading, callback);
     }
 
     void SwitchDiskResources(u64 title_id) override {
-        delegate.SwitchDiskResources(title_id);
+        software.SwitchDiskResources(title_id);
+    }
+
+    /**
+     * Cierra la escena abierta y vuelca a memoria del invitado todo lo sucio.
+     * Lo llama RendererGXM::SwapBuffers antes de que el renderer de software
+     * lea los framebuffers, y cualquier operacion que vaya a tocar la memoria
+     * o a mandar trabajo por otro camino.
+     */
+    void FlushPending();
+
+    /// Triangulos dibujados por la GPU en el intervalo, para el overlay.
+    static std::atomic<u32> gpu_triangles;
+    /// Triangulos que han caido al rasterizador de software.
+    static std::atomic<u32> software_triangles;
+
+    static void ResetCounters() {
+        gpu_triangles.store(0, std::memory_order_relaxed);
+        software_triangles.store(0, std::memory_order_relaxed);
     }
 
 private:
-    VideoCore::RasterizerInterface& delegate;
+    struct Surface;
+    struct PipelineCache;
+
+    /// Pesquisa un pipeline (y compila el shader si es la primera vez).
+    /// Devuelve nullptr si la configuracion no esta soportada.
+    const PipelineCache* GetPipeline();
+
+    /// Sube el lote y lo dibuja. Devuelve false si no se ha podido.
+    bool DrawBatchOnGpu();
+
+    /// La superficie de dibujado que pide el estado actual, creada si hace
+    /// falta. nullptr si no se puede (formato no soportado, sin memoria).
+    Surface* CurrentSurface();
+
+    /// Cierra la escena GXM si hay una abierta.
+    void EndScene();
+
+    bool EnsureInitialized();
+    void Release();
+
+    VideoCore::RasterizerInterface& software;
+    Memory::MemorySystem& memory;
+    Pica::PicaCore& pica;
+
+    bool initialized = false;
+    bool available = false;
+    const char* status = "sin inicializar";
+    SceGxmContext* context = nullptr;
+    SceGxmShaderPatcher* patcher = nullptr;
+
+    std::unique_ptr<PipelineCache> pipelines;
+    std::vector<std::unique_ptr<Surface>> surfaces;
+    Surface* open_surface = nullptr;
+
+    /// Vertices del lote en curso, en el formato de la CPU del invitado.
+    std::vector<Pica::OutputVertex> batch;
+    /// Decision de soporte para el lote en curso: se toma al primer triangulo.
+    bool batch_decided = false;
+    bool batch_on_gpu = false;
+
+    /// Buffer de vertices mapeado para la GPU (crece cuando hace falta) y su
+    /// buffer de indices secuenciales.
+    Allocation vertex_buffer;
+    Allocation index_buffer;
+    u32 vertex_capacity = 0;
+    u32 index_capacity = 0;
 };
 
 } // namespace Gxm

@@ -129,6 +129,7 @@ if (ENABLE_SOFTWARE_RENDERER)
             renderer_gxm/gxm_pica_format.h
             renderer_gxm/gxm_presenter.cpp
             renderer_gxm/gxm_presenter.h
+            renderer_gxm/rasterizer_gxm.cpp
             renderer_gxm/rasterizer_gxm.h
             renderer_gxm/renderer_gxm.cpp
             renderer_gxm/renderer_gxm.h

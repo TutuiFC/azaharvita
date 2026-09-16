@@ -62,12 +62,12 @@ public:
 
 private:
     /// El camino de software completo: rasterizado, caches, salto de fotogramas
-    /// y el EndFrame que acaba llamando al frontend. Ver el comentario de la
-    /// clase.
+    /// y el EndFrame que acaba llamando al frontend. Ademas es la referencia de
+    /// correccion a la que cae el rasterizador GXM con lo que aun no soporta.
     SwRenderer::RendererSoftware software;
 
-    /// La interfaz que se le da a la PICA. Reenvia todo a software.Rasterizer();
-    /// ver rasterizer_gxm.h para el porque de la capa.
+    /// El rasterizador de la GPU: acumula los triangulos que salen del pipeline
+    /// de geometria y los dibuja con sceGxmDraw. Ver rasterizer_gxm.h.
     RasterizerGXM rasterizer;
 };
 
