@@ -19,6 +19,7 @@
 #include "video_core/pica/regs_framebuffer.h"
 #include "video_core/pica/regs_rasterizer.h"
 #include "video_core/pica_types.h"
+#include "video_core/renderer_gxm/gxm_texture_cache.h"
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
 
 namespace Gxm {
@@ -283,6 +284,7 @@ struct RasterizerGXM::PipelineCache {
         const SceGxmProgramParameter* combiner_buffer_color = nullptr;
         const SceGxmProgramParameter* alphatest_ref = nullptr;
         const SceGxmProgramParameter* samplers[3] = {nullptr, nullptr, nullptr};
+        u8 sampler_units[3] = {0, 0, 0};
         const SceShaccCgCompileOutput* output = nullptr;
         SceGxmShaderPatcherId id{};
         bool registered = false;
@@ -408,6 +410,12 @@ struct RasterizerGXM::PipelineCache {
         entry->samplers[0] = sceGxmProgramFindParameterByName(gxp, "tex0");
         entry->samplers[1] = sceGxmProgramFindParameterByName(gxp, "tex1");
         entry->samplers[2] = sceGxmProgramFindParameterByName(gxp, "tex2");
+        for (u32 i = 0; i < 3; i++) {
+            entry->sampler_units[i] =
+                entry->samplers[i] != nullptr
+                    ? static_cast<u8>(sceGxmProgramParameterGetResourceIndex(entry->samplers[i]))
+                    : 0;
+        }
 
         const Entry* result = entry.get();
         entries.emplace(key, std::move(entry));
@@ -492,6 +500,7 @@ RasterizerGXM::RasterizerGXM(VideoCore::RasterizerInterface& software_, Memory::
 
 RasterizerGXM::~RasterizerGXM() {
     FlushPending();
+    textures.reset();
     pipelines.reset();
     surfaces.clear();
     vertex_buffer = Allocation{};
@@ -519,6 +528,7 @@ bool RasterizerGXM::EnsureInitialized() {
         pipelines.reset();
         return false;
     }
+    textures = std::make_unique<TextureCache>();
     available = true;
     status = "gxm";
     LOG_INFO(Render, "GXM: rasterizador de la GPU listo (shaders compilados en runtime)");
@@ -673,9 +683,9 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
         batch_decided = true;
         batch_on_gpu = false;
         if (EnsureInitialized()) {
-            // Con texturas todavia no hay cache, asi que un shader que las
-            // muestree se queda en el camino de software. Igual con scissor o
-            // W-buffering, que el contexto GXM aun no reproduce.
+            // Lo que aun no reproduce el contexto GXM (scissor, W-buffering) o
+            // el generador (iluminacion, niebla, proctex...) manda el lote al
+            // camino de software. Las texturas ya no: las sirve el cache.
             Pica::Shader::FSConfig config{pica.regs.internal};
             config.ApplyProfile(Pica::Shader::Profile{});
             const auto source = Pica::Shader::Generator::GXM::GenerateFragmentShader(config);
@@ -683,22 +693,7 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
                                  RasterizerRegs::ScissorMode::Disabled;
             const bool wbuffering = pica.regs.internal.rasterizer.depthmap_enable ==
                                     RasterizerRegs::DepthBuffering::WBuffering;
-            bool samples_texture = false;
-            if (source.has_value()) {
-                for (const auto& stage : config.texture.tev_stages) {
-                    const Pica::TexturingRegs::TevStageConfig tev = stage;
-                    for (const auto src : {tev.color_source1.Value(), tev.color_source2.Value(),
-                                           tev.color_source3.Value(), tev.alpha_source1.Value(),
-                                           tev.alpha_source2.Value(), tev.alpha_source3.Value()}) {
-                        const auto value = static_cast<u32>(src);
-                        if (value >= static_cast<u32>(Pica::TexturingRegs::TevStageConfig::Source::Texture0) &&
-                            value <= static_cast<u32>(Pica::TexturingRegs::TevStageConfig::Source::Texture3)) {
-                            samples_texture = true;
-                        }
-                    }
-                }
-            }
-            batch_on_gpu = source.has_value() && !scissor && !wbuffering && !samples_texture;
+            batch_on_gpu = source.has_value() && !scissor && !wbuffering;
         }
         if (batch_on_gpu && CurrentSurface() == nullptr) {
             batch_on_gpu = false;
@@ -829,6 +824,20 @@ bool RasterizerGXM::DrawBatchOnGpu() {
     sceGxmSetFragmentProgram(context, pipeline->program);
     sceGxmSetVertexStream(context, 0, vertex_buffer.Data());
 
+    // Texturas: por cada sampler que el shader use de verdad, su unidad. Si
+    // alguna no se puede servir (formato, borde, unidad apagada...), el lote
+    // entero vuelve a software desde DrawTriangles.
+    for (u32 i = 0; i < 3; i++) {
+        if (pipeline->samplers[i] == nullptr) {
+            continue;
+        }
+        const SceGxmTexture* texture = textures->Get(i, pica.regs.internal, memory);
+        if (texture == nullptr) {
+            return false;
+        }
+        sceGxmSetFragmentTexture(context, pipeline->sampler_units[i], texture);
+    }
+
     // Uniforms. Los que el compilador haya eliminado no existen como parametro
     // y se saltan; los samplers quedan para cuando exista el cache de texturas.
     void* uniform_buffer = nullptr;
@@ -903,21 +912,27 @@ void RasterizerGXM::FlushAll() {
 
 void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
     FlushPending();
+    textures->InvalidateRange(addr, size);
     software.FlushRegion(addr, size);
 }
 
 void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
     FlushPending();
+    textures->InvalidateRange(addr, size);
     software.InvalidateRegion(addr, size);
 }
 
 void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
     FlushPending();
+    textures->InvalidateRange(addr, size);
     software.FlushAndInvalidateRegion(addr, size);
 }
 
 void RasterizerGXM::ClearAll(bool flush) {
     FlushPending();
+    if (textures != nullptr) {
+        textures->Clear();
+    }
     software.ClearAll(flush);
 }
 

@@ -182,6 +182,12 @@ private:
     /// Porcentaje del fotograma en presentar (swap de vita2d incluido).
     double stats_swap_percent = 0.0;
 
+    /// Triangulos del intervalo que ha rasterizado la GPU y cuantos han caido
+    /// al rasterizador de software. Es la medida que dice si el camino nuevo
+    /// esta cubriendo la escena o solo un trozo.
+    unsigned int stats_tri_gpu = 0;
+    unsigned int stats_tri_sw = 0;
+
     /**
      * El mismo reparto, pero en MILISEGUNDOS POR FOTOGRAMA.
      *

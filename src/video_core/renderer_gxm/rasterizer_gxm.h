@@ -24,6 +24,8 @@ struct RegsInternal;
 
 namespace Gxm {
 
+class TextureCache;
+
 /**
  * Rasterizador del backend GXM.
  *
@@ -127,6 +129,7 @@ private:
     SceGxmShaderPatcher* patcher = nullptr;
 
     std::unique_ptr<PipelineCache> pipelines;
+    std::unique_ptr<TextureCache> textures;
     std::vector<std::unique_ptr<Surface>> surfaces;
     Surface* open_surface = nullptr;
 

@@ -554,6 +554,13 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             Common::FrameStats::Reset();
         }
 
+        // Los contadores del rasterizador de la GPU y los del software se
+        // vacian aqui, una vez por intervalo, para que la linea diga la
+        // proporcion del ultimo segundo.
+        stats_tri_gpu = Gxm::RasterizerGXM::gpu_triangles.exchange(0, std::memory_order_relaxed);
+        stats_tri_sw =
+            Gxm::RasterizerGXM::software_triangles.exchange(0, std::memory_order_relaxed);
+
         // Reparto del tiempo del rasterizador por triangulo: cuanto se va en
         // preparar cada triangulo, cuanto en el tramo paralelo y cuanto
         // rasterizando el triangulo entero en el propio hilo (los pequenos).
@@ -1033,6 +1040,20 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     std::size_t noc = 0;
     append_labeled_percent(line_occ, noc, "ocu ", stats_occupancy_percent);
     append_labeled_percent(line_occ, noc, "  ras ", stats_raster_share_percent);
+    {
+        // tg = triangulos del intervalo en la GPU; ts = los que han caido al
+        // software. Si ts manda, lo que falta no es optimizar: es cobertura.
+        const char* gpu_label = "  tg ";
+        for (std::size_t i = 0; gpu_label[i] != '\0'; i++) {
+            line_occ[noc++] = gpu_label[i];
+        }
+        noc += AppendUInt(line_occ + noc, stats_tri_gpu);
+        const char* sw_label = " ts ";
+        for (std::size_t i = 0; sw_label[i] != '\0'; i++) {
+            line_occ[noc++] = sw_label[i];
+        }
+        noc += AppendUInt(line_occ + noc, stats_tri_sw);
+    }
     line_occ[noc] = '\0';
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 452, 0xFF80D0FF, 0.8f, line_occ);
 
