@@ -49,6 +49,7 @@ namespace Pica::Shader::Generator::GXM {
  * y los uniforms const_color[6], tev_combiner_buffer_color, alphatest_ref y
  * los samplers tex0-tex2.
  */
-std::optional<std::string> GenerateFragmentShader(const FSConfig& config);
+std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
+                                                  const char** out_reason = nullptr);
 
 } // namespace Pica::Shader::Generator::GXM

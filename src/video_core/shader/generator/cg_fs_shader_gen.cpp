@@ -27,36 +27,39 @@ using Operation = TexturingRegs::TevStageConfig::Operation;
  * dejar al hardware: se generan en la shader tal cual hace el de GLSL. Lo que
  * este backend NO puede hacer todavia se rechaza antes de generar una linea.
  */
-bool IsSupported(const FSConfig& config) {
+bool IsSupported(const FSConfig& config, const char** out_reason) {
+    const auto reject = [out_reason](const char* reason) {
+        if (out_reason != nullptr) {
+            *out_reason = reason;
+        }
+        return false;
+    };
     // Iluminacion: exige los LUTs de la PICA, el vector normal y el ojo, y esta
     // fuera del primer tramo de la fase.
     if (config.lighting.enable || config.lighting.enable_shadow) {
-        return false;
+        return reject("iluminacion");
     }
     // Texturas procedurales: necesitan noise y LUTs de la PICA.
     if (config.proctex.enable) {
-        return false;
+        return reject("proctex");
     }
     // Shadow maps: necesita una pasada y el muestreo de la sombra.
     if (config.framebuffer.shadow_rendering || config.texture.shadow_texture_orthographic) {
-        return false;
+        return reject("shadow");
     }
-    // Niebla: el color sale de una LUT de 128 entradas que aun no se sube.
-    // FogMode tiene siete valores y solo Fog (5) y Gas (7) pintan algo; Gas
-    // esta sin implementar hasta en el de GLSL.
-    if (config.texture.fog_mode == TexturingRegs::FogMode::Fog ||
-        config.texture.fog_mode == TexturingRegs::FogMode::Gas) {
-        return false;
+    // Gas está sin implementar hasta en el de GLSL; Fog si está soportada.
+    if (config.texture.fog_mode == TexturingRegs::FogMode::Gas) {
+        return reject("fog gas");
     }
     // Modos de textura: solo 2D y "apagada". Proyeccion, cubo y sombra llevan
     // otra matematica de coordenadas.
     const auto texture0_type = config.texture.texture0_type.Value();
     if (texture0_type != TexturingRegs::TextureConfig::Texture2D &&
         texture0_type != TexturingRegs::TextureConfig::Disabled) {
-        return false;
+        return reject("tipo de textura 0");
     }
     if (config.texture.texture2_use_coord1) {
-        return false;
+        return reject("textura 2 con coord 1");
     }
     return true;
 }
@@ -64,10 +67,11 @@ bool IsSupported(const FSConfig& config) {
 /// Emite el Cg de una configuracion, o deja el motivo del rechazo en el LOG.
 class FragmentWriter {
 public:
-    explicit FragmentWriter(const FSConfig& config_) : config{config_} {}
+    explicit FragmentWriter(const FSConfig& config_, const char** reason_)
+        : config{config_}, reason{reason_} {}
 
     std::optional<std::string> Generate() {
-        if (!IsSupported(config)) {
+        if (!IsSupported(config, reason)) {
             LOG_DEBUG(Render, "GXM FS: configuracion no soportada todavia; se cae a software");
             return std::nullopt;
         }
@@ -92,8 +96,11 @@ public:
         WriteInterface();
         WriteUniforms();
 
+        // gl_FragCoord (WPOS) da la profundidad de ventana, que con nuestro
+        // viewport ya es exactamente la de la PICA; la necesita la niebla.
         out += "void main(float4 primary_color : COLOR0, float2 tc0 : TEXCOORD0, "
                "float2 tc1 : TEXCOORD1, float2 tc2 : TEXCOORD2, "
+               "float4 gl_FragCoord : WPOS, "
                "out float4 gl_FragColor : COLOR)\n{\n";
 
         // La PICA redondea el color primario a 8 bits antes de meterlo en la
@@ -117,6 +124,25 @@ public:
         }
 
         WriteAlphaTestCondition(config.framebuffer.alpha_test_func);
+
+        // Niebla: el factor sale de la LUT de 128 entradas (dos floats por
+        // entrada: valor y pendiente) indexada por la profundidad; el color es
+        // el registro de niebla. Misma matematica que el generador de GLSL.
+        if (config.texture.fog_mode == TexturingRegs::FogMode::Fog) {
+            if (config.texture.fog_flip) {
+                out += "    float fog_index = (1.0 - clamp(gl_FragCoord.z, 0.0, 1.0)) * 128.0;\n";
+            } else {
+                out += "    float fog_index = clamp(gl_FragCoord.z, 0.0, 1.0) * 128.0;\n";
+            }
+            out += "    float fog_i = clamp(floor(fog_index), 0.0, 127.0);\n";
+            out += "    float fog_f = fog_index - fog_i;\n";
+            out += "    int fog_ii = int(fog_i);\n";
+            out += "    float fog_factor = fog_lut[fog_ii * 2] + fog_lut[fog_ii * 2 + 1] * "
+                   "fog_f;\n";
+            out += "    fog_factor = clamp(fog_factor, 0.0, 1.0);\n";
+            out += "    combiner_output.rgb = lerp(fog_color, combiner_output.rgb, "
+                   "fog_factor);\n";
+        }
 
         // El redondeo final: la PICA escribe siempre 8 bits por canal.
         out += "    combiner_output = byteround(combiner_output);\n";
@@ -200,6 +226,10 @@ private:
         }
         if (config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always) {
             out += "uniform float alphatest_ref;\n";
+        }
+        if (config.texture.fog_mode == TexturingRegs::FogMode::Fog) {
+            out += "uniform float fog_lut[256];\n";
+            out += "uniform float3 fog_color;\n";
         }
         out += "\n";
     }
@@ -453,6 +483,7 @@ private:
     }
 
     const FSConfig& config;
+    const char** reason = nullptr;
     std::string out;
     bool uses_tex0 = false;
     bool uses_tex1 = false;
@@ -463,8 +494,9 @@ private:
 
 } // Anonymous namespace
 
-std::optional<std::string> GenerateFragmentShader(const FSConfig& config) {
-    FragmentWriter writer{config};
+std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
+                                                  const char** out_reason) {
+    FragmentWriter writer{config, out_reason};
     return writer.Generate();
 }
 

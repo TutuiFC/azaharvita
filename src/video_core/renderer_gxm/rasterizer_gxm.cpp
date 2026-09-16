@@ -274,6 +274,8 @@ struct RasterizerGXM::PipelineCache {
         const SceGxmProgramParameter* alphatest_ref = nullptr;
         const SceGxmProgramParameter* samplers[3] = {nullptr, nullptr, nullptr};
         u8 sampler_units[3] = {0, 0, 0};
+        const SceGxmProgramParameter* fog_lut = nullptr;
+        const SceGxmProgramParameter* fog_color = nullptr;
         const SceShaccCgCompileOutput* output = nullptr;
         SceGxmShaderPatcherId id{};
         bool registered = false;
@@ -399,6 +401,8 @@ struct RasterizerGXM::PipelineCache {
         entry->samplers[0] = sceGxmProgramFindParameterByName(gxp, "tex0");
         entry->samplers[1] = sceGxmProgramFindParameterByName(gxp, "tex1");
         entry->samplers[2] = sceGxmProgramFindParameterByName(gxp, "tex2");
+        entry->fog_lut = sceGxmProgramFindParameterByName(gxp, "fog_lut");
+        entry->fog_color = sceGxmProgramFindParameterByName(gxp, "fog_color");
         for (u32 i = 0; i < 3; i++) {
             entry->sampler_units[i] =
                 entry->samplers[i] != nullptr
@@ -792,15 +796,21 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
             // camino de software. Las texturas ya no: las sirve el cache.
             Pica::Shader::FSConfig config{pica.regs.internal};
             config.ApplyProfile(Pica::Shader::Profile{});
-            const auto source = Pica::Shader::Generator::GXM::GenerateFragmentShader(config);
+            const char* reason = nullptr;
+            const auto source =
+                Pica::Shader::Generator::GXM::GenerateFragmentShader(config, &reason);
             const bool scissor = pica.regs.internal.rasterizer.scissor_test.mode !=
                                  RasterizerRegs::ScissorMode::Disabled;
             const bool wbuffering = pica.regs.internal.rasterizer.depthmap_enable ==
                                     RasterizerRegs::DepthBuffering::WBuffering;
             batch_on_gpu = source.has_value() && !scissor && !wbuffering;
             if (!batch_on_gpu) {
+                // El motivo concreto (iluminacion, proctex, ...) va a crash.txt:
+                // sin el, "skip: shader" no distingue entre causas.
                 NoteSkip(scissor ? 0 : (wbuffering ? 1 : 2),
-                         scissor ? "scissor" : (wbuffering ? "wbuffer" : "shader"));
+                         scissor ? "scissor"
+                                 : (wbuffering ? "wbuffer"
+                                               : (reason != nullptr ? reason : "shader")));
             }
         }
         if (batch_on_gpu && CurrentSurface() == nullptr) {
@@ -980,6 +990,24 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         if (pipeline->alphatest_ref != nullptr) {
             const f32 reference = static_cast<f32>(merger.alpha_test.ref);
             sceGxmSetUniformDataF(uniform_buffer, pipeline->alphatest_ref, 0, 1, &reference);
+        }
+        if (pipeline->fog_lut != nullptr) {
+            // 128 entradas de dos floats: valor y pendiente (misma LUT que usa
+            // el rasterizador de software, leida como 16 bits sin signo).
+            f32 lut[256];
+            for (u32 i = 0; i < 128; i++) {
+                const u32 raw = pica.fog.lut[i].raw;
+                lut[i * 2] = static_cast<f32>(raw & 0xFFFF) / 65535.0f;
+                lut[i * 2 + 1] = static_cast<f32>(raw >> 16) / 65535.0f;
+            }
+            sceGxmSetUniformDataF(uniform_buffer, pipeline->fog_lut, 0, 256, lut);
+        }
+        if (pipeline->fog_color != nullptr) {
+            const auto& fog = pica.regs.internal.texturing.fog_color;
+            const f32 color[4] = {static_cast<f32>(fog.r) / 255.0f,
+                                  static_cast<f32>(fog.g) / 255.0f,
+                                  static_cast<f32>(fog.b) / 255.0f, 1.0f};
+            sceGxmSetUniformDataF(uniform_buffer, pipeline->fog_color, 0, 3, color);
         }
     }
 
