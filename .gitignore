@@ -1,0 +1,17 @@
+# Salida del build cruzado — se regenera con ./build.sh
+build/
+
+# ELFs archivados por versión (ver build.sh) — pesan varios MB cada uno
+# y crash.txt solo necesita el que coincide con la version en consola,
+# no el historial completo dentro del repositorio.
+elf/
+
+# Binarios finales
+*.vpk
+*.elf
+*.self
+
+# Windows / editor
+Thumbs.db
+.vs/
+*.user
