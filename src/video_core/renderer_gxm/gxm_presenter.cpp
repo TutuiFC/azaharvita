@@ -310,11 +310,11 @@ void ScreenPresenter::Release() {
         sceShaccCgDestroyCompileOutput(fragment_output);
         fragment_output = nullptr;
     }
-    if (module_id >= 0) {
-        sceShaccCgReleaseCompiler();
-        sceKernelStopUnloadModule(module_id, 0, nullptr, 0, nullptr, nullptr);
-        module_id = -1;
-    }
+    // El modulo del compilador NO se descarga aqui: es estado global del
+    // proceso y el rasterizador de la GPU puede tener programas compilados con
+    // el vivos. Descargarlo o soltar el compilador invalidaria esa memoria y
+    // el fallo apareceria mucho despues, al dibujar. Lo que si se sueltan son
+    // los programas que son de este objeto (arriba).
 }
 
 const SceShaccCgCompileOutput* ScreenPresenter::CompileShader(SceShaccCgTargetProfile profile,
