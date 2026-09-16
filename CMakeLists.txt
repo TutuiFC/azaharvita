@@ -70,6 +70,14 @@ set(CITRA_WARNINGS_AS_ERRORS      OFF)
 # ---------------------------------------------------------------------------
 # Presupuesto de memoria
 # ---------------------------------------------------------------------------
+# AL DIA DE HOY el presupuesto que se pide es el AMPLIADO: src/citra_vita pone
+# ATTRIBUTE2=12 en el param.sfo (opcion AZAHAR_EXTENDED_MEMORY, ahora ON), que
+# sube la RAM de usuario de ~256 MB a ~365 MB. Lo de abajo describe el reparto
+# dentro del presupuesto NORMAL a proposito: mientras no haya una medida hecha
+# en consola del presupuesto ampliado, las cuentas se siguen haciendo contra los
+# 256 MB y lo que el atributo conceda de mas es colchon, no gasto planificado.
+# Ver la nota "Que hacer con los ~110 MB del modo ampliado" al final del bloque.
+#
 # Una aplicacion de Vita dispone de unos 256 MB de RAM de usuario, y ahi tiene
 # que caber TODO:
 #
@@ -97,7 +105,33 @@ set(CITRA_WARNINGS_AS_ERRORS      OFF)
 # es el mismo presupuesto repartido mejor. Si "cap" empieza a subir en el
 # overlay, es que 8 MB se han quedado cortos; vaciar la cache no rompe nada,
 # solo obliga a retraducir, pero conviene saberlo.
-set(AZAHAR_HEAP_MB "192" CACHE STRING "Tamano del heap de la aplicacion en MB")
+#
+# QUE HACER CON LOS ~110 MB DEL MODO AMPLIADO
+#
+# El heap sube de 192 a 216 MB, y ni un mega mas por ahora. El motivo es que un
+# presupuesto corto NO da ningun error legible: la consola se niega a lanzar la
+# aplicacion y no dice por que. Con 216 MB la suma sigue cabiendo en los 256 MB
+# del presupuesto NORMAL (216 + ~15 del binario + ~16 de GXM/vita2d + ~5 de
+# pilas = ~252), asi que este VPK arranca EN LOS TRES ESCENARIOS posibles del
+# atributo nuevo:
+#
+#   - el firmware lo acepta      -> presupuesto ~365 MB, sobran ~113
+#   - el firmware lo ignora      -> presupuesto ~256 MB, sobran ~4: arranca igual
+#   - el firmware lo rechaza     -> no arranca, y entonces la causa es el
+#                                   atributo y solo el atributo (ver abajo)
+#
+# Subir el heap a 288 MB -- que es lo que pedia el README, y lo que hace falta
+# para el modo New 3DS -- ata el arranque a que el atributo funcione, y eso no
+# se puede afirmar sin probarlo en la consola del usuario. El paso siguiente es
+# arrancar este VPK, leer en la pantalla de arranque la linea "mem usuario libre
+# ... (modo ampliado ...)" y, con ESE numero, decidir el reparto definitivo.
+# Mientras tanto el modo ampliado es colchon medido, no memoria ya gastada.
+#
+# La cache de traduccion se queda en 8 MB: el contador "cap" del overlay
+# (vaciados por falta de sitio) sigue siendo la unica prueba de si se queda
+# corta, y hasta hoy ha salido 0 en todas las medidas. Ampliarla "porque ahora
+# cabe" seria gastar presupuesto sin un numero que lo pida.
+set(AZAHAR_HEAP_MB "216" CACHE STRING "Tamano del heap de la aplicacion en MB")
 set(AZAHAR_TRANS_CACHE_MB "8" CACHE STRING "Cache de traduccion del interprete en MB")
 
 add_compile_definitions(
@@ -226,13 +260,19 @@ add_link_options(
 # a arrancar.
 #
 # O sea que esto se sube lo MINIMO imprescindible, de mega en mega, y solo
-# cuando build.sh avise de que el hueco baja de 4 KB. Hoy quedan ~31 KB libres,
-# que es de sobra para los ~3,2 KB que necesita vita-elf-create.
+# cuando build.sh avise de que el hueco baja de 4 KB.
+#
+# Ha habido que subirlo una vez, en la version 0.0.1.x: con 0x81500000 el hueco
+# se habia quedado en 2.584 bytes (el aviso de build.sh lo canto) y
+# vita-elf-create moria al convertir el ELF. Con 0x81600000 el hueco vuelve a
+# ~1 MB. El coste son ~1 MB de RAM de usuario, que es el precio declarado de
+# este ajuste (ver arriba): al ser de mega en mega, nunca se paga mas de un
+# mega de golpe.
 #
 # Y antes de subirla, comprobar cuanto ha crecido de verdad el codigo: pasar
 # texture_decode.cpp y etc1.cpp a -O3 parecia que pedia megabytes y resulto que
 # engordo el binario 1.296 bytes.
-add_link_options(-Wl,--section-start=.init_array=0x81500000)
+add_link_options(-Wl,--section-start=.init_array=0x81600000)
 
 # La Vita necesita threads POSIX reales; newlib los trae via -lpthread.
 find_package(Threads QUIET)

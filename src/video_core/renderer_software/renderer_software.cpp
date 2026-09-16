@@ -81,7 +81,20 @@ void RendererSoftware::SwapBuffers() {
         // screen_infos: son ~170.000 pixeles con su switch de formato, y ademas
         // eso corre en el hilo principal, el mismo que emula la CPU. Al no
         // tocarlo, el frontend vuelve a presentar la ultima imagen completa.
+#ifdef __PSVITA__
+        // Cronometrado aparte del resto del "swap".
+        //
+        // PerfStats mete esto y la presentacion en el mismo saco, y son dos
+        // trabajos distintos: esto es CPU en el hilo que emula el ARM11, y
+        // presentar es el chip grafico. Al cambiar el camino de presentacion
+        // (vita2d -> GXM) solo se mueve el segundo; sin separarlos no se puede
+        // atribuir la diferencia. Ver Common::FrameStats.
+        const unsigned long long convert_begin = Common::VitaMicros();
         PrepareRenderTarget();
+        Common::FrameStats::Add(Common::FrameStats::convert_us, convert_begin);
+#else
+        PrepareRenderTarget();
+#endif
     }
 
     // EndFrame se llama SIEMPRE, tambien en los saltados: de ahi cuelga

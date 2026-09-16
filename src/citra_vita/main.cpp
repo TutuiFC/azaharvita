@@ -31,6 +31,7 @@
 
 #include "citra_vita/vita_input.h"
 #include "citra_vita/vita_jit_probe.h"
+#include "citra_vita/vita_version.h"
 #include "citra_vita/vita_window.h"
 #include "common/file_util.h"
 #include "common/logging/backend.h"
@@ -83,8 +84,10 @@ unsigned int _pthread_stack_default_user = 256 * 1024;
 
 namespace {
 
-/// Version del port, visible en el menu y en la pantalla de arranque.
-constexpr char kVersion[] = "version 0.0.3.9";
+/// Version del port, visible en el menu y en la pantalla de arranque. Se define
+/// en vita_version.h, que es el unico sitio donde se escribe (el overlay del
+/// juego usa la misma constante).
+using VitaFrontend::kVersion;
 
 constexpr char kUserDir[] = "ux0:/data/azahar/";
 constexpr char kRomDir[] = "ux0:/data/azahar/roms";
@@ -158,9 +161,18 @@ void ConfigureSettings() {
     Settings::values.use_disk_shader_cache = false;
     Settings::values.async_shader_compilation = false;
 
-    // Modo 3DS original: el New 3DS pide otros 128 MB de FCRAM que no caben en
-    // el presupuesto de memoria de una aplicacion de Vita.
+    // Modo New 3DS: se decide al compilar (-DAZAHAR_NEW_3DS=ON), no aqui.
+    //
+    // Dejo de ser "imposible" al activar el modo de memoria ampliada: la FCRAM
+    // del New 3DS son 256 MB frente a 128, y el presupuesto pasa de ~256 a
+    // ~365 MB. Lo que sigue haciendo falta es un heap de >= 288 MB, y eso ata el
+    // arranque a que ATTRIBUTE2=12 funcione. El CMakeLists de esta carpeta tiene
+    // la cuenta completa y las dos comprobaciones que impiden encenderlo a medias.
+#ifdef AZAHAR_NEW_3DS
+    Settings::values.is_new_3ds = true;
+#else
     Settings::values.is_new_3ds = false;
+#endif
 
     Settings::values.resolution_factor = 1;
     Settings::values.layout_option = Settings::LayoutOption::Default;
@@ -684,6 +696,60 @@ int FreeMemoryKB() {
     return info.size_user / 1024;
 }
 
+/**
+ * CDRAM libre, en KB.
+ *
+ * Son 128 MB de memoria dedicada al chip grafico que NO salen del presupuesto
+ * de RAM de usuario, y hoy solo la toca vita2d para sus buffers de pantalla. El
+ * backend GXM va a vivir ahi, asi que conviene ver el numero desde el principio:
+ * es el unico sitio donde se puede gastar memoria sin quitarsela al heap.
+ */
+int FreeCdramKB() {
+    SceKernelFreeMemorySizeInfo info{};
+    info.size = sizeof(info);
+    if (sceKernelGetFreeMemorySize(&info) < 0) {
+        return -1;
+    }
+    return info.size_cdram / 1024;
+}
+
+/**
+ * Presupuesto total de RAM de usuario, en KB, deducido.
+ *
+ * No se puede leer directamente: sceKernelGetFreeMemorySize dice lo que QUEDA,
+ * y para cuando corre main() el heap de newlib ya esta reservado entero (lo
+ * hace libc antes de entrar). Sumandoselo de vuelta sale el presupuesto con el
+ * que arranco el proceso, menos el binario y las reservas del sistema -- que
+ * son unos pocos MB y no cambian la conclusion.
+ *
+ * Llamarlo PRONTO importa: cada hilo y cada textura que se cree despues salen
+ * de aqui, y entonces el numero ya no es el presupuesto sino lo que sobra.
+ */
+int TotalUserMemoryKB() {
+    const int free_kb = FreeMemoryKB();
+    if (free_kb < 0) {
+        return -1;
+    }
+    return free_kb + static_cast<int>(AZAHAR_HEAP_MB) * 1024;
+}
+
+/**
+ * Si la consola ha concedido de verdad el modo de memoria ampliada.
+ *
+ * No hay ninguna llamada que responda "ATTRIBUTE2=12 ha sido aceptado": lo
+ * unico observable es cuanta memoria hay. Una aplicacion normal se mueve en
+ * ~256 MB de presupuesto y el modo ampliado lo sube a ~365, asi que el total
+ * deducido cae claramente a un lado u otro de 300 MB y nunca cerca.
+ *
+ * Es una deduccion, no una lectura, y por eso lo que se pinta en pantalla es la
+ * cifra ADEMAS del SI/no: si algun dia el umbral se queda mal puesto, el numero
+ * sigue diciendo la verdad.
+ */
+bool ExtendedMemoryGranted() {
+    const int total_kb = TotalUserMemoryKB();
+    return total_kb > 300 * 1024;
+}
+
 /// Muestra un error a pantalla completa con el estado de memoria y espera.
 void DrawFatalError(vita2d_pgf* font, const char* title, const std::string& detail) {
     vita2d_start_drawing();
@@ -983,6 +1049,22 @@ void DrawStep(vita2d_pgf* font, const char* step) {
     vita2d_pgf_draw_text(font, 40, 90, kColorDim, 0.85f, kVersion);
     vita2d_pgf_draw_text(font, 40, 140, kColorText, 1.0f, "Iniciando...");
     vita2d_pgf_draw_text(font, 40, 180, kColorDim, 1.0f, step);
+
+    // El presupuesto de memoria, a la vista desde el primer fotograma.
+    //
+    // Es el numero que decide todo lo demas -- si el heap puede subir, si el
+    // modo New 3DS es viable, cuanto sitio queda para el backend GXM -- y hasta
+    // ahora solo aparecia en la pantalla de error fatal, o sea justo cuando ya
+    // no sirve para decidir nada. Aqui se ve siempre, se puede fotografiar y no
+    // hace falta reproducir ningun fallo para leerlo.
+    const bool extended = ExtendedMemoryGranted();
+    vita2d_pgf_draw_textf(font, 40, 232, extended ? 0xFF80FF80 : 0xFF60C0FF, 0.85f,
+                          "mem usuario %d MB totales, %d MB libres  (modo ampliado %s)",
+                          TotalUserMemoryKB() / 1024, FreeMemoryKB() / 1024,
+                          extended ? "SI" : "no");
+    vita2d_pgf_draw_textf(font, 40, 256, kColorDim, 0.85f, "heap %u MB    CDRAM libre %d MB",
+                          static_cast<unsigned int>(AZAHAR_HEAP_MB), FreeCdramKB() / 1024);
+
     vita2d_end_drawing();
     vita2d_swap_buffers();
 }
@@ -1123,6 +1205,26 @@ int main(int argc, char** argv) {
             scePowerGetGpuClockFrequency());
         *result.out = 0;
         WriteCrashLog("relojes", buffer);
+    }
+
+    // El presupuesto de memoria, anotado ANTES de reservar nada.
+    //
+    // Va a crash.txt ademas de a la pantalla porque el escenario que importa es
+    // justo el que no se puede fotografiar: si la aplicacion muere despues, esta
+    // linea dice con cuanta memoria habia arrancado. Y si ATTRIBUTE2=12 dejara
+    // de concederse en una actualizacion de firmware, aqui se veria de inmediato
+    // en vez de aparecer como un fallo de reserva sin relacion aparente.
+    {
+        char buffer[128];
+        const auto result =
+            fmt::format_to_n(buffer, sizeof(buffer) - 1,
+                             "usuario {} MB totales / {} MB libres, heap {} MB, CDRAM {} MB, "
+                             "modo ampliado {}",
+                             TotalUserMemoryKB() / 1024, FreeMemoryKB() / 1024,
+                             static_cast<unsigned int>(AZAHAR_HEAP_MB), FreeCdramKB() / 1024,
+                             ExtendedMemoryGranted() ? "SI" : "no");
+        *result.out = 0;
+        WriteCrashLog("memoria", buffer);
     }
 
     // El hilo principal es el que emula la CPU del 3DS, y esa es la parte de

@@ -27,7 +27,70 @@
 
 #ifdef __PSVITA__
 
+#include <atomic>
+
 namespace Common {
+
+/// Microsegundos de reloj de pared desde que arranco el proceso.
+///
+/// Envuelve sceKernelGetProcessTimeWide para que video_core pueda cronometrar
+/// sin arrastrar cabeceras de psp2 a codigo que es comun a todas las
+/// plataformas. Es una lectura de contador, no una llamada al kernel cara.
+unsigned long long VitaMicros();
+
+/**
+ * Reparto del tiempo de CADA FOTOGRAMA, medido donde de verdad ocurre.
+ *
+ * POR QUE HACE FALTA, teniendo ya el 'cpu/gpu/svc/swap' de PerfStats.
+ *
+ * 1. PerfStats mete en 'swap' dos cosas que no se parecen en nada: convertir el
+ *    framebuffer del 3DS (PrepareRenderTarget, trabajo de CPU en el hilo que
+ *    emula el ARM11) y presentarlo (subir la textura y dibujar, trabajo del
+ *    chip grafico). Al sustituir vita2d por un backend GXM, lo primero no
+ *    cambia y lo segundo si; sin separarlos no hay forma de decir si el cambio
+ *    sirvio.
+ *
+ * 2. Dentro de presentar hay que separar 'dibujar' de 'intercambiar buffers'.
+ *    vita2d_swap_buffers ESPERA a que la GPU termine y al barrido de pantalla.
+ *    Ese tiempo no es coste: es la consola parada. Sumado al resto haria
+ *    parecer cara una presentacion que en realidad estaba esperando.
+ *
+ * 3. Todo lo de PerfStats son PORCENTAJES del fotograma. Un porcentaje no sirve
+ *    para comparar dos versiones: si el fotograma entero baja de 2000 ms a
+ *    1000, todos los porcentajes pueden salir identicos. El plan pide medir
+ *    "antes -> despues" sobre las mismas ROMs, y para eso hacen falta
+ *    milisegundos absolutos. De ahi que esto acumule tiempo, no proporciones.
+ *
+ * Son microsegundos acumulados desde el ultimo Reset(), que hace el overlay una
+ * vez por segundo. Dos lecturas de reloj por fotograma y apartado -- unas doce
+ * en total --, no por pixel: la medida no se estorba a si misma.
+ */
+namespace FrameStats {
+
+/// Framebuffer del 3DS -> ScreenInfo. CPU pura, en el hilo de emulacion.
+inline std::atomic<unsigned long long> convert_us{0};
+/// Subir los pixeles a memoria de la GPU (memcpy a la textura).
+inline std::atomic<unsigned long long> upload_us{0};
+/// Encolar el dibujado de las dos pantallas y del overlay.
+inline std::atomic<unsigned long long> draw_us{0};
+/// Intercambio de buffers: esperar a la GPU y al barrido. Casi todo espera.
+inline std::atomic<unsigned long long> swap_us{0};
+/// Presentaciones contadas en el intervalo, para poder dividir.
+inline std::atomic<unsigned int> frames{0};
+
+inline void Add(std::atomic<unsigned long long>& slot, unsigned long long begin) {
+    slot.fetch_add(VitaMicros() - begin, std::memory_order_relaxed);
+}
+
+inline void Reset() {
+    convert_us.store(0, std::memory_order_relaxed);
+    upload_us.store(0, std::memory_order_relaxed);
+    draw_us.store(0, std::memory_order_relaxed);
+    swap_us.store(0, std::memory_order_relaxed);
+    frames.store(0, std::memory_order_relaxed);
+}
+
+} // namespace FrameStats
 
 /// Anota una linea en ux0:/data/azahar/crash.txt. Seguro en cualquier hilo y en
 /// cualquier momento, incluido antes de main o con el heap agotado.

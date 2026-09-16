@@ -6,6 +6,7 @@ add_executable(azahar
     vita_input.h
     vita_jit_probe.cpp
     vita_jit_probe.h
+    vita_version.h
     vita_window.cpp
     vita_window.h
 )
@@ -75,11 +76,25 @@ target_link_options(azahar PRIVATE
 # ATTRIBUTE2=12 activa el modo de memoria ampliada de la Vita: sube el
 # presupuesto de RAM de usuario de ~256 MB a ~365 MB.
 #
-# Desactivado por defecto: es un atributo que no esta bien documentado y, si el
-# firmware no lo acepta, rechaza la aplicacion al arrancar. Con AZAHAR_HEAP_MB
-# por debajo del presupuesto normal no hace falta. Activalo solo si subes el
-# heap por encima de ~220 MB y sabes que tu firmware lo admite.
-option(AZAHAR_EXTENDED_MEMORY "Pedir el modo de memoria ampliada (ATTRIBUTE2=12)" OFF)
+# ACTIVADO. Son ~110 MB gratis que estaban sin pedir, y el emulador vive o muere
+# por la memoria: la FCRAM del 3DS sola ya son 128 MB, y el modo New 3DS (hoy
+# imposible) pide otros 128.
+#
+# Si tu consola NO arranca la aplicacion con este VPK -- pantalla negra y vuelta
+# a la LiveArea, sin mensaje --, es esto: el firmware ha rechazado el atributo.
+# Se revierte en una linea, cambiando OFF aqui o compilando con
+#
+#     ./build.sh clean && cmake ... -DAZAHAR_EXTENDED_MEMORY=OFF
+#
+# y el VPK vuelve a ser exactamente el de antes: AZAHAR_HEAP_MB se ha dejado en
+# 216, que cabe tambien en el presupuesto normal (ver el CMakeLists raiz), asi
+# que revertir el atributo NO obliga a tocar nada mas.
+#
+# Para saber si ha surtido efecto no hace falta adivinar: la pantalla de
+# arranque escribe la memoria de usuario libre y dice "modo ampliado SI/no"
+# comparandola con el umbral de los 256 MB. Ese numero es el que decide si el
+# heap puede subir a 288 MB y si el modo New 3DS es viable.
+option(AZAHAR_EXTENDED_MEMORY "Pedir el modo de memoria ampliada (ATTRIBUTE2=12)" ON)
 
 # vita_create_vpk guarda VITA_MKSFOEX_FLAGS en la cache de CMake, asi que el
 # valor sobrevive entre configuraciones: hay que quitar el flag viejo a mano
@@ -92,6 +107,45 @@ endif()
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS}" CACHE STRING "vita-mksfoex flags" FORCE)
 
 target_compile_definitions(azahar PRIVATE AZAHAR_HEAP_MB=${AZAHAR_HEAP_MB})
+
+# Modo New 3DS. El README lo daba por imposible "porque no cabe en el
+# presupuesto de memoria de la Vita", y con el modo ampliado esa frase deja de
+# ser cierta por aritmetica:
+#
+#   FCRAM New 3DS            256 MB   (frente a 128 del 3DS original)
+#   VRAM                       6 MB
+#   RAM extra del New 3DS      4 MB
+#   DSP                      0,5 MB
+#   tablas de paginas          5 MB por proceso
+#   cache del rasterizador
+#   ------------------------------
+#   heap necesario          ~290 MB, contra los ~365 del presupuesto ampliado
+#
+# O sea que CABE, y por eso existe esta opcion. Sigue en OFF, y no por
+# precaucion generica: encenderla exige subir AZAHAR_HEAP_MB a 288 como minimo,
+# y eso ata el arranque a que ATTRIBUTE2=12 funcione en esa consola concreta --
+# cosa que nadie ha comprobado todavia. Ademas el New 3DS emula un ARM11 mas
+# rapido y juegos mas pesados sobre un interprete que ya va al limite: la
+# ganancia es compatibilidad (juegos exclusivos de New 3DS), nunca velocidad.
+#
+# El orden correcto es: arrancar este VPK, leer "modo ampliado SI" en la
+# pantalla de arranque, y solo entonces compilar con
+#
+#     -DAZAHAR_HEAP_MB=288 -DAZAHAR_NEW_3DS=ON
+option(AZAHAR_NEW_3DS "Emular un New 3DS (exige memoria ampliada y heap >= 288 MB)" OFF)
+if(AZAHAR_NEW_3DS)
+    if(AZAHAR_HEAP_MB LESS 288)
+        message(FATAL_ERROR
+            "AZAHAR_NEW_3DS=ON necesita AZAHAR_HEAP_MB >= 288 (ahora ${AZAHAR_HEAP_MB}). "
+            "La FCRAM del New 3DS son 256 MB solo de memoria del invitado.")
+    endif()
+    if(NOT AZAHAR_EXTENDED_MEMORY)
+        message(FATAL_ERROR
+            "AZAHAR_NEW_3DS=ON necesita AZAHAR_EXTENDED_MEMORY=ON: 288 MB de heap no caben "
+            "en el presupuesto normal de ~256 MB y la consola rechazaria la aplicacion.")
+    endif()
+    target_compile_definitions(azahar PRIVATE AZAHAR_NEW_3DS=1)
+endif()
 
 # Un eboot "unsafe" puede subir el reloj de la CPU y salirse de su carpeta,
 # pero la consola se niega a lanzarlo si el usuario no tiene activado

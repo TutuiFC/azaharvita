@@ -13,6 +13,7 @@
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/cpu.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 
 namespace Common {
@@ -188,6 +189,10 @@ void VitaPinThreadToUserCore(unsigned int index, const char* role) {
     buffer[n] = 0;
 
     VitaNote("afinidad", buffer);
+}
+
+unsigned long long VitaMicros() {
+    return static_cast<unsigned long long>(sceKernelGetProcessTimeWide());
 }
 
 } // namespace Common

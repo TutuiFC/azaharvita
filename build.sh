@@ -73,7 +73,9 @@ if [ -f "$VPK" ]; then
     # direcciones resuelven a funciones sin relacion y no hay forma de saber que
     # el ELF no era el bueno salvo por lo absurdo del resultado. Ha pasado dos
     # veces. Estas copias ocupan unos 8 MB cada una y viven en elf/.
-    VER=$(grep -oE 'kVersion\[\] = "version [^"]+"' "$ROOT/src/citra_vita/main.cpp" \
+    # La version vive en vita_version.h desde 0.0.1.0; antes estaba escrita a
+    # mano en main.cpp Y en vita_window.cpp, y las dos se desincronizaron.
+    VER=$(grep -oE 'kVersion\[\] = "version [^"]+"' "$ROOT/src/citra_vita/vita_version.h" \
           | sed 's/.*version //; s/"//')
     if [ -n "$VER" ]; then
         mkdir -p "$ROOT/elf"

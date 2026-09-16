@@ -6,6 +6,7 @@
 #include <cstring>
 #include <psp2/ctrl.h>
 #include <psp2/touch.h>
+#include "citra_vita/vita_version.h"
 #include "citra_vita/vita_window.h"
 #include "common/settings.h"
 #include "core/3ds.h"
@@ -366,9 +367,16 @@ void EmuWindow_Vita::PresentScreens() {
     const auto& top = renderer.Screen(VideoCore::ScreenId::TopLeft);
     const auto& bottom = renderer.Screen(VideoCore::ScreenId::Bottom);
 
+    // Los tres tramos de presentar, cronometrados por separado. Ver el bloque de
+    // Common::FrameStats para el razonamiento; en corto: subir pixeles, encolar
+    // dibujos y esperar al barrido son tres cosas con costes muy distintos, y
+    // sumadas no dicen nada sobre cual hay que arreglar.
+    const unsigned long long upload_begin = Common::VitaMicros();
     UploadScreenNative(top_texture, top);
     UploadScreenNative(bottom_texture, bottom);
+    Common::FrameStats::Add(Common::FrameStats::upload_us, upload_begin);
 
+    const unsigned long long draw_begin = Common::VitaMicros();
     vita2d_start_drawing();
     vita2d_clear_screen();
     DrawRotatedScreen(top_texture, top, kTopLeft, kTopTop, kTopWidth, kTopHeight);
@@ -376,8 +384,16 @@ void EmuWindow_Vita::PresentScreens() {
                       kBottomHeight);
     DrawStatsOverlay();
     vita2d_end_drawing();
-    vita2d_swap_buffers();
+    Common::FrameStats::Add(Common::FrameStats::draw_us, draw_begin);
 
+    // vita2d_swap_buffers espera a que la GPU acabe y al barrido de pantalla.
+    // Casi todo lo que se mida aqui es la consola PARADA, no trabajo: por eso va
+    // en su propio contador y el overlay lo pinta aparte.
+    const unsigned long long swap_begin = Common::VitaMicros();
+    vita2d_swap_buffers();
+    Common::FrameStats::Add(Common::FrameStats::swap_us, swap_begin);
+
+    Common::FrameStats::frames.fetch_add(1, std::memory_order_relaxed);
     frames_presented++;
 }
 
@@ -418,10 +434,34 @@ void AppendOneDecimal(char* out, std::size_t& n, double value) {
     out[n++] = '.';
     out[n++] = static_cast<char>('0' + (tenths % 10));
 }
-/// Se pinta en el overlay para poder confirmar de un vistazo que build se esta
-/// ejecutando. Sin esto, "sigue igual" no distingue entre "la optimizacion no
-/// sirvio" y "no se instalo la version nueva".
-constexpr char kOverlayBuild[] = "Azahar 0.0.3.9";
+
+/**
+ * Igual que la anterior, pero para milisegundos por fotograma.
+ *
+ * Existe aparte porque AppendOneDecimal acota a 999, y aqui eso no vale: en esta
+ * consola un fotograma pasa de 2000 ms con facilidad, que es justo el numero que
+ * interesa medir. Se acota en 99999,9 (siete caracteres como mucho), y quien la
+ * use tiene que dejar ese hueco en su buffer.
+ *
+ * No se subio el tope de la otra funcion porque sus llamadas son porcentajes con
+ * buffers ajustados a tres digitos -- line_gx[40] se desbordaria por un byte.
+ */
+void AppendMillis(char* out, std::size_t& n, double value) {
+    if (!(value > 0.0)) { // tambien descarta NaN
+        value = 0.0;
+    }
+    if (value > 99999.0) {
+        value = 99999.0;
+    }
+    const unsigned int tenths = static_cast<unsigned int>(value * 10.0 + 0.5);
+    n += AppendUInt(out + n, tenths / 10);
+    out[n++] = '.';
+    out[n++] = static_cast<char>('0' + (tenths % 10));
+}
+// El cartel de version del overlay (kOverlayBuild) ya no se escribe aqui: viene
+// de citra_vita/vita_version.h, que es el unico sitio donde vive el numero.
+// Estaba duplicado a mano y se habia quedado desfasado respecto al de main.cpp
+// -- que es exactamente el fallo que ese cartel existe para evitar.
 } // Anonymous namespace
 
 void EmuWindow_Vita::DrawStatsOverlay() {
@@ -457,6 +497,34 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             stats_gpu_percent = stats.time_gpu / total * 100.0;
             stats_svc_percent = (stats.time_hle_svc + stats.time_hle_ipc) / total * 100.0;
             stats_swap_percent = stats.time_swap / total * 100.0;
+        }
+
+        // Y lo mismo en milisegundos absolutos. PerfStats da segundos POR
+        // FOTOGRAMA de sistema, asi que basta multiplicar por mil: no hay que
+        // dividir por nada mas.
+        stats_frame_ms = total * 1000.0;
+        stats_cpu_ms = stats.time_remaining * 1000.0;
+        stats_gx_ms = stats.time_gpu * 1000.0;
+        stats_svc_ms = (stats.time_hle_svc + stats.time_hle_ipc) * 1000.0;
+
+        // Los contadores del frontend, en cambio, se acumulan durante todo el
+        // intervalo: hay que repartirlos entre las presentaciones que han
+        // cabido. Se usa el contador propio (Common::FrameStats::frames) y no el
+        // FPS de PerfStats por el mismo motivo que el resto del overlay: a menos
+        // de un fotograma por segundo ese FPS es fraccionario y dividir por el
+        // convierte el ruido del muestreo en cifras absurdas.
+        {
+            const unsigned int present_frames =
+                Common::FrameStats::frames.load(std::memory_order_relaxed);
+            const double n = present_frames > 0 ? static_cast<double>(present_frames) : 1.0;
+            const auto per_frame_ms = [n](std::atomic<unsigned long long>& slot) {
+                return static_cast<double>(slot.load(std::memory_order_relaxed)) / n / 1000.0;
+            };
+            stats_convert_ms = per_frame_ms(Common::FrameStats::convert_us);
+            stats_upload_ms = per_frame_ms(Common::FrameStats::upload_us);
+            stats_draw_ms = per_frame_ms(Common::FrameStats::draw_us);
+            stats_swapwait_ms = per_frame_ms(Common::FrameStats::swap_us);
+            Common::FrameStats::Reset();
         }
 
         // Reparto del tiempo del rasterizador por triangulo: cuanto se va en
@@ -940,6 +1008,71 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     append_labeled_percent(line_occ, noc, "  ras ", stats_raster_share_percent);
     line_occ[noc] = '\0';
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 452, 0xFF80D0FF, 0.8f, line_occ);
+
+    /**
+     * EL REPARTO DEL FOTOGRAMA EN MILISEGUNDOS. La linea base del proyecto.
+     *
+     * Todo lo demas del overlay son porcentajes, y con porcentajes no se puede
+     * decir si una version va mejor que otra: se reparten sobre el total, asi
+     * que pueden salir identicos mientras el fotograma se parte por la mitad.
+     * Estas dos lineas son las que se anotan antes de tocar nada y contra las
+     * que se compara despues.
+     *
+     *   ms   = fotograma completo (tiempo de pared entre vblanks del invitado)
+     *   cpu  = interprete del ARM11 y todo lo que no es GX, SVC ni presentar
+     *   gx   = listas de comandos, rellenos y transferencias (rasterizado sw)
+     *   svc  = llamadas al sistema del invitado e IPC
+     *
+     *   conv = framebuffer del 3DS -> ScreenInfo (CPU, hilo de emulacion)
+     *   sub  = subir los pixeles a memoria de la GPU
+     *   dib  = encolar el dibujado de las dos pantallas y este overlay
+     *   esp  = esperar al intercambio de buffers -> consola PARADA, no coste.
+     *          Si 'esp' es grande, sobra tiempo de GPU y el problema esta
+     *          entero en la CPU; si crece al cambiar de backend grafico, es que
+     *          ahora se espera mas al barrido, no que se trabaje mas.
+     */
+    char line_ms[64];
+    {
+        std::size_t n = 0;
+        const char* label = "ms ";
+        for (std::size_t i = 0; label[i] != '\0'; i++) {
+            line_ms[n++] = label[i];
+        }
+        AppendMillis(line_ms, n, stats_frame_ms);
+        const auto append = [&](const char* text, double value) {
+            for (std::size_t i = 0; text[i] != '\0'; i++) {
+                line_ms[n++] = text[i];
+            }
+            AppendMillis(line_ms, n, value);
+        };
+        append(" cpu ", stats_cpu_ms);
+        append(" gx ", stats_gx_ms);
+        append(" svc ", stats_svc_ms);
+        line_ms[n] = '\0';
+    }
+
+    char line_pres[64];
+    {
+        std::size_t n = 0;
+        const char* label = "conv ";
+        for (std::size_t i = 0; label[i] != '\0'; i++) {
+            line_pres[n++] = label[i];
+        }
+        AppendMillis(line_pres, n, stats_convert_ms);
+        const auto append = [&](const char* text, double value) {
+            for (std::size_t i = 0; text[i] != '\0'; i++) {
+                line_pres[n++] = text[i];
+            }
+            AppendMillis(line_pres, n, value);
+        };
+        append(" sub ", stats_upload_ms);
+        append(" dib ", stats_draw_ms);
+        append(" esp ", stats_swapwait_ms);
+        line_pres[n] = '\0';
+    }
+
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 470, 0xFF60FFC0, 0.8f, line_ms);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 488, 0xFF60FFC0, 0.8f, line_pres);
 
     const u32 ablation_mode = SwRenderer::Ablation::mode.load(std::memory_order_relaxed);
     char line_abl[40] = "abl ";

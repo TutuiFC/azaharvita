@@ -158,6 +158,32 @@ private:
     double stats_raster_share_percent = 0.0;
     /// Porcentaje del fotograma en presentar (swap de vita2d incluido).
     double stats_swap_percent = 0.0;
+
+    /**
+     * El mismo reparto, pero en MILISEGUNDOS POR FOTOGRAMA.
+     *
+     * Todo lo de arriba son porcentajes, y un porcentaje no sirve para comparar
+     * dos versiones: si el fotograma entero pasa de 2000 ms a 1000, el reparto
+     * puede salir identico y parecer que no ha cambiado nada. El plan de trabajo
+     * pide reportar cada fase como "antes -> despues" sobre unas ROMs fijas, y
+     * eso son milisegundos absolutos o no es nada.
+     *
+     * 'frame' es el total (tiempo de pared entre vblanks del invitado); el resto
+     * son trozos suyos. cpu/gx/svc vienen de PerfStats; conv/sub/dib/esp de
+     * Common::FrameStats, medidos en el sitio exacto donde ocurren.
+     */
+    double stats_frame_ms = 0.0;
+    double stats_cpu_ms = 0.0;
+    double stats_gx_ms = 0.0;
+    double stats_svc_ms = 0.0;
+    /// Framebuffer del 3DS -> ScreenInfo, en el hilo que emula el ARM11.
+    double stats_convert_ms = 0.0;
+    /// Subida de los pixeles a memoria de la GPU.
+    double stats_upload_ms = 0.0;
+    /// Encolar el dibujado de las pantallas y el overlay.
+    double stats_draw_ms = 0.0;
+    /// Espera al intercambio de buffers: consola parada, no trabajo.
+    double stats_swapwait_ms = 0.0;
     /// Reparto de unidades de textura por formato, ya formateado ("fmt a8 3 ...").
     char stats_format_line[56] = "fmt -";
     SceUInt64 stats_next_update_us = 0;
