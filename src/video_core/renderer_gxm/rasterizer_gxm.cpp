@@ -660,10 +660,15 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     // venir a cero (el juego las fija por otro camino). La configuracion de
     // PANTALLA que usa la misma direccion si lo tiene: se busca por direccion y
     // se toman de ahi el stride y, si hace falta, las dimensiones.
+    //
+    // OJO con las unidades: la direccion de DIBUJADO es el registro en
+    // unidades de 8 bytes (regs_framebuffer.h la multiplica por 8 al darla
+    // como direccion fisica), pero la de PANTALLA ya es una direccion de bytes
+    // (la escribe GSP y la imprimen las notas "fb" de crash.txt tal cual).
     for (u32 i = 0; i < 2 && address != 0; i++) {
         const auto& display = pica.regs.framebuffer_config[i];
-        const PAddr candidates[4] = {display.address_left1 * 8, display.address_left2 * 8,
-                                     display.address_right1 * 8, display.address_right2 * 8};
+        const PAddr candidates[4] = {display.address_left1, display.address_left2,
+                                     display.address_right1, display.address_right2};
         bool matches = false;
         for (const PAddr candidate : candidates) {
             if (candidate != 0 && candidate == address) {
@@ -683,6 +688,16 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
         break;
     }
     if (address == 0 || width == 0 || height == 0 || width > 1024 || height > 1024) {
+        static bool noted_once = false;
+        if (!noted_once) {
+            noted_once = true;
+            char note[96];
+            const auto written = fmt::format_to_n(
+                note, sizeof(note) - 1, "rechazado: addr {:#x} {}x{} stride {}", address, width,
+                height, guest_stride);
+            *written.out = 0;
+            Common::VitaNote("gxm fb", note);
+        }
         return nullptr;
     }
     if (guest_stride == 0) {
