@@ -992,19 +992,34 @@ void RasterizerGXM::FlushAll() {
 
 void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
     FlushPending();
-    textures->InvalidateRange(addr, size);
+    // El cache de texturas se crea en el primer lote, y estos vaciados llegan
+    // desde el arranque del juego, mucho antes: sin la comprobacion esto era
+    // una desreferencia de puntero nulo (la caida de 0.1.0.2 a 0.1.0.4).
+    if (textures != nullptr) {
+        textures->InvalidateRange(addr, size);
+    }
     software.FlushRegion(addr, size);
 }
 
 void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
     FlushPending();
-    textures->InvalidateRange(addr, size);
+    // El cache de texturas se crea en el primer lote, y estos vaciados llegan
+    // desde el arranque del juego, mucho antes: sin la comprobacion esto era
+    // una desreferencia de puntero nulo (la caida de 0.1.0.2 a 0.1.0.4).
+    if (textures != nullptr) {
+        textures->InvalidateRange(addr, size);
+    }
     software.InvalidateRegion(addr, size);
 }
 
 void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
     FlushPending();
-    textures->InvalidateRange(addr, size);
+    // El cache de texturas se crea en el primer lote, y estos vaciados llegan
+    // desde el arranque del juego, mucho antes: sin la comprobacion esto era
+    // una desreferencia de puntero nulo (la caida de 0.1.0.2 a 0.1.0.4).
+    if (textures != nullptr) {
+        textures->InvalidateRange(addr, size);
+    }
     software.FlushAndInvalidateRegion(addr, size);
 }
 
