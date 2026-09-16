@@ -23,9 +23,9 @@ namespace VitaFrontend {
  * ELF de la serie anterior (0.0.2.5 a 0.0.3.9) siguen en elf/ y no se pueden
  * pisar, asi que al subir el numero hay que saltarse los que ya existan alli.
  */
-constexpr char kVersion[] = "version 0.0.1.0";
+constexpr char kVersion[] = "version 0.0.1.1";
 
-/// La misma version con el nombre delante, para el overlay ("Azahar 0.0.1.0").
-constexpr char kOverlayBuild[] = "Azahar 0.0.1.0";
+/// La misma version con el nombre delante, para el overlay ("Azahar 0.0.1.1").
+constexpr char kOverlayBuild[] = "Azahar 0.0.1.1";
 
 } // namespace VitaFrontend

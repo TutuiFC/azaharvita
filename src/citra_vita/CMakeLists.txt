@@ -27,6 +27,11 @@ target_link_libraries(azahar PRIVATE
     vita2d
     SceDisplay_stub
     SceGxm_stub
+    # El backend GXM carga libshacccg.suprx con sceKernelLoadStartModule y
+    # compila los shaders de presentacion con SceShaccCg. Ver
+    # video_core/renderer_gxm/gxm_presenter.cpp.
+    SceKernelModulemgr_stub
+    SceShaccCg_stub
     SceSysmodule_stub
     SceCtrl_stub
     SceTouch_stub

@@ -14,6 +14,9 @@
 #include "common/vita_diag.h"
 #include "core/core.h"
 #include "video_core/gpu.h"
+#include "video_core/renderer_gxm/gxm_pica_format.h"
+#include "video_core/renderer_gxm/gxm_presenter.h"
+#include "video_core/renderer_gxm/renderer_gxm.h"
 #include "video_core/renderer_software/renderer_software.h"
 #include "video_core/renderer_software/sw_rasterizer.h"
 
@@ -38,17 +41,30 @@ constexpr u32 kBottomTop = kMarginY + kTopHeight;                         // 272
 // coordenadas, mas fino que los pixeles de pantalla.
 constexpr int kTouchMaxX = 1919;
 constexpr int kTouchMaxY = 1087;
+
+/// Monta una linea de texto de tamano fijo: 'prefix' y luego 'source'. Se hace
+/// a mano y no con snprintf porque esta libc no garantiza que la variante que
+/// enlaza vita2d entienda todos los formatos, y esto es una copia y ya.
+void BuildLine(char* out, std::size_t capacity, const char* prefix, const char* source) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; prefix[i] != '\0' && n + 1 < capacity; i++) {
+        out[n++] = prefix[i];
+    }
+    for (std::size_t i = 0; source[i] != '\0' && n + 1 < capacity; i++) {
+        out[n++] = source[i];
+    }
+    out[n] = '\0';
+}
 } // Anonymous namespace
 
 EmuWindow_Vita::EmuWindow_Vita() {
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
 
-    top_texture = vita2d_create_empty_texture_format(kTopWidth, kTopHeight,
-                                                     SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
-    bottom_texture = vita2d_create_empty_texture_format(kBottomWidth, kBottomHeight,
-                                                        SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
-
+    // Las dos texturas de vita2d se crean de forma perezosa, en
+    // UploadScreenNative, cuando el fotograma se presenta por ese camino. Con
+    // la presentacion por GXM no se usan, y crearlas aqui serian ~1 MB de CDRAM
+    // ocupados para nada (vita2d las reserva en CDRAM por defecto).
     BuildLayout();
 }
 
@@ -220,61 +236,11 @@ void EmuWindow_Vita::UploadScreen(vita2d_texture* texture, const std::vector<u8>
     }
 }
 
-/**
- * Formato de GXM equivalente al del framebuffer del 3DS.
- *
- * La GPU de la Vita entiende los cinco de forma nativa, asi que no hay que
- * convertir nada en la CPU: se le da el buffer crudo y ella lo interpreta al
- * muestrear la textura.
- */
-static SceGxmTextureFormat GxmFormatFor(Pica::PixelFormat format) {
-    /**
-     * El orden de canales, deducido y no adivinado.
-     *
-     * El primer intento uso las variantes BGR/ABGR y los carteles amarillos
-     * salieron azules: rojo y azul intercambiados.
-     *
-     * La regla sale del unico caso que ya se sabia bueno: el buffer RGBA8 que
-     * escribia el codigo anterior guardaba los bytes en orden R,G,B y se subia
-     * como A8B8G8R8. O sea que el nombre de GXM lista los canales del bit MAS
-     * significativo al menos, y la memoria en little-endian va justo al reves.
-     *
-     * Aplicando eso a como lee Citra cada formato (ver Common::Color):
-     *
-     *   RGB565   pixel>>11 = R, >>5 = G, &0x1F = B   -> R G B de mas a menos
-     *   RGB5A1   >>11 R, >>6 G, >>1 B, &1 A          -> R G B A
-     *   RGBA4    >>12 R, >>8 G, >>4 B, &0xF A        -> R G B A
-     *   RGB8     bytes[2]=R, [1]=G, [0]=B            -> R G B
-     *   RGBA8    bytes[3]=R, [2]=G, [1]=B, [0]=A     -> R G B A
-     *
-     * De ahi salen todos los sufijos _RGB / _RGBA.
-     */
-    switch (format) {
-    case Pica::PixelFormat::RGBA8:
-        return SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_RGBA;
-    case Pica::PixelFormat::RGB8:
-        return SCE_GXM_TEXTURE_FORMAT_U8U8U8_RGB;
-    case Pica::PixelFormat::RGB5A1:
-        return SCE_GXM_TEXTURE_FORMAT_U5U5U5U1_RGBA;
-    case Pica::PixelFormat::RGB565:
-        return SCE_GXM_TEXTURE_FORMAT_U5U6U5_RGB;
-    case Pica::PixelFormat::RGBA4:
-        return SCE_GXM_TEXTURE_FORMAT_U4U4U4U4_RGBA;
-    }
-    return SCE_GXM_TEXTURE_FORMAT_U5U6U5_RGB;
-}
-
-/// Bytes por pixel del formato del 3DS.
-static u32 BytesPerPixelFor(Pica::PixelFormat format) {
-    switch (format) {
-    case Pica::PixelFormat::RGBA8:
-        return 4;
-    case Pica::PixelFormat::RGB8:
-        return 3;
-    default:
-        return 2;
-    }
-}
+// La tabla de formatos GXM y el numero de bytes por pixel de cada formato del
+// 3DS viven en video_core/renderer_gxm/gxm_pica_format.h: los necesitan tanto
+// el camino de vita2d de este fichero como el presentador GXM, y tenerlos
+// duplicados fue exactamente el origen de un ciclo de prueba en consola
+// (rojo y azul intercambiados). Ver alli el porque de cada sufijo _RGB/_RGBA.
 
 void EmuWindow_Vita::UploadScreenNative(vita2d_texture*& texture, const ScreenInfoRef& info) {
     if (!info.valid || info.pixels.empty()) {
@@ -284,7 +250,12 @@ void EmuWindow_Vita::UploadScreenNative(vita2d_texture*& texture, const ScreenIn
     // La textura se recrea solo cuando cambian tamano o formato. Los juegos los
     // cambian muy de vez en cuando (al entrar y salir de menus, sobre todo), asi
     // que en la practica esto ocurre un punado de veces por partida.
-    const SceGxmTextureFormat want = GxmFormatFor(info.format);
+    //
+    // La tabla de formatos es la misma que usa el presentador GXM
+    // (renderer_gxm/gxm_pica_format.h): estaba duplicada aqui, y dos copias de
+    // una correspondencia que costo un ciclo de prueba en consola averiguar es
+    // pedir que se desincronicen.
+    const SceGxmTextureFormat want = Gxm::FormatFor(info.format);
     if (texture == nullptr || vita2d_texture_get_width(texture) != info.width ||
         vita2d_texture_get_height(texture) != info.height ||
         vita2d_texture_get_format(texture) != want) {
@@ -300,7 +271,7 @@ void EmuWindow_Vita::UploadScreenNative(vita2d_texture*& texture, const ScreenIn
     u8* dest = static_cast<u8*>(vita2d_texture_get_datap(texture));
     const u32 dest_stride = vita2d_texture_get_stride(texture);
     const u32 src_stride = info.stride;
-    const u32 row_bytes = info.width * BytesPerPixelFor(info.format);
+    const u32 row_bytes = info.width * Gxm::BytesPerPixelFor(info.format);
 
     if (dest_stride == src_stride) {
         // Caso normal: una sola copia de bloque, sin tocar un solo pixel.
@@ -360,28 +331,84 @@ void EmuWindow_Vita::PresentScreens() {
         return;
     }
 
-    const auto& renderer = static_cast<SwRenderer::RendererSoftware&>(system.GPU().Renderer());
+    auto& renderer = system.GPU().Renderer();
+
+    /**
+     * Los dos renderers exponen Screen() con la misma firma a proposito (ver
+     * renderer_gxm.h), asi que aqui se elige el tipo por la API activa, que es
+     * la misma que uso CreateRenderer para construir el objeto. No se usa
+     * dynamic_cast: con RTTI el binario engorda y el tipo ya se sabe.
+     */
+    const bool gxm_api = Settings::GetWorkingGraphicsAPI() == Settings::GraphicsAPI::GXM;
 
     // El framebuffer del 3DS esta GIRADO en memoria: 240 de ancho por 400 (o
-    // 320) de alto. Se sube tal cual, en su formato nativo, y se dibuja rotado.
-    const auto& top = renderer.Screen(VideoCore::ScreenId::TopLeft);
-    const auto& bottom = renderer.Screen(VideoCore::ScreenId::Bottom);
+    // 320) de alto. Se sube tal cual, en su formato nativo, y se presenta
+    // rotado.
+    const SwRenderer::ScreenInfo* top;
+    const SwRenderer::ScreenInfo* bottom;
+    if (gxm_api) {
+        auto& gxm_renderer = static_cast<Gxm::RendererGXM&>(renderer);
+        top = &gxm_renderer.Screen(VideoCore::ScreenId::TopLeft);
+        bottom = &gxm_renderer.Screen(VideoCore::ScreenId::Bottom);
+    } else {
+        auto& sw_renderer = static_cast<SwRenderer::RendererSoftware&>(renderer);
+        top = &sw_renderer.Screen(VideoCore::ScreenId::TopLeft);
+        bottom = &sw_renderer.Screen(VideoCore::ScreenId::Bottom);
+    }
+
+    /**
+     * El presentador GXM se crea la primera vez que se presenta con la API GXM
+     * y decide su propio destino al inicializarse: si no puede (falta
+     * libshacccg.suprx, falla la compilacion de shaders, no hay memoria), Ready()
+     * se queda en false y este fotograma -- y los siguientes -- van por vita2d
+     * exactamente como antes. Es una degradacion a proposito: el backend nuevo
+     * no puede impedir jugar.
+     *
+     * El contexto y el patcher son los de vita2d: GXM solo admite un contexto
+     * por proceso y es el que abre la escena donde se dibujan los quads.
+     */
+    bool use_gxm = false;
+    if (gxm_api) {
+        if (gxm_presenter == nullptr) {
+            gxm_presenter = std::make_unique<Gxm::ScreenPresenter>(
+                static_cast<float>(kVitaScreenWidth), static_cast<float>(kVitaScreenHeight),
+                vita2d_get_context(), vita2d_get_shader_patcher());
+        }
+        gxm_presenter->Initialize();
+        use_gxm = gxm_presenter->Ready();
+    }
+
+    if (!use_gxm) {
+        // Camino de siempre: copiar los bytes crudos a la textura de vita2d.
+        // Con GXM la copia la hace el presentador y se cronometra alli.
+        const unsigned long long upload_begin = Common::VitaMicros();
+        UploadScreenNative(top_texture, *top);
+        UploadScreenNative(bottom_texture, *bottom);
+        Common::FrameStats::Add(Common::FrameStats::upload_us, upload_begin);
+    }
 
     // Los tres tramos de presentar, cronometrados por separado. Ver el bloque de
     // Common::FrameStats para el razonamiento; en corto: subir pixeles, encolar
     // dibujos y esperar al barrido son tres cosas con costes muy distintos, y
     // sumadas no dicen nada sobre cual hay que arreglar.
-    const unsigned long long upload_begin = Common::VitaMicros();
-    UploadScreenNative(top_texture, top);
-    UploadScreenNative(bottom_texture, bottom);
-    Common::FrameStats::Add(Common::FrameStats::upload_us, upload_begin);
-
     const unsigned long long draw_begin = Common::VitaMicros();
     vita2d_start_drawing();
     vita2d_clear_screen();
-    DrawRotatedScreen(top_texture, top, kTopLeft, kTopTop, kTopWidth, kTopHeight);
-    DrawRotatedScreen(bottom_texture, bottom, kBottomLeft, kBottomTop, kBottomWidth,
-                      kBottomHeight);
+    if (use_gxm) {
+        gxm_presenter->Draw(*top, *bottom, {kTopLeft, kTopTop, kTopWidth, kTopHeight},
+                            {kBottomLeft, kBottomTop, kBottomWidth, kBottomHeight});
+    } else {
+        DrawRotatedScreen(top_texture, *top, kTopLeft, kTopTop, kTopWidth, kTopHeight);
+        DrawRotatedScreen(bottom_texture, *bottom, kBottomLeft, kBottomTop, kBottomWidth,
+                          kBottomHeight);
+    }
+
+    // Estado para el overlay. El presentador puede apagarse a mitad de partida
+    // (sin memoria de GPU), asi que la linea se rehace en cada fotograma.
+    presenter_uses_gxm = use_gxm;
+    BuildLine(presenter_line, sizeof(presenter_line), "pres ",
+              gxm_api ? gxm_presenter->Status() : "vita2d (software)");
+
     DrawStatsOverlay();
     vita2d_end_drawing();
     Common::FrameStats::Add(Common::FrameStats::draw_us, draw_begin);
@@ -1073,6 +1100,12 @@ void EmuWindow_Vita::DrawStatsOverlay() {
 
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 470, 0xFF60FFC0, 0.8f, line_ms);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 488, 0xFF60FFC0, 0.8f, line_pres);
+
+    // Con que se ha presentado el fotograma: verde cuando lo ha dibujado el
+    // chip con GXM, gris cuando es el camino de vita2d. Sin esto, "¿y esto va
+    // por el backend nuevo?" solo se responde mirando la fecha del VPK.
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 506,
+                         presenter_uses_gxm ? 0xFF60FFC0 : 0xFFA0A0A0, 0.8f, presenter_line);
 
     const u32 ablation_mode = SwRenderer::Ablation::mode.load(std::memory_order_relaxed);
     char line_abl[40] = "abl ";

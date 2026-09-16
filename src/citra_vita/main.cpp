@@ -151,7 +151,13 @@ void CreateDirectories() {
 
 /// Ajustes adaptados a lo que la Vita puede dar.
 void ConfigureSettings() {
-    Settings::values.graphics_api = Settings::GraphicsAPI::Software;
+    // Motor grafico por defecto: GXM. Presenta con el chip de la consola los
+    // fotogramas que sigue rasterizando el camino de software; si el
+    // presentador no puede arrancar (falta libshacccg.suprx, falla la
+    // compilacion de los shaders, no hay memoria de GPU), degrada solo al
+    // camino de vita2d sin tocar la emulacion. En el menu, SELECT alterna entre
+    // GXM y el renderer de software entero para comparar.
+    Settings::values.graphics_api = Settings::GraphicsAPI::GXM;
 
     // Sin JIT: dynarmic solo tiene backends de x86-64 y ARM64, y la Vita es
     // ARMv7. Se usa el interprete dyncom.
@@ -288,6 +294,18 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
         vita2d_pgf_draw_textf(font, 40, 500, kColorDim, 0.9f,
                               "CRUZ: jugar   CIRCULO: salir   (%d/%d)", selected + 1,
                               static_cast<int>(roms.size()));
+
+        // El motor grafico se elige aqui y se aplica al siguiente juego: cada
+        // partida construye su renderer desde cero en RunGame, asi que no hace
+        // falta recrear nada en caliente (y el menu se dibuja a 60 fps, fuera
+        // del bucle de emulacion).
+        if (Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::GXM) {
+            vita2d_pgf_draw_text(font, 40, 470, kColorDim, 0.9f,
+                                 "SELECT: motor grafico  (GXM)");
+        } else {
+            vita2d_pgf_draw_text(font, 40, 470, kColorDim, 0.9f,
+                                 "SELECT: motor grafico  (software)");
+        }
     }
 
     vita2d_end_drawing();
@@ -1133,6 +1151,14 @@ void Run(vita2d_pgf* font) {
         }
         if (pressed & SCE_CTRL_CIRCLE) {
             running = false;
+        }
+        if (pressed & SCE_CTRL_SELECT) {
+            // Alterna el motor grafico del siguiente juego. El renderer se
+            // construye en System::Load, con estos ajustes ya puestos.
+            const bool gxm =
+                Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::GXM;
+            Settings::values.graphics_api =
+                gxm ? Settings::GraphicsAPI::Software : Settings::GraphicsAPI::GXM;
         }
         if ((pressed & SCE_CTRL_CROSS) && !roms.empty()) {
             RunGame(font, roms[selected].path);

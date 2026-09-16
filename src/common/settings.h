@@ -23,6 +23,16 @@ enum class GraphicsAPI {
     Software = 0,
     OpenGL = 1,
     Vulkan = 2,
+    /**
+     * Backend nativo de PS Vita contra sceGxm.
+     *
+     * En esta fase NO rasteriza la PICA: presenta los fotogramas que produce el
+     * rasterizador por software con el chip grafico de la consola. Existe como
+     * API propia, y no como un detalle del renderer de software, porque a partir
+     * de aqui crece hacia backend completo (generador de shaders Cg, cache de
+     * texturas, pipelines). Ver src/video_core/renderer_gxm/.
+     */
+    GXM = 3,
 };
 
 enum class InitClock : u32 {
@@ -525,7 +535,11 @@ struct Values {
 // TODO: Add a null renderer backend for this, perhaps.
 #error "At least one renderer must be enabled."
 #endif
-        GraphicsAPI::Software, GraphicsAPI::Vulkan, Keys::graphics_api};
+        // El tope del rango es GXM a proposito: GXM es la API mas alta y el
+        // clamp de abajo tiene que dejarla pasar. Si se queda en Vulkan, elegir
+        // GXM en el menu se recorta a Vulkan -- que en esta consola no existe y
+        // CreateRenderer manda al caso por defecto.
+        GraphicsAPI::Software, GraphicsAPI::GXM, Keys::graphics_api};
     // clang-format on
     SwitchableSetting<u32> physical_device{0, Keys::physical_device};
     Setting<bool> use_gles{false, Keys::use_gles};

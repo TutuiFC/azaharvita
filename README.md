@@ -12,6 +12,10 @@ a PS Vita real (ARMv7, Cortex-A9).
 3. Mete ahí los juegos: `.3ds`, `.cci`, `.cxi`, `.app`, `.cia`, `.3dsx`.
    **Tienen que estar descifrados**, igual que en Azahar de PC.
 4. Abre Azahar desde la LiveArea y elige un juego de la lista.
+5. (Opcional) Para la presentación por GXM, copia `libshacccg.suprx` (extraído
+   del firmware de tu propia consola, como en cualquier homebrew que compile
+   shaders) a `ur0:/data/`. Si no está, el emulador presenta con vita2d y lo
+   dice en el overlay; lo demás funciona exactamente igual.
 
 ### Controles
 
@@ -32,20 +36,29 @@ Los botones se mapean por posición, no por nombre: el botón de confirmar del
 ZL/ZR del New 3DS se quedan sin asignar: a la Vita se le acaban los botones y
 robárselos a algo que los juegos sí usan sería peor.
 
+En el menú de ROMs, **SELECT** alterna el motor gráfico entre la presentación
+por GXM y el renderer de software completo, y la elección se aplica al
+siguiente juego que se cargue.
+
 ---
 
 ## Qué esperar de rendimiento
 
 **Va a ir muy lento.** No es un defecto del port, es aritmética:
 
-- La Vita **no puede usar JIT**. El recompilador de Azahar (dynarmic) solo
-  tiene backends para x86-64 y ARM64; la Vita es ARMv7 de 32 bits y no existe
-  backend para ella. Se usa el intérprete `dyncom`, que ejecuta las
-  instrucciones del ARM11 una a una: entre 10 y 50 veces más lento que un JIT.
-- La Vita **no puede acelerar el gráfico**. Azahar necesita OpenGL 4.3 o
-  Vulkan 1.1; la Vita da OpenGL ES 2.0 vía GXM. Se usa `renderer_software`,
-  que rasteriza la PICA200 con la CPU, compitiendo por los mismos ciclos que
-  el intérprete.
+- La Vita **no usa JIT**. El recompilador de Azahar (dynarmic) solo tiene
+  backends para x86-64 y ARM64; la Vita es ARMv7 de 32 bits y no existe backend
+  para ella. Se usa el intérprete `dyncom`, que ejecuta las instrucciones del
+  ARM11 una a una: entre 10 y 50 veces más lento que un JIT. (Ejecutar el ARM11
+  *nativamente* sobre el Cortex-A9 con un plugin en modo kernel es posible — el
+  ARM11 es ARMv6K y el Cortex-A9 ARMv7-A —, pero es un proyecto aparte que no
+  está hecho.)
+- La PICA200 **se sigue rasterizando en la CPU**. Azahar necesita OpenGL 4.3 o
+  Vulkan 1.1 para rasterizar por hardware, y la Vita da OpenGL ES 2.0 vía GXM.
+  Lo que sí hace ya este port es **presentar con el chip gráfico** (backend
+  `renderer_gxm`, con `sceGxmDraw`): los fotogramas que produce
+  `renderer_software` se suben a texturas GXM y los dibuja la GPU de la consola.
+  Llevar ahí también el rasterizado es la Fase 3 del plan de trabajo.
 - Emular un ARM11 a 268 MHz con un intérprete sobre un Cortex-A9 a 444 MHz
   deja muy poco margen.
 
@@ -65,7 +78,7 @@ bus 222 MHz, GPU 222 MHz).
 | **HTTPS** | La Vita no trae OpenSSL. Las peticiones cifradas fallan de forma limpia; el HTTP normal sí funciona. |
 | **Multijugador** | enet se compila pero la Vita usa `sceNetCtl`, con otra API. |
 | **Grabación de vídeo** | Necesita ffmpeg, que no existe aquí. |
-| **Modo New 3DS** | Forzado a 3DS original: los 128 MB extra de FCRAM no caben en el presupuesto de memoria de la Vita. |
+| **Modo New 3DS** | Desactivado por defecto, pero ya no es imposible: con el modo de memoria ampliada pide ~290 MB de los ~365 disponibles, y por eso la opción exige `AZAHAR_HEAP_MB=288` y comprobar antes en la consola que el modo ampliado se concede. Sigue en `OFF` en el VPK de serie. |
 | **Giroscopio / acelerómetro** | Se devuelve una consola quieta. Mantener despiertos los sensores cuesta CPU que no sobra. |
 | **Cámara y micrófono** | Sin implementar. |
 
@@ -89,15 +102,19 @@ mueves el proyecto.
 ### Si no arranca en la consola
 
 Lo primero que hay que mirar es la memoria. El emulador pide un heap de
-**288 MB** (`_newlib_heap_size_user` en `src/citra_vita/main.cpp`), que solo
-cabe gracias al modo de memoria ampliada que activa `ATTRIBUTE2=12` en el
-`param.sfo`. Ese bloque lo reserva libc **antes** de `main()`: si no cabe, la
-aplicación no llega ni a pintar nada. Si se cierra nada más abrirla, baja ese
-valor (por ejemplo a 200 MB) y vuelve a compilar.
+**216 MB** (`AZAHAR_HEAP_MB` en el `CMakeLists.txt` raíz), que cabe tanto en el
+presupuesto normal (~256 MB) como en el ampliado (~365 MB) que pide
+`ATTRIBUTE2=12` en el `param.sfo`. Si el firmware no arranca la aplicación con
+ese atributo, se revierte con `-DAZAHAR_EXTENDED_MEMORY=OFF` sin tocar nada más
+(ver los comentarios del `CMakeLists.txt` de `src/citra_vita`).
 
-El desglose de por qué hacen falta tantos: FCRAM del 3DS 128 MB + VRAM 6 MB +
-RAM extra del New 3DS 4 MB + DSP 512 KB + tablas de páginas ~5 MB por proceso
-+ caché del rasterizador y memoria de trabajo.
+Para no adivinar: la pantalla de arranque pinta la memoria de usuario que hay de
+verdad y si el modo ampliado se ha concedido (`mem usuario ... MB ... (modo
+ampliado SI/no)`), y esa misma línea queda anotada en `crash.txt`.
+
+El desglose de para qué hace falta: FCRAM del 3DS 128 MB + VRAM 6 MB + DSP
+512 KB + tablas de páginas ~5 MB por proceso + caché del rasterizador y memoria
+de trabajo.
 
 ---
 
@@ -114,8 +131,15 @@ azaharvita/
 └── src/
     ├── citra_vita/           frontend nativo (NUEVO)
     │   ├── main.cpp          arranque, menú de ROMs, bucle
-    │   ├── vita_window.cpp   EmuWindow: presenta con vita2d
+    │   ├── vita_window.cpp   EmuWindow: presenta con GXM o vita2d
+    │   ├── vita_version.h    versión del port (única fuente)
     │   └── vita_input.cpp    mandos y táctil
+    ├── video_core/renderer_gxm/  backend GXM (NUEVO)
+    │   ├── renderer_gxm.*        renderer de la API GXM (delega el rasterizado)
+    │   ├── rasterizer_gxm.h      rasterizador: hoy reenvía al de software
+    │   ├── gxm_presenter.*       dibuja las pantallas con sceGxmDraw
+    │   ├── gxm_memory.*          memoria reservada y mapeada para la GPU
+    │   └── gxm_pica_format.h     formato GXM de cada formato del 3DS
     ├── vita_compat/include/  shims de POSIX que la newlib no trae
     ├── audio_core/vita_sink.*  salida de audio por sceAudioOut (NUEVO)
     ├── common/  core/  video_core/  audio_core/  network/
@@ -139,6 +163,11 @@ marcados con `#ifdef __PSVITA__` para que se vean de un vistazo.
 
 Los más relevantes:
 
+- **`video_core/renderer_gxm/`**: backend nuevo, no un parche de los de
+  escritorio. Implementa `RendererBase` y `RasterizerInterface` (que en esta
+  fase delega en el de software) y presenta las pantallas con `sceGxmDraw` y
+  texturas GXM. Los dos shaders de presentación son propios y se compilan en la
+  consola con `libshacccg.suprx`; si no está, se presenta con vita2d.
 - **`-fno-short-enums`** (en `CMakeLists.txt`). El ABI de ARM empaqueta los
   enums al byte; Citra da por hecho que ocupan 4 bytes porque mapea las
   estructuras de registros de la PICA200 sobre la memoria del 3DS campo a

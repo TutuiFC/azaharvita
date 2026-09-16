@@ -86,7 +86,11 @@ public:
         switch_disk_resources_callback = callback;
     }
 
-    void SetAccurateMul(bool accurate_mul_) {
+    /// Virtual para que un backend que delega en otro (RasterizerGXM, que en su
+    /// fase 2 reenvia todo al de software) pueda propagar el ajuste al
+    /// rasterizador que de verdad sombrea. Sin esto, la llamada se queda en el
+    /// objeto intermedio y el de dentro trabaja con el valor contrario.
+    virtual void SetAccurateMul(bool accurate_mul_) {
         accurate_mul = accurate_mul_;
     }
 

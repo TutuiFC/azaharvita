@@ -4,10 +4,15 @@
 
 #pragma once
 
+#include <memory>
 #include <psp2/kernel/processmgr.h>
 #include <vita2d.h>
 #include "core/frontend/emu_window.h"
 #include "video_core/renderer_software/renderer_software.h"
+
+namespace Gxm {
+class ScreenPresenter;
+}
 
 namespace VitaFrontend {
 
@@ -80,6 +85,24 @@ private:
 
     vita2d_texture* top_texture = nullptr;
     vita2d_texture* bottom_texture = nullptr;
+
+    /**
+     * Presentacion con el chip grafico (sceGxm).
+     *
+     * Se crea solo cuando la API activa es GXM y se inicializa en su primera
+     * presentacion. Si no puede (falta libshacccg.suprx, falla la compilacion
+     * de los shaders, no hay memoria), se queda apagado y PresentScreens sigue
+     * por vita2d exactamente como antes: es una degradacion silenciosa a
+     * proposito. El resultado se ve en la linea "pres" del overlay.
+     */
+    std::unique_ptr<Gxm::ScreenPresenter> gxm_presenter;
+    /// Linea "pres ..." del overlay, ya montada ("pres gxm", "pres vita2d (sin
+    /// libshacccg)"). Se rehace en cada fotograma porque el presentador puede
+    /// apagarse a mitad de partida si se queda sin memoria de GPU.
+    char presenter_line[48] = "pres vita2d (software)";
+    /// True cuando el ultimo fotograma lo ha dibujado GXM. Solo cambia el color
+    /// de esa linea.
+    bool presenter_uses_gxm = false;
 
     bool should_exit = false;
     bool is_touching = false;

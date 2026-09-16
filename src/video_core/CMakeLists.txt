@@ -117,6 +117,23 @@ if (ENABLE_SOFTWARE_RENDERER)
         renderer_software/sw_texturing.cpp
         renderer_software/sw_texturing.h
     )
+
+    # Backend nativo de PS Vita contra sceGxm. En esta fase contiene al de
+    # software y lo delega todo (rasterizado incluido); lo nuevo es la
+    # presentacion, que dibuja los fotogramas con el chip. Ver
+    # renderer_gxm/renderer_gxm.h y renderer_gxm/gxm_presenter.h.
+    if (VITA)
+        target_sources(video_core PRIVATE
+            renderer_gxm/gxm_memory.cpp
+            renderer_gxm/gxm_memory.h
+            renderer_gxm/gxm_pica_format.h
+            renderer_gxm/gxm_presenter.cpp
+            renderer_gxm/gxm_presenter.h
+            renderer_gxm/rasterizer_gxm.h
+            renderer_gxm/renderer_gxm.cpp
+            renderer_gxm/renderer_gxm.h
+        )
+    endif()
 endif()
 if (ENABLE_OPENGL)
     target_sources(video_core PRIVATE

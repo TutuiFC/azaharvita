@@ -6,7 +6,9 @@
 
 #include <psp2/gxm.h>
 #include "common/common_types.h"
-#include "video_core/rasterizer_cache/pixel_format.h"
+// Pica::PixelFormat se define aqui; rasterizer_cache/pixel_format.h solo lo
+// declara por delante y no basta para nombrar sus valores.
+#include "video_core/pica/regs_external.h"
 
 namespace Gxm {
 

@@ -5,6 +5,9 @@
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "video_core/gpu.h"
+#ifdef __PSVITA__
+#include "video_core/renderer_gxm/renderer_gxm.h"
+#endif
 #ifdef ENABLE_OPENGL
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #endif
@@ -30,6 +33,12 @@ std::unique_ptr<RendererBase> CreateRenderer(Frontend::EmuWindow& emu_window,
 #ifdef ENABLE_SOFTWARE_RENDERER
     case Settings::GraphicsAPI::Software:
         return std::make_unique<SwRenderer::RendererSoftware>(system, pica, emu_window);
+#endif
+#ifdef __PSVITA__
+    case Settings::GraphicsAPI::GXM:
+        // Backend nativo de la consola. En esta fase presenta con sceGxm lo
+        // que sigue rasterizando el camino de software; ver renderer_gxm.h.
+        return std::make_unique<Gxm::RendererGXM>(system, pica, emu_window);
 #endif
 #ifdef ENABLE_VULKAN
     case Settings::GraphicsAPI::Vulkan:
