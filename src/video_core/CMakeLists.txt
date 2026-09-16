@@ -133,6 +133,8 @@ if (ENABLE_SOFTWARE_RENDERER)
             renderer_gxm/rasterizer_gxm.h
             renderer_gxm/gxm_texture_cache.cpp
             renderer_gxm/gxm_texture_cache.h
+            renderer_gxm/gxm_cg.cpp
+            renderer_gxm/gxm_cg.h
             renderer_gxm/renderer_gxm.cpp
             renderer_gxm/renderer_gxm.h
             # Generador de shaders Cg del backend GXM: el tercer hermano de

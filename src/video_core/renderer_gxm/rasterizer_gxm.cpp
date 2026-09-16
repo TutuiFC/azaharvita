@@ -20,6 +20,7 @@
 #include "video_core/pica/regs_framebuffer.h"
 #include "video_core/pica/regs_rasterizer.h"
 #include "video_core/pica_types.h"
+#include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_texture_cache.h"
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
 
@@ -57,58 +58,14 @@ void CgFree(void* pointer) {
 }
 
 bool EnsureCgModule() {
-    if (g_module >= 0) {
-        return true;
-    }
-    for (const char* path : kShacccgPaths) {
-        g_module = sceKernelLoadStartModule(path, 0, nullptr, 0, nullptr, nullptr);
-        if (g_module >= 0) {
-            break;
-        }
-        // El codigo importa: un fallo en plena carga del juego puede ser falta
-        // de memoria, no que el fichero no exista. Sin esto, todo se resume en
-        // "sin libshacccg" y se depura a ciegas.
-        LOG_ERROR(Render, "GXM: cargar {} fallo con {:#x}", path, static_cast<u32>(g_module));
-    }
-    if (g_module < 0) {
-        return false;
-    }
-    sceShaccCgSetDefaultAllocator(&CgAlloc, &CgFree);
-    sceShaccCgInitializeCallbackList(&g_callbacks, SCE_SHACCCG_TRIVIAL);
-    g_callbacks.openFile = &OpenSource;
-    return true;
+    // Delegado en el cargador compartido (renderer_gxm/gxm_cg.*): el modulo es
+    // estado global del proceso y aqui, por separado, el segundo intento fallaba
+    // y se reintentaba en cada lote (450 ms -> 13.734 ms de fotograma).
+    return EnsureCgReady();
 }
 
-const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
-                                         const char* source) {
-    g_source.fileName = name;
-    g_source.text = source;
-    g_source.size = static_cast<SceUInt32>(std::strlen(source));
-
-    SceShaccCgCompileOptions options{};
-    sceShaccCgInitializeCompileOptions(&options);
-    options.mainSourceFile = name;
-    options.targetProfile = profile;
-    options.entryFunctionName = "main";
-
-    const SceShaccCgCompileOutput* output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
-    if (output == nullptr || output->programData == nullptr) {
-        if (output != nullptr) {
-            for (int i = 0; i < output->diagnosticCount && i < 4; i++) {
-                LOG_ERROR(Render, "GXM {}: {}", name,
-                          output->diagnostics[i].message != nullptr
-                              ? output->diagnostics[i].message
-                              : "(sin mensaje)");
-            }
-            sceShaccCgDestroyCompileOutput(output);
-        } else {
-            LOG_ERROR(Render, "GXM: el compilador no devolvio nada para {}", name);
-        }
-        Common::VitaNote("gxm shader", name);
-        return nullptr;
-    }
-    return output;
-}
+// Las llamadas a CompileCg de este fichero van directas a la compartida
+// (Gxm::CompileCg, gxm_cg.h): tener aqui una copia hacia ambigua la llamada.
 
 /**
  * Shader de vertices fijo: los vertices llegan del interprete de la PICA ya en

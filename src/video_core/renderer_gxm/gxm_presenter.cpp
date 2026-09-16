@@ -10,6 +10,7 @@
 #include <psp2/kernel/modulemgr.h>
 #include "common/logging/log.h"
 #include "common/vita_diag.h"
+#include "video_core/renderer_gxm/gxm_cg.h"
 
 namespace Gxm {
 
@@ -135,27 +136,14 @@ bool ScreenPresenter::Init() {
         return false;
     };
 
-    // 1. El compilador. Es lo unico que puede no estar en la consola.
-    for (const char* path : kShacccgPaths) {
-        module_id = sceKernelLoadStartModule(path, 0, nullptr, 0, nullptr, nullptr);
-        if (module_id >= 0) {
-            LOG_INFO(Render, "GXM: libshacccg cargado desde {}", path);
-            break;
-        }
-    }
-    if (module_id < 0) {
-        // Sin compilador no hay shaders y sin shaders no hay dibujado: se dice
-        // y se deja que el frontend siga por vita2d. El juego no se entera.
+    // 1. El compilador, COMPARTIDO con el rasterizador (ver gxm_cg.h): cargarlo
+    //    por separado hacia que el segundo intento fallara y que el
+    //    rasterizador lo reintentara en cada lote, con un coste enorme.
+    if (!EnsureCgReady()) {
         status = "vita2d (sin libshacccg)";
         LOG_WARNING(Render, "GXM: no hay libshacccg.suprx; se presenta con vita2d");
         return false;
     }
-
-    // El compilador necesita un asignador propio ANTES de compilar: este es el
-    // orden que documenta la API.
-    sceShaccCgSetDefaultAllocator(&ShaccCgAlloc, &ShaccCgFree);
-    sceShaccCgInitializeCallbackList(&shader_callbacks, SCE_SHACCCG_TRIVIAL);
-    shader_callbacks.openFile = &OpenSource;
 
     // 2. El contexto. Es el de vita2d; GXM solo admite uno por proceso y este
     //    es el que abre y cierra la escena.
@@ -319,34 +307,8 @@ void ScreenPresenter::Release() {
 
 const SceShaccCgCompileOutput* ScreenPresenter::CompileShader(SceShaccCgTargetProfile profile,
                                                               const char* name, const char* source) {
-    g_source.fileName = name;
-    g_source.text = source;
-    g_source.size = static_cast<SceUInt32>(std::strlen(source));
-
-    SceShaccCgCompileOptions options{};
-    sceShaccCgInitializeCompileOptions(&options);
-    options.mainSourceFile = name;
-    options.targetProfile = profile;
-    options.entryFunctionName = "main";
-
-    const SceShaccCgCompileOutput* output = sceShaccCgCompileProgram(&options, &shader_callbacks, 0);
-    if (output == nullptr || output->programData == nullptr) {
-        // Los diagnosticos son lo unico que dice que linea del Cg no le ha
-        // gustado. Van al registro, recortados: en pantalla no caben.
-        if (output != nullptr) {
-            for (int i = 0; i < output->diagnosticCount && i < 6; i++) {
-                const SceShaccCgDiagnosticMessage& diagnostic = output->diagnostics[i];
-                LOG_ERROR(Render, "GXM {}: {}", name,
-                          diagnostic.message != nullptr ? diagnostic.message : "(sin mensaje)");
-            }
-            sceShaccCgDestroyCompileOutput(output);
-        } else {
-            LOG_ERROR(Render, "GXM: el compilador no devolvio nada para {}", name);
-        }
-        Common::VitaNote("gxm shader", name);
-        return nullptr;
-    }
-    return output;
+    // Delegado en el compilador compartido; ver gxm_cg.h.
+    return Gxm::CompileCg(profile, name, source);
 }
 
 ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
