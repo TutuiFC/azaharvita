@@ -132,6 +132,10 @@ if (ENABLE_SOFTWARE_RENDERER)
             renderer_gxm/rasterizer_gxm.h
             renderer_gxm/renderer_gxm.cpp
             renderer_gxm/renderer_gxm.h
+            # Generador de shaders Cg del backend GXM: el tercer hermano de
+            # glsl_fs_shader_gen y spv_fs_shader_gen, mismo PicaFSConfig.
+            shader/generator/cg_fs_shader_gen.cpp
+            shader/generator/cg_fs_shader_gen.h
         )
     endif()
 endif()

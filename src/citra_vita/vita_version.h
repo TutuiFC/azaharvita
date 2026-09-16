@@ -22,10 +22,14 @@ namespace VitaFrontend {
  * NUMERACION: se reinicio en 0.0.1.0 al empezar el trabajo de rendimiento. Los
  * ELF de la serie anterior (0.0.2.5 a 0.0.3.9) siguen en elf/ y no se pueden
  * pisar, asi que al subir el numero hay que saltarse los que ya existan alli.
+ *
+ * 0.1.0.0: el usuario verifico en consola el cierre de la Fase 2 (presentacion
+ * por GXM identica al camino de software) y se abre la Fase 3 con el generador
+ * de shaders Cg.
  */
-constexpr char kVersion[] = "version 0.0.1.1";
+constexpr char kVersion[] = "version 0.1.0.0";
 
-/// La misma version con el nombre delante, para el overlay ("Azahar 0.0.1.1").
-constexpr char kOverlayBuild[] = "Azahar 0.0.1.1";
+/// La misma version con el nombre delante, para el overlay ("Azahar 0.1.0.0").
+constexpr char kOverlayBuild[] = "Azahar 0.1.0.0";
 
 } // namespace VitaFrontend
