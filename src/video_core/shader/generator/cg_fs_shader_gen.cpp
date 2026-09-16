@@ -43,10 +43,17 @@ bool IsSupported(const FSConfig& config, const char** out_reason) {
     if (config.proctex.enable) {
         return reject("proctex");
     }
-    // Shadow maps: necesita una pasada y el muestreo de la sombra.
-    if (config.framebuffer.shadow_rendering || config.texture.shadow_texture_orthographic) {
-        return reject("shadow");
+    // Pase de sombras: cuando la PICA esta escribiendo el mapa de sombras, el
+    // shader no pinta color sino profundidad empaquetada. Sin atomos ni imagenes
+    // en GXM todavia no se puede reproducir, asi que va a software.
+    if (config.framebuffer.shadow_rendering) {
+        return reject("shadow pass");
     }
+    // OJO: shadow_texture_orthographic NO se rechaza. Es una bandera de la
+    // configuracion de textura que solo usan los shaders que muestrean una
+    // textura de sombra (via texture0_type, que si se comprueba abajo); en un
+    // dibujado normal no cambia nada. Rechazarla tiraba a software lotes que no
+    // tienen nada de sombras (medido en consola con NSMB2: era el unico motivo).
     // Gas está sin implementar hasta en el de GLSL; Fog si está soportada.
     if (config.texture.fog_mode == TexturingRegs::FogMode::Gas) {
         return reject("fog gas");
