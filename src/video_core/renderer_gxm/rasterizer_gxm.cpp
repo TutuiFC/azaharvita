@@ -219,6 +219,10 @@ struct RasterizerGXM::Surface {
     PAddr guest_address = 0;
     u32 width = 0;
     u32 height = 0;
+    /// Bytes por fila del framebuffer del invitado. NO es width*bpp: los juegos
+    /// alinean las filas (medido en consola: 512 bytes para 240x400 en RGB5A1),
+    /// y volcar con el stride natural corrompe la imagen.
+    u32 guest_stride = 0;
     /// Bytes por pixel del framebuffer del invitado (2, 3 o 4).
     u32 bpp = 0;
     /// Formatos de la copia (color surface <-> invitado). Con el mismo tamano
@@ -238,10 +242,6 @@ struct RasterizerGXM::Surface {
     Allocation depth_buffer;
     Allocation notification_word;
     SceGxmNotification notification{};
-
-    u32 stride_bytes() const {
-        return width * bpp;
-    }
 };
 
 /// Comprueba que el tramo [address, address + size) de la memoria del invitado
@@ -582,7 +582,7 @@ void RasterizerGXM::FlushPending() {
             surface->copy_src, SCE_GXM_TRANSFER_TILED, surface->color_buffer.Data(), 0, 0,
             static_cast<int>(surface->rt_stride), surface->copy_dst, SCE_GXM_TRANSFER_LINEAR,
             memory.GetPhysicalPointer(surface->guest_address), 0, 0,
-            static_cast<int>(surface->stride_bytes()), nullptr, 0, nullptr);
+            static_cast<int>(surface->guest_stride), nullptr, 0, nullptr);
         if (rc < 0) {
             LOG_ERROR(Render, "GXM: el volcado del framebuffer fallo ({:#x})", static_cast<u32>(rc));
         }
@@ -652,15 +652,47 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     default:
         return nullptr;
     }
-    const PAddr address = config.color_buffer_address * 8;
-    const u32 width = config.width;
-    const u32 height = config.height;
-    if (width == 0 || height == 0 || width > 1024 || height > 1024 || address == 0) {
+    PAddr address = config.color_buffer_address * 8;
+    u32 width = config.width;
+    u32 height = config.height;
+    u32 guest_stride = 0;
+    // La configuracion de DIBUJADO no lleva stride, y sus dimensiones pueden
+    // venir a cero (el juego las fija por otro camino). La configuracion de
+    // PANTALLA que usa la misma direccion si lo tiene: se busca por direccion y
+    // se toman de ahi el stride y, si hace falta, las dimensiones.
+    for (u32 i = 0; i < 2 && address != 0; i++) {
+        const auto& display = pica.regs.framebuffer_config[i];
+        const PAddr candidates[4] = {display.address_left1 * 8, display.address_left2 * 8,
+                                     display.address_right1 * 8, display.address_right2 * 8};
+        bool matches = false;
+        for (const PAddr candidate : candidates) {
+            if (candidate != 0 && candidate == address) {
+                matches = true;
+            }
+        }
+        if (!matches) {
+            continue;
+        }
+        guest_stride = display.stride;
+        if (width == 0 || width > 1024) {
+            width = display.width;
+        }
+        if (height == 0 || height > 1024) {
+            height = display.height;
+        }
+        break;
+    }
+    if (address == 0 || width == 0 || height == 0 || width > 1024 || height > 1024) {
         return nullptr;
+    }
+    if (guest_stride == 0) {
+        // Sin configuracion de pantalla que case, se usa el stride natural; es
+        // lo correcto para juegos que no alinean las filas.
+        guest_stride = width * bpp;
     }
     // El framebuffer del invitado tiene que estar entero mapeado y contiguo:
     // la copia inicial de contenido y los volcados lo recorren completo.
-    if (!GuestSpanMapped(memory, address, width * height * bpp)) {
+    if (!GuestSpanMapped(memory, address, guest_stride * height)) {
         return nullptr;
     }
     const bool depth16 = config.depth_format.Value() == FramebufferRegs::DepthFormat::D16;
@@ -684,6 +716,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     surface->width = width;
     surface->height = height;
     surface->bpp = bpp;
+    surface->guest_stride = guest_stride;
     surface->copy_src = copy_src;
     surface->copy_dst = copy_dst;
 
@@ -754,7 +787,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     const u8* guest = memory.GetPhysicalPointer(address);
     if (guest != nullptr) {
         sceGxmTransferCopy(width, height, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE, copy_src,
-                           SCE_GXM_TRANSFER_LINEAR, guest, 0, 0, static_cast<int>(width * bpp),
+                           SCE_GXM_TRANSFER_LINEAR, guest, 0, 0, static_cast<int>(guest_stride),
                            copy_dst, SCE_GXM_TRANSFER_TILED, surface->color_buffer.Data(), 0, 0,
                            static_cast<int>(surface->rt_stride), nullptr, 0, nullptr);
     }
