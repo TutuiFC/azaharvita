@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <fmt/format.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/shacccg.h>
 #include <vita2d.h>
@@ -532,23 +533,27 @@ bool RasterizerGXM::EnsureInitialized() {
     initialized = true;
     if (!EnsureCgModule()) {
         status = "sin libshacccg";
+        Common::VitaNote("gxm init", "sin libshacccg");
         return false;
     }
     context = vita2d_get_context();
     patcher = vita2d_get_shader_patcher();
     if (context == nullptr || patcher == nullptr) {
         status = "sin contexto gxm";
+        Common::VitaNote("gxm init", "sin contexto");
         return false;
     }
     pipelines = std::make_unique<PipelineCache>(context, patcher);
     if (!pipelines->Initialize()) {
         status = "error de shader";
+        Common::VitaNote("gxm init", "shader de vertices");
         pipelines.reset();
         return false;
     }
     textures = std::make_unique<TextureCache>();
     available = true;
     status = "gxm";
+    Common::VitaNote("gxm init", "rasterizador listo");
     LOG_INFO(Render, "GXM: rasterizador de la GPU listo (shaders compilados en runtime)");
     return true;
 }
@@ -629,6 +634,9 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     }
 
     // Nueva superficie: reservar color y profundidad y crear el render target.
+    // Antes hay que cerrar cualquier escena abierta: crear un render target con
+    // una escena en marcha no es legal en GXM.
+    EndScene();
     auto surface = std::make_unique<Surface>();
     surface->guest_address = address;
     surface->width = width;
@@ -643,6 +651,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     if (!surface->color_buffer.Valid() || !surface->depth_buffer.Valid() ||
         !surface->notification_word.Valid()) {
         LOG_ERROR(Render, "GXM: sin memoria para la superficie de dibujado");
+        Common::VitaNote("gxm fb", "sin memoria");
         return nullptr;
     }
     std::memset(surface->color_buffer.Data(), 0, surface->color_buffer.Size());
@@ -666,7 +675,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     params.flags = 0;
     params.width = static_cast<u16>(width);
     params.height = static_cast<u16>(height);
-    params.scenesPerFrame = 4;
+    params.scenesPerFrame = 16;
     params.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
     params.multisampleLocations = 0;
     // La memoria del driver la reservamos nosotros: el SDK de Vita no define
@@ -721,6 +730,14 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
 
     Surface* result = surface.get();
     surfaces.emplace_back(std::move(surface));
+    {
+        char note[64];
+        const auto written =
+            fmt::format_to_n(note, sizeof(note) - 1, "addr {:#x} {}x{} creada", address, width,
+                             height);
+        *written.out = 0;
+        Common::VitaNote("gxm fb", note);
+    }
     return result;
 }
 
@@ -761,6 +778,13 @@ bool RasterizerGXM::DrawBatchOnGpu() {
     Surface* surface = CurrentSurface();
     if (surface == nullptr) {
         return false;
+    }
+    // GXM solo admite UNA escena abierta: si la que hay es de otra superficie
+    // (juegos con doble buffer alternan framebuffers), se cierra antes de
+    // empezar la nueva. Sin esto, el segundo sceGxmBeginScene con la primera
+    // escena en marcha es una caida.
+    if (open_surface != nullptr && open_surface != surface) {
+        EndScene();
     }
     const u32 vertex_count = static_cast<u32>(batch.size());
     if (vertex_count == 0) {
@@ -925,6 +949,15 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         drawn += chunk;
     }
     surface->dirty = true;
+    {
+        // Nota unica: con esto, un volcado posterior sabe si la GPU llego a
+        // dibujar algo, que es la duda que dejo el ultimo crash.
+        static bool noted_first_draw = false;
+        if (!noted_first_draw) {
+            noted_first_draw = true;
+            Common::VitaNote("gxm draw", "primer lote dibujado en la GPU");
+        }
+    }
     gpu_triangles.fetch_add(vertex_count / 3, std::memory_order_relaxed);
     return true;
 }
