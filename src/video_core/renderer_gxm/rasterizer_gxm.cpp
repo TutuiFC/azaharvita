@@ -258,6 +258,7 @@ struct RasterizerGXM::Surface {
     PAddr guest_address = 0;
     u32 width = 0;
     u32 height = 0;
+    Pica::FramebufferRegs::ColorFormat color_format = Pica::FramebufferRegs::ColorFormat::RGBA8;
     bool dirty = false;
     bool scene_open = false;
     SceGxmRenderTarget* render_target = nullptr;
@@ -269,8 +270,13 @@ struct RasterizerGXM::Surface {
     Allocation notification_word;
     SceGxmNotification notification{};
 
+    /// Bytes por pixel del framebuffer del invitado (3 en RGB8, 4 en RGBA8).
+    u32 guest_bpp() const {
+        return color_format == Pica::FramebufferRegs::ColorFormat::RGB8 ? 3u : 4u;
+    }
+
     u32 stride_bytes() const {
-        return width * 4;
+        return width * guest_bpp();
     }
 };
 
@@ -558,6 +564,13 @@ bool RasterizerGXM::EnsureInitialized() {
     return true;
 }
 
+void RasterizerGXM::NoteSkip(u32 index, const char* reason) {
+    if (index < 5 && !skip_noted[index]) {
+        skip_noted[index] = true;
+        Common::VitaNote("gxm skip", reason);
+    }
+}
+
 void RasterizerGXM::EndScene() {
     if (open_surface == nullptr) {
         return;
@@ -583,14 +596,19 @@ void RasterizerGXM::FlushPending() {
             continue;
         }
         surface->dirty = false;
-        // Color: misma disposicion de canales en los dos lados (el color
-        // surface es RGBA y el invitado guarda su RGBA8 igual), asi que la
-        // copia es byte a byte.
+        // Del render target (siempre 32 bits) al framebuffer del invitado. Para
+        // RGBA8 la copia es byte a byte; para RGB8, el color surface esta en
+        // ARGB (memoria B,G,R,A) y el destino de 24 bits (BGR) copia los tres
+        // primeros bytes tal cual: los dos describen el mismo orden.
+        const bool guest_rgb8 = surface->color_format == FramebufferRegs::ColorFormat::RGB8;
+        const SceGxmTransferFormat dest_format =
+            guest_rgb8 ? SCE_GXM_TRANSFER_FORMAT_U8U8U8_BGR
+                       : SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR;
         const int rc = sceGxmTransferCopy(
             surface->width, surface->height, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE,
             SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR, SCE_GXM_TRANSFER_TILED,
-            surface->color_buffer.Data(), 0, 0, static_cast<int>(surface->stride_bytes()),
-            SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR, SCE_GXM_TRANSFER_LINEAR,
+            surface->color_buffer.Data(), 0, 0,
+            static_cast<int>(surface->width * 4), dest_format, SCE_GXM_TRANSFER_LINEAR,
             memory.GetPhysicalPointer(surface->guest_address), 0, 0,
             static_cast<int>(surface->stride_bytes()), nullptr, 0, nullptr);
         if (rc < 0) {
@@ -604,12 +622,28 @@ void RasterizerGXM::FlushPending() {
 
 RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     const auto& config = pica.regs.internal.framebuffer.framebuffer;
-    // Solo RGBA8: el volcado al invitado necesita que emisor y receptor tengan
-    // los mismos bytes; con 16 bits o 24 no hay formato de transferencia que
-    // respete el orden de canales del 3DS todavia.
-    if (config.color_format.Value() != FramebufferRegs::ColorFormat::RGBA8) {
+    /**
+     * Formatos de framebuffer soportados y por que el color surface no siempre
+     * es "RGBA".
+     *
+     * El invitado guarda su RGB8 en el orden B,G,R y su RGBA8 en A,B,G,R. El
+     * render target es siempre de 32 bits (no hay color surface de 24), asi que
+     * lo que se hace es elegir el NOMBRE del formato GXM de forma que la salida
+     * estandar del shader (r,g,b,a) caiga en los bytes que espera el invitado
+     * (los nombres listan los canales del byte mas significativo al menos):
+     *
+     *   invitado RGBA8 [A,B,G,R] <- surface U8U8U8U8_RGBA  (memoria [A,B,G,R])
+     *   invitado RGB8  [B,G,R]   <- surface U8U8U8U8_ARGB  (memoria [B,G,R,A])
+     *
+     * y al volcar, la transferencia copia los bytes 0..2 tal cual a un
+     * destino de 24 bits (BGR), que es lo que describe el mismo orden.
+     */
+    const auto guest_format = config.color_format.Value();
+    if (guest_format != FramebufferRegs::ColorFormat::RGBA8 &&
+        guest_format != FramebufferRegs::ColorFormat::RGB8) {
         return nullptr;
     }
+    const u32 bpp = guest_format == FramebufferRegs::ColorFormat::RGB8 ? 3u : 4u;
     const PAddr address = config.color_buffer_address * 8;
     const u32 width = config.width;
     const u32 height = config.height;
@@ -618,7 +652,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     }
     // El framebuffer del invitado tiene que estar entero mapeado y contiguo:
     // la copia inicial de contenido y los volcados lo recorren completo.
-    if (!GuestSpanMapped(memory, address, width * height * 4)) {
+    if (!GuestSpanMapped(memory, address, width * height * bpp)) {
         return nullptr;
     }
     const bool depth16 = config.depth_format.Value() == FramebufferRegs::DepthFormat::D16;
@@ -641,6 +675,13 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     surface->guest_address = address;
     surface->width = width;
     surface->height = height;
+    surface->color_format = guest_format;
+    // El nombre del color surface lo elige el formato del invitado: ver el
+    // comentario de arriba sobre el orden de canales.
+    const SceGxmColorFormat rt_color_format =
+        guest_format == FramebufferRegs::ColorFormat::RGBA8
+            ? SCE_GXM_COLOR_FORMAT_U8U8U8U8_RGBA
+            : SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB;
 
     const u32 aligned_width = (width + 7) & ~7u;
     const u32 aligned_height = (height + 7) & ~7u;
@@ -657,7 +698,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     std::memset(surface->color_buffer.Data(), 0, surface->color_buffer.Size());
     std::memset(surface->depth_buffer.Data(), 0, surface->depth_buffer.Size());
 
-    if (sceGxmColorSurfaceInit(&surface->color_surface, SCE_GXM_COLOR_FORMAT_U8U8U8U8_RGBA,
+    if (sceGxmColorSurfaceInit(&surface->color_surface, rt_color_format,
                                SCE_GXM_COLOR_SURFACE_TILED, SCE_GXM_COLOR_SURFACE_SCALE_NONE,
                                SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, width, height, aligned_width,
                                surface->color_buffer.Data()) != 0) {
@@ -707,12 +748,15 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     // dos sentidos de la memoria (color y, si el juego lo usa, profundidad).
     const u8* guest = memory.GetPhysicalPointer(address);
     if (guest != nullptr) {
+        const SceGxmTransferFormat guest_color_format =
+            guest_format == FramebufferRegs::ColorFormat::RGB8
+                ? SCE_GXM_TRANSFER_FORMAT_U8U8U8_BGR
+                : SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR;
         sceGxmTransferCopy(width, height, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE,
-                           SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR, SCE_GXM_TRANSFER_LINEAR, guest, 0,
-                           0, static_cast<int>(width * 4),
-                           SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR, SCE_GXM_TRANSFER_TILED,
-                           surface->color_buffer.Data(), 0, 0, static_cast<int>(width * 4),
-                           nullptr, 0, nullptr);
+                           guest_color_format, SCE_GXM_TRANSFER_LINEAR, guest, 0, 0,
+                           static_cast<int>(width * bpp), guest_color_format,
+                           SCE_GXM_TRANSFER_TILED, surface->color_buffer.Data(), 0, 0,
+                           static_cast<int>(width * bpp), nullptr, 0, nullptr);
     }
     if (depth_mapped) {
         const u8* guest_depth = memory.GetPhysicalPointer(depth_address);
@@ -758,9 +802,14 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
             const bool wbuffering = pica.regs.internal.rasterizer.depthmap_enable ==
                                     RasterizerRegs::DepthBuffering::WBuffering;
             batch_on_gpu = source.has_value() && !scissor && !wbuffering;
+            if (!batch_on_gpu) {
+                NoteSkip(scissor ? 0 : (wbuffering ? 1 : 2),
+                         scissor ? "scissor" : (wbuffering ? "wbuffer" : "shader"));
+            }
         }
         if (batch_on_gpu && CurrentSurface() == nullptr) {
             batch_on_gpu = false;
+            NoteSkip(3, "framebuffer");
         }
     }
 
@@ -904,6 +953,7 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         }
         const SceGxmTexture* texture = textures->Get(i, pica.regs.internal, memory);
         if (texture == nullptr) {
+            NoteSkip(4, "textura");
             return false;
         }
         sceGxmSetFragmentTexture(context, pipeline->sampler_units[i], texture);

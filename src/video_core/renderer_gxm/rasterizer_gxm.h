@@ -115,6 +115,11 @@ private:
     /// Cierra la escena GXM si hay una abierta.
     void EndScene();
 
+    /// Anota UNA vez por motivo el rechazo de un lote (va a crash.txt). Sin
+    /// esto, "tg 0" no dice si el problema es el scissor, el shader o el
+    /// framebuffer, y se depura a ciegas.
+    void NoteSkip(u32 index, const char* reason);
+
     bool EnsureInitialized();
     void Release();
 
@@ -138,6 +143,9 @@ private:
     /// Decision de soporte para el lote en curso: se toma al primer triangulo.
     bool batch_decided = false;
     bool batch_on_gpu = false;
+    /// Motivos de rechazo ya anotados (scissor, wbuffer, shader, framebuffer,
+    /// textura/pipeline).
+    bool skip_noted[5] = {false, false, false, false, false};
 
     /// Buffer de vertices mapeado para la GPU (crece cuando hace falta) y su
     /// buffer de indices secuenciales.
