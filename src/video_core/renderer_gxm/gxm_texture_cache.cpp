@@ -134,6 +134,12 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     if (span == 0) {
         return nullptr;
     }
+    // El tramo entero tiene que estar mapeado y contiguo: la decodificacion
+    // recorre todos los texeles, no solo los que el juego llegue a muestrear.
+    const u8* last = memory.GetPhysicalPointer(address + span - 1);
+    if (last != source + span - 1) {
+        return nullptr;
+    }
 
     const u32 needed = width * height * 4;
     // CDRAM primero: la CPU la escribe una vez y la GPU la lee en cada

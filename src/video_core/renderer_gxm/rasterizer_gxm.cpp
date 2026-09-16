@@ -249,6 +249,9 @@ struct RasterizerGXM::Surface {
         if (render_target != nullptr) {
             sceGxmDestroyRenderTarget(render_target);
         }
+        if (driver_uid >= 0) {
+            sceKernelFreeMemBlock(driver_uid);
+        }
     }
 
     PAddr guest_address = 0;
@@ -257,6 +260,7 @@ struct RasterizerGXM::Surface {
     bool dirty = false;
     bool scene_open = false;
     SceGxmRenderTarget* render_target = nullptr;
+    SceUID driver_uid = -1;
     SceGxmColorSurface color_surface{};
     SceGxmDepthStencilSurface depth_surface{};
     Allocation color_buffer;
@@ -268,6 +272,20 @@ struct RasterizerGXM::Surface {
         return width * 4;
     }
 };
+
+/// Comprueba que el tramo [address, address + size) de la memoria del invitado
+/// este mapeado y sea contiguo. Es la misma comprobacion que hace el
+/// renderizador de software antes de leer un framebuffer: sin ella, una
+/// direccion del juego a medio mapear haria que la GPU leyera memoria que no
+/// existe.
+bool GuestSpanMapped(Memory::MemorySystem& memory, PAddr address, u32 size) {
+    if (size == 0) {
+        return false;
+    }
+    const u8* first = memory.GetPhysicalPointer(address);
+    const u8* last = memory.GetPhysicalPointer(address + size - 1);
+    return first != nullptr && last == first + size - 1;
+}
 
 /**
  * Cache de programas de fragmentos: uno por configuracion TEV y mezcla.
@@ -590,9 +608,19 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     const PAddr address = config.color_buffer_address * 8;
     const u32 width = config.width;
     const u32 height = config.height;
-    if (width == 0 || height == 0) {
+    if (width == 0 || height == 0 || width > 1024 || height > 1024 || address == 0) {
         return nullptr;
     }
+    // El framebuffer del invitado tiene que estar entero mapeado y contiguo:
+    // la copia inicial de contenido y los volcados lo recorren completo.
+    if (!GuestSpanMapped(memory, address, width * height * 4)) {
+        return nullptr;
+    }
+    const bool depth16 = config.depth_format.Value() == FramebufferRegs::DepthFormat::D16;
+    const PAddr depth_address = config.depth_buffer_address * 8;
+    const u32 depth_stride = depth16 ? width * 2 : width * 4;
+    const bool depth_mapped =
+        depth_address != 0 && GuestSpanMapped(memory, depth_address, width * height * depth_stride);
     for (auto& surface : surfaces) {
         if (surface->guest_address == address && surface->width == width &&
             surface->height == height) {
@@ -609,8 +637,6 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     const u32 aligned_width = (width + 7) & ~7u;
     const u32 aligned_height = (height + 7) & ~7u;
     surface->color_buffer = Allocate(Pool::Cdram, aligned_width * aligned_height * 4);
-    const bool depth16 =
-        config.depth_format.Value() == FramebufferRegs::DepthFormat::D16;
     surface->depth_buffer =
         Allocate(Pool::Cdram, aligned_width * aligned_height * (depth16 ? 2 : 4));
     surface->notification_word = Allocate(Pool::Host, 4);
@@ -643,11 +669,30 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     params.scenesPerFrame = 4;
     params.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
     params.multisampleLocations = 0;
-    params.driverMemBlock = static_cast<SceUID>(-1);
+    // La memoria del driver la reservamos nosotros: el SDK de Vita no define
+    // SCE_UID_INVALID_UID, asi que depender de un centinela era una suposicion,
+    // y con una UID que GXM no reconozca el fallo es una caida.
+    unsigned int driver_size = 0;
+    if (sceGxmGetRenderTargetMemSize(&params, &driver_size) < 0 || driver_size == 0) {
+        return nullptr;
+    }
+    const SceUID driver_uid = sceKernelAllocMemBlock(
+        "azahar_gxm_rt", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, driver_size, nullptr);
+    if (driver_uid < 0) {
+        return nullptr;
+    }
+    void* driver_mem = nullptr;
+    if (sceKernelGetMemBlockBase(driver_uid, &driver_mem) < 0) {
+        sceKernelFreeMemBlock(driver_uid);
+        return nullptr;
+    }
+    params.driverMemBlock = driver_uid;
     if (sceGxmCreateRenderTarget(&params, &surface->render_target) != 0) {
+        sceKernelFreeMemBlock(driver_uid);
         LOG_ERROR(Render, "GXM: no se pudo crear el render target");
         return nullptr;
     }
+    surface->driver_uid = driver_uid;
 
     // Copiar dentro lo que ya hubiera en el framebuffer del invitado, en los
     // dos sentidos de la memoria (color y, si el juego lo usa, profundidad).
@@ -659,18 +704,20 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
                            SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR, SCE_GXM_TRANSFER_TILED,
                            surface->color_buffer.Data(), 0, 0, static_cast<int>(width * 4),
                            nullptr, 0, nullptr);
-        const PAddr depth_address = config.depth_buffer_address * 8;
-        const u8* guest_depth = memory.GetPhysicalPointer(depth_address);
-        if (guest_depth != nullptr) {
-            sceGxmTransferCopy(width, height, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE,
-                               SCE_GXM_TRANSFER_FORMAT_RAW32, SCE_GXM_TRANSFER_LINEAR, guest_depth,
-                               0, 0, static_cast<int>(width * 4),
-                               SCE_GXM_TRANSFER_FORMAT_RAW32, SCE_GXM_TRANSFER_TILED,
-                               surface->depth_buffer.Data(), 0, 0, static_cast<int>(width * 4),
-                               nullptr, 0, nullptr);
-        }
-        sceGxmTransferFinish();
     }
+    if (depth_mapped) {
+        const u8* guest_depth = memory.GetPhysicalPointer(depth_address);
+        const SceGxmTransferFormat depth_format =
+            depth16 ? SCE_GXM_TRANSFER_FORMAT_RAW16 : SCE_GXM_TRANSFER_FORMAT_RAW32;
+        const PAddr depth_span = depth16 ? width * height * 2 : width * height * 4;
+        sceGxmTransferCopy(width, height, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE, depth_format,
+                           SCE_GXM_TRANSFER_LINEAR, guest_depth, 0, 0,
+                           static_cast<int>(depth_stride), depth_format,
+                           SCE_GXM_TRANSFER_TILED, surface->depth_buffer.Data(), 0, 0,
+                           static_cast<int>(depth_stride), nullptr, 0, nullptr);
+        (void)depth_span;
+    }
+    sceGxmTransferFinish();
 
     Surface* result = surface.get();
     surfaces.emplace_back(std::move(surface));
