@@ -9,8 +9,10 @@
 #ifdef AZAHAR_VITA_NATIVE_IO
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include "common/vita_diag.h"
 #endif
 #include <array>
+#include <atomic>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -144,6 +146,26 @@ typedef struct stat file_stat_t;
 namespace FileUtil {
 
 using Common::GetLastErrorMsg;
+
+#ifdef AZAHAR_VITA_NATIVE_IO
+namespace {
+/**
+ * Deja constancia en crash.txt de un fallo de E/S del camino nativo.
+ *
+ * Los fallos de fichero son silenciosos de otra forma (el registro de la
+ * consola no escribe a disco), y un fallo de apertura o de redimensionado se
+ * manifiesta como un error del propio juego, sin pista de donde viene. Con
+ * presupuesto: un fallo en bucle no debe inundar la tarjeta.
+ */
+void NoteVitaIOFailure(const char* what, const char* path) {
+    static std::atomic<int> budget{16};
+    if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    Common::VitaNote(what, path != nullptr ? path : "?");
+}
+} // Anonymous namespace
+#endif
 
 // Remove any ending forward slashes from directory paths
 // Modifies argument.
@@ -1333,6 +1355,7 @@ bool IOFile::Open() {
     if (!m_good) {
         LOG_ERROR(Common_Filesystem, "sceIoOpen fallo en {} (modo {}): {:#x}", filename, openmode,
                   static_cast<unsigned int>(m_vita_fd));
+        NoteVitaIOFailure("io open", filename.c_str());
     }
     return m_good;
 #endif
@@ -1508,6 +1531,7 @@ bool IOFile::Seek(s64 off, int origin) {
                                               : SCE_SEEK_END;
     if (sceIoLseek(m_vita_fd, off, whence) < 0) {
         m_good = false;
+        NoteVitaIOFailure("io seek", filename.c_str());
     }
     return m_good;
 #else
@@ -1563,6 +1587,7 @@ std::size_t IOFile::ReadImpl(void* data, std::size_t length, std::size_t elem_si
             sceIoRead(m_vita_fd, data, static_cast<SceSize>(length * elem_size));
         if (got < 0) {
             m_good = false;
+            NoteVitaIOFailure("io read", filename.c_str());
             return 0;
         }
         return static_cast<std::size_t>(got) / elem_size;
@@ -1673,6 +1698,7 @@ std::size_t IOFile::WriteImpl(const void* data, std::size_t length, std::size_t 
             sceIoWrite(m_vita_fd, data, static_cast<SceSize>(length * elem_size));
         if (put < 0) {
             m_good = false;
+            NoteVitaIOFailure("io write", filename.c_str());
             return 0;
         }
         return static_cast<std::size_t>(put) / elem_size;
@@ -1791,11 +1817,63 @@ int IOFile::GetFd() const {
 
 bool IOFile::Resize(u64 size) {
 #ifdef AZAHAR_VITA_NATIVE_IO
-    // Sin equivalente directo en sceIo. Solo lo usan rutas de escritura de
-    // guardado, que en la Vita no se ejercitan todavia; se deja avisado en vez
-    // de fingir que ha funcionado.
-    LOG_WARNING(Common_Filesystem, "Resize({}) no implementado en Vita", size);
-    return false;
+    if (m_vita_fd < 0) {
+        m_good = false;
+        NoteVitaIOFailure("io resize cerrado", filename.c_str());
+        return false;
+    }
+
+    // sceIo no expone truncate, pero se puede resolver sin perder nada:
+    //  - encoger: ftruncate de newlib sobre un fd de stdio (existe en libc.a).
+    //  - agrandar: escribir un byte en la ultima posicion, el mismo truco que
+    //    usan los archive para crear ficheros; no depende de que FatFs sepa
+    //    extender con ftruncate.
+    // Los datos de guardado son pequenos, asi que el off_t de 32 bits de
+    // ftruncate no es un problema. La posicion del descriptor no debe cambiar
+    // para el llamante, que puede seguir leyendo o escribiendo donde estaba.
+    const SceOff saved = sceIoLseek(m_vita_fd, 0, SCE_SEEK_CUR);
+    const SceOff current = sceIoLseek(m_vita_fd, 0, SCE_SEEK_END);
+    if (saved < 0 || current < 0) {
+        m_good = false;
+        NoteVitaIOFailure("io resize seek", filename.c_str());
+        return false;
+    }
+    sceIoLseek(m_vita_fd, saved, SCE_SEEK_SET);
+
+    if (static_cast<u64>(current) == size) {
+        return true;
+    }
+
+    if (static_cast<u64>(current) > size) {
+        std::FILE* raw = std::fopen(filename.c_str(), "r+b");
+        if (raw == nullptr) {
+            m_good = false;
+            NoteVitaIOFailure("io resize fopen", filename.c_str());
+            return false;
+        }
+        const int rc = ftruncate(fileno(raw), static_cast<off_t>(size));
+        std::fclose(raw);
+        if (rc != 0) {
+            m_good = false;
+            NoteVitaIOFailure("io resize trunc", filename.c_str());
+            return false;
+        }
+    } else {
+        if (sceIoLseek(m_vita_fd, static_cast<SceOff>(size) - 1, SCE_SEEK_SET) < 0) {
+            m_good = false;
+            NoteVitaIOFailure("io resize grow seek", filename.c_str());
+            return false;
+        }
+        const char zero = 0;
+        if (sceIoWrite(m_vita_fd, &zero, 1) != 1) {
+            m_good = false;
+            NoteVitaIOFailure("io resize grow write", filename.c_str());
+            return false;
+        }
+    }
+
+    sceIoLseek(m_vita_fd, saved, SCE_SEEK_SET);
+    return true;
 #endif
     if (!IsOpen() || 0 !=
 #if defined(HAVE_LIBRETRO_VFS)
