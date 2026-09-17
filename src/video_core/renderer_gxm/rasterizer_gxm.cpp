@@ -157,8 +157,12 @@ bool MapBlendFactor(FramebufferRegs::BlendFactor factor, SceGxmBlendFactor* out)
     case FramebufferRegs::BlendFactor::OneMinusDestAlpha:
         *out = SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
         return true;
+    case FramebufferRegs::BlendFactor::SourceAlphaSaturate:
+        *out = SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+        return true;
     default:
-        // Los factores con color/alfa constante no existen en GXM.
+        // Quedan los cuatro factores con color/alfa CONSTANTE: GXM no tiene
+        // color de mezcla constante, asi que esos lotes se van a software.
         return false;
     }
 }
@@ -543,23 +547,34 @@ struct RasterizerGXM::PipelineCache {
 
         const auto source = Pica::Shader::Generator::GXM::GenerateFragmentShader(config);
         if (!source.has_value()) {
+            // No deberia pasar: AddTriangle ya genero esta misma configuracion
+            // antes de aceptar el lote. Si pasa, es que las dos no miran lo
+            // mismo, y eso conviene verlo escrito.
+            NoteOnce(noted[3], "gxm pipeline", "el generador se echo atras");
             return nullptr;
         }
         auto entry = std::make_unique<Entry>();
         entry->output = CompileCg(SCE_SHACCCG_PROFILE_FP, "azahar_gxm_f.cg", source->c_str());
         if (entry->output == nullptr) {
+            // CompileCg ya deja su nota ("gxm shader") con el fichero; el
+            // mensaje del compilador va al registro normal.
             return nullptr;
         }
         const auto* gxp = reinterpret_cast<const SceGxmProgram*>(entry->output->programData);
-        if (sceGxmShaderPatcherRegisterProgram(patcher, gxp, &entry->id) != 0) {
+        const int register_rc = sceGxmShaderPatcherRegisterProgram(patcher, gxp, &entry->id);
+        if (register_rc != 0) {
+            NoteOnce(noted[4], "gxm pipeline", "registrar err {:#x}",
+                     static_cast<u32>(register_rc));
             sceShaccCgDestroyCompileOutput(entry->output);
             return nullptr;
         }
         entry->registered = true;
-        if (sceGxmShaderPatcherCreateFragmentProgram(patcher, entry->id,
-                                                     SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
-                                                     SCE_GXM_MULTISAMPLE_NONE, &blend, vertex_gxp,
-                                                     &entry->program) != 0) {
+        const int program_rc = sceGxmShaderPatcherCreateFragmentProgram(
+            patcher, entry->id, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4, SCE_GXM_MULTISAMPLE_NONE,
+            &blend, vertex_gxp, &entry->program);
+        if (program_rc != 0) {
+            NoteOnce(noted[5], "gxm pipeline", "programa de fragmentos err {:#x}",
+                     static_cast<u32>(program_rc));
             sceGxmShaderPatcherUnregisterProgram(patcher, entry->id);
             sceShaccCgDestroyCompileOutput(entry->output);
             return nullptr;
@@ -589,6 +604,9 @@ struct RasterizerGXM::PipelineCache {
         const auto& merger = regs.framebuffer.output_merger;
         if (merger.fragment_operation_mode !=
             FramebufferRegs::FragmentOperationMode::Default) {
+            // Sombra y gas: no son un dibujado normal y GXM no los reproduce.
+            NoteOnce(noted[0], "gxm mezcla", "modo de fragmento {}",
+                     static_cast<u32>(merger.fragment_operation_mode.Value()));
             return false;
         }
         blend.colorMask = 0;
@@ -610,8 +628,20 @@ struct RasterizerGXM::PipelineCache {
         blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
         blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
         blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
-        // El logic op no existe en GXM: si el juego lo enciende, a software.
-        if (merger.logic_op.Value() != FramebufferRegs::LogicOp::Copy) {
+        /**
+         * El logic op solo cuenta si la MEZCLA ESTA APAGADA.
+         *
+         * En la PICA son excluyentes -- el rasterizador de software hace
+         * "if (alphablend_enable) mezcla; else LogicOp" --, asi que el registro
+         * del logic op puede traer cualquier cosa mientras el juego dibuja con
+         * mezcla, y el hardware ni lo mira. Rechazar el lote por ese valor,
+         * como se hacia aqui, mandaba a software TODO lo que llevara mezcla.
+         * GXM no tiene logic op, asi que cuando de verdad se usa, a software.
+         */
+        if (!merger.alphablend_enable &&
+            merger.logic_op.Value() != FramebufferRegs::LogicOp::Copy) {
+            NoteOnce(noted[2], "gxm mezcla", "logic op {}",
+                     static_cast<u32>(merger.logic_op.Value()));
             return false;
         }
         if (merger.alphablend_enable) {
@@ -629,6 +659,16 @@ struct RasterizerGXM::PipelineCache {
                 !MapBlendFactor(merger.alpha_blending.factor_dest_rgb.Value(), &color_dst) ||
                 !MapBlendFactor(merger.alpha_blending.factor_source_a.Value(), &alpha_src) ||
                 !MapBlendFactor(merger.alpha_blending.factor_dest_a.Value(), &alpha_dst)) {
+                // Con los seis valores crudos en crash.txt se sabe CUAL de
+                // ellos no tiene equivalente (los factores constantes) sin
+                // gastar otra prueba en consola.
+                NoteOnce(noted[1], "gxm mezcla", "eq {}/{} fac {}/{} {}/{}",
+                         static_cast<u32>(merger.alpha_blending.blend_equation_rgb.Value()),
+                         static_cast<u32>(merger.alpha_blending.blend_equation_a.Value()),
+                         static_cast<u32>(merger.alpha_blending.factor_source_rgb.Value()),
+                         static_cast<u32>(merger.alpha_blending.factor_dest_rgb.Value()),
+                         static_cast<u32>(merger.alpha_blending.factor_source_a.Value()),
+                         static_cast<u32>(merger.alpha_blending.factor_dest_a.Value()));
                 return false;
             }
             blend.colorFunc = color_func;
@@ -648,6 +688,18 @@ struct RasterizerGXM::PipelineCache {
     }
 
     SceGxmContext* context;
+    /**
+     * Motivos por los que este cache se ha negado a dar un pipeline, uno por
+     * sitio y anotados una sola vez. En orden: modo de fragmento, factores de
+     * mezcla, logic op, generador, registrar el programa y crear el programa de
+     * fragmentos.
+     *
+     * Hasta 0.1.0.14 todos estos caminos devolvian nulo en silencio, y el lote
+     * se iba a software sin dejar rastro: la superficie se creaba ("gxm fb:
+     * creada") y despues no habia ni dibujado ni motivo. Eso es una prueba de
+     * consola perdida.
+     */
+    bool noted[6] = {};
     SceGxmShaderPatcher* patcher;
     const SceGxmProgram* vertex_gxp = nullptr;
     SceGxmVertexProgram* vertex_program = nullptr;
@@ -1139,6 +1191,8 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         if (needed > vertex_buffer.Size()) {
             Allocation buffer = Allocate(Pool::Host, needed);
             if (!buffer.Valid()) {
+                NoteOnce(fb_noted[10], "gxm draw", "sin memoria para {} bytes de vertices",
+                         needed);
                 return false;
             }
             vertex_buffer = std::move(buffer);
@@ -1147,6 +1201,7 @@ bool RasterizerGXM::DrawBatchOnGpu() {
     if (index_capacity == 0) {
         Allocation buffer = Allocate(Pool::Host, kMaxVerticesPerDraw * sizeof(u16));
         if (!buffer.Valid()) {
+            NoteOnce(fb_noted[11], "gxm draw", "sin memoria para los indices");
             return false;
         }
         index_buffer = std::move(buffer);

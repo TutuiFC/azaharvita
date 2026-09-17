@@ -160,16 +160,16 @@ private:
     /// textura/pipeline, plantilla).
     bool skip_noted[6] = {};
     /**
-     * Notas del camino de superficie, una por sitio. En orden: formato de
-     * color, dimensiones, tramo sin mapear, sin memoria, superficie de color,
-     * superficie de profundidad, render target, tope de superficies, comienzo
-     * de escena y dibujado.
+     * Notas del camino de superficie y de dibujado, una por sitio. En orden:
+     * formato de color, dimensiones, tramo sin mapear, sin memoria, superficie
+     * de color, superficie de profundidad, render target, tope de superficies,
+     * comienzo de escena, dibujado, vertices sin memoria e indices sin memoria.
      *
      * Cada sitio tiene la suya A PROPOSITO: con un unico flag, el primer
      * rechazo tapaba a los demas y cada prueba en consola solo derribaba un
      * muro. Ver NoteOnce en el .cpp.
      */
-    bool fb_noted[10] = {};
+    bool fb_noted[12] = {};
 
     /// Buffer de vertices mapeado para la GPU (crece cuando hace falta) y su
     /// buffer de indices secuenciales.
