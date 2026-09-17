@@ -965,7 +965,21 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     params.flags = 0;
     params.width = static_cast<u16>(width);
     params.height = static_cast<u16>(height);
-    params.scenesPerFrame = 16;
+    /**
+     * Ocho, y no dieciseis: ESTE era el muro.
+     *
+     * La cabecera del SDK lo dice en una linea de comentario -- scenesPerFrame
+     * va en el rango [1, SCE_GXM_MAX_SCENES_PER_RENDERTARGET], que son 8 -- y
+     * ese limite no lo comprueba nadie al compilar porque vitasdk ni siquiera
+     * define la constante. Con 16, sceGxmGetRenderTargetMemSize devuelve
+     * 0x805b0003 (INVALID_VALUE), no se crea el render target y CurrentSurface
+     * devuelve nulo en todos los lotes. Es lo que anota crash.txt de 0.1.0.13:
+     * "gxm fb: rt memsize err 0x805b0003".
+     *
+     * Es una PISTA para el driver (cuantas escenas espera por fotograma en este
+     * render target), no un tope duro: pasarse cuesta rendimiento, no un error.
+     */
+    params.scenesPerFrame = 8;
     params.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
     params.multisampleLocations = 0;
     // La memoria del driver la reservamos nosotros: el SDK de Vita no define
@@ -1357,14 +1371,24 @@ void RasterizerGXM::FlushAll() {
 }
 
 void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
-    // Volcar SOLO lo que pisa el tramo. Vaciarlo todo en cada aviso deja la
-    // traduccion de tiles a filas (CopyTiledGuest, y eso es CPU) corriendo por
-    // framebuffers que nadie ha pedido.
-    EndScene();
+    /**
+     * Volcar SOLO lo que pisa el tramo, y cerrar la escena SOLO si hay algo que
+     * pisar.
+     *
+     * Estos avisos llegan muchas veces por fotograma y casi ninguno habla de un
+     * framebuffer nuestro. Cerrar la escena en todos ellos era pagar dos
+     * precios: esperar a la GPU sin motivo y, sobre todo, gastar escenas --
+     * cada render target se crea con un numero esperado de escenas por
+     * fotograma (params.scenesPerFrame) y pasarse cuesta rendimiento. EndScene
+     * dentro del bucle es idempotente: la primera superficie que pise el tramo
+     * la cierra y las demas ya la encuentran cerrada.
+     */
     for (auto& surface : surfaces) {
-        if (surface->Overlaps(addr, size)) {
-            WriteBack(*surface);
+        if (!surface->Overlaps(addr, size)) {
+            continue;
         }
+        EndScene();
+        WriteBack(*surface);
     }
     // El cache de texturas se crea en el primer lote, y estos vaciados llegan
     // desde el arranque del juego, mucho antes: sin la comprobacion esto era
@@ -1387,12 +1411,15 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
      * correcto es olvidar lo nuestro y volver a leer del invitado antes del
      * siguiente lote.
      */
-    EndScene();
     for (auto& surface : surfaces) {
-        if (surface->Overlaps(addr, size)) {
-            surface->dirty = false;
-            surface->needs_reload = true;
+        if (!surface->Overlaps(addr, size)) {
+            continue;
         }
+        // Si la escena abierta esta dibujando justo ahi, hay que pararla: lo
+        // que contenga esa superficie lo decide ahora el invitado.
+        EndScene();
+        surface->dirty = false;
+        surface->needs_reload = true;
     }
     if (textures != nullptr) {
         textures->InvalidateRange(addr, size);
@@ -1403,12 +1430,13 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
 void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
     // Las dos cosas y en este orden: el invitado se lleva lo que hemos dibujado
     // y despues lo que el haga ahi es lo que manda.
-    EndScene();
     for (auto& surface : surfaces) {
-        if (surface->Overlaps(addr, size)) {
-            WriteBack(*surface);
-            surface->needs_reload = true;
+        if (!surface->Overlaps(addr, size)) {
+            continue;
         }
+        EndScene();
+        WriteBack(*surface);
+        surface->needs_reload = true;
     }
     if (textures != nullptr) {
         textures->InvalidateRange(addr, size);
