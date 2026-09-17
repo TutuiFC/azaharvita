@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <utility>
 #include <fmt/format.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/shacccg.h>
@@ -20,6 +21,7 @@
 #include "video_core/pica/regs_framebuffer.h"
 #include "video_core/pica/regs_rasterizer.h"
 #include "video_core/pica_types.h"
+#include "video_core/utils.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_texture_cache.h"
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
@@ -96,6 +98,10 @@ void main(float4 position : POSITION,
 
 constexpr u32 kVertexStride = 14 * sizeof(float);
 constexpr u32 kMaxVerticesPerDraw = 60000;
+/// Cuantas superficies de dibujado se mantienen a la vez. Cada una se lleva su
+/// color y su profundidad en CDRAM y no los suelta: sin tope, un juego que
+/// alterne framebuffers se come la memoria del chip grafico.
+constexpr std::size_t kMaxSurfaces = 8;
 
 SceGxmDepthFunc MapDepthFunc(FramebufferRegs::CompareFunc func) {
     switch (func) {
@@ -202,9 +208,15 @@ struct PipelineKeyHash {
  * GPU para un framebuffer del invitado.
  *
  * La memoria es NUESTRA (reservada y mapeada para la GPU); el invitado solo ve
- * el volcado. Por eso, al crearla, se copia dentro el contenido que ya tuviera
- * el framebuffer del invitado: hay juegos que dibujan por encima de lo anterior
- * sin borrar, y arrancar en negro cambiaria la imagen.
+ * lo que se le vuelca. Por eso, al crearla, se copia dentro lo que ya tuviera
+ * su framebuffer: hay juegos que dibujan por encima de lo anterior sin borrar,
+ * y arrancar en negro cambiaria la imagen.
+ *
+ * COLOR LINEAL, PROFUNDIDAD EN TILES, Y NO ES UN CAPRICHO. El color se pide
+ * lineal porque la CPU tiene que leerlo y escribirlo para traducirlo al orden
+ * del invitado (ver CopyTiledGuest), y una superficie en tiles solo la entiende
+ * el chip. La profundidad va en tiles porque es lo que GXM sabe conservar entre
+ * escenas, y como no se comparte con el invitado, su formato interno da igual.
  */
 struct RasterizerGXM::Surface {
     ~Surface() {
@@ -216,23 +228,32 @@ struct RasterizerGXM::Surface {
         }
     }
 
+    /// Pisa el tramo [addr, addr + size)? Es lo que preguntan los vaciados y
+    /// las invalidaciones por tramo para no tocar los demas framebuffers.
+    [[nodiscard]] bool Overlaps(PAddr addr, u32 size) const noexcept {
+        const PAddr end = guest_address + guest_stride * height;
+        return addr < end && guest_address < addr + size;
+    }
+
     PAddr guest_address = 0;
     u32 width = 0;
     u32 height = 0;
-    /// Bytes por fila del framebuffer del invitado. NO es width*bpp: los juegos
-    /// alinean las filas (medido en consola: 512 bytes para 240x400 en RGB5A1),
-    /// y volcar con el stride natural corrompe la imagen.
-    u32 guest_stride = 0;
-    /// Bytes por pixel del framebuffer del invitado (2, 3 o 4).
+    /// Bytes por pixel en el invitado (2, 3 o 4) y en nuestra superficie de
+    /// color: los mismos, salvo en RGB8 (3 alli, 4 aqui, porque no existe color
+    /// surface de 24 bits).
     u32 bpp = 0;
-    /// Formatos de la copia (color surface <-> invitado). Con el mismo tamano
-    /// son iguales y la copia es byte a byte; en RGB8 el origen es de 32 bits y
-    /// el destino de 24, que describe el mismo orden de canales.
-    SceGxmTransferFormat copy_src{};
-    SceGxmTransferFormat copy_dst{};
-    /// Stride en bytes de la superficie de color (32 o 16 bits por pixel).
-    u32 rt_stride = 0;
+    u32 rt_bpp = 0;
+    /// Bytes de una FILA DE TILES del invitado. El rasterizador de software
+    /// direcciona con width*bpp por cada 8 filas de pixeles, asi que este es el
+    /// stride natural y NO el de la configuracion de pantalla.
+    u32 guest_stride = 0;
+    /// Stride de la superficie de color, en PIXELES.
+    u32 color_stride = 0;
+    /// Hay dibujado nuestro que el invitado todavia no ha visto.
     bool dirty = false;
+    /// El invitado ha cambiado este framebuffer por otro camino (un relleno de
+    /// color, una transferencia): hay que volver a leerlo antes de dibujar.
+    bool needs_reload = false;
     bool scene_open = false;
     SceGxmRenderTarget* render_target = nullptr;
     SceUID driver_uid = -1;
@@ -240,8 +261,6 @@ struct RasterizerGXM::Surface {
     SceGxmDepthStencilSurface depth_surface{};
     Allocation color_buffer;
     Allocation depth_buffer;
-    Allocation notification_word;
-    SceGxmNotification notification{};
 };
 
 /// Comprueba que el tramo [address, address + size) de la memoria del invitado
@@ -257,6 +276,157 @@ bool GuestSpanMapped(Memory::MemorySystem& memory, PAddr address, u32 size) {
     const u8* last = memory.GetPhysicalPointer(address + size - 1);
     return first != nullptr && last == first + size - 1;
 }
+
+namespace {
+/**
+ * Una linea de crash.txt con valores dentro.
+ *
+ * Las notas son lo unico que se ve de la consola, y una nota sin numeros
+ * ("rechazado") obliga a gastar una prueba entera en averiguar cual de los diez
+ * motivos fue -- que es justo lo que costo el ultimo muro. El buffer es local y
+ * corto a proposito: esto se llama desde sitios donde el emulador puede estar a
+ * punto de irse al suelo.
+ */
+template <typename... Args>
+void NoteFmt(const char* tag, fmt::format_string<Args...> format, Args&&... args) {
+    char note[128];
+    const auto written =
+        fmt::format_to_n(note, sizeof(note) - 1, format, std::forward<Args>(args)...);
+    *written.out = 0;
+    Common::VitaNote(tag, note);
+}
+
+/// La misma nota, pero solo la primera vez. El flag lo pone quien llama para que
+/// cada sitio tenga el suyo y ninguno tape a otro.
+template <typename... Args>
+void NoteOnce(bool& already, const char* tag, fmt::format_string<Args...> format, Args&&... args) {
+    if (already) {
+        return;
+    }
+    already = true;
+    NoteFmt(tag, format, std::forward<Args>(args)...);
+}
+
+/**
+ * La configuracion de DIBUJADO de la PICA en crash.txt, una vez por combinacion.
+ *
+ * Es el equivalente de las notas "fb" del renderizador de software, que cuentan
+ * la de PANTALLA. Son dos registros distintos y confundirlos ya costo una
+ * prueba de consola: lo que se mira aqui no es de donde barre la pantalla, sino
+ * donde esta dibujando la PICA, que en la mayoria de los juegos es otro buffer
+ * (en tiles, sin hueco entre filas) del que luego se copia a la pantalla.
+ *
+ * Se queda con las primeras combinaciones y calla: un juego que alterne dos
+ * framebuffers llenaria el fichero de lineas identicas.
+ */
+void NoteDrawConfig(PAddr color, PAddr depth, u32 width, u32 height, u32 color_format,
+                    u32 depth_format) {
+    struct Signature {
+        PAddr color;
+        PAddr depth;
+        u32 width;
+        u32 height;
+        u32 color_format;
+        u32 depth_format;
+    };
+    constexpr u32 kMaxSignatures = 6;
+    static Signature seen[kMaxSignatures]{};
+    static u32 seen_count = 0;
+
+    const Signature now{color, depth, width, height, color_format, depth_format};
+    for (u32 i = 0; i < seen_count; i++) {
+        if (std::memcmp(&seen[i], &now, sizeof(Signature)) == 0) {
+            return;
+        }
+    }
+    if (seen_count >= kMaxSignatures) {
+        return;
+    }
+    seen[seen_count++] = now;
+    NoteFmt("gxm dib", "addr {:#010x} {}x{} fmt {} z {:#010x} fmtz {}", color, width, height,
+            color_format, depth, depth_format);
+}
+
+/**
+ * El framebuffer de DIBUJADO del invitado NO es lineal.
+ *
+ * La PICA lo guarda en tiles de 8x8 en orden Morton, y las filas de tiles van
+ * una detras de otra con width*bpp bytes por cada 8 filas de pixeles. Es
+ * exactamente lo que hace DrawPixel del rasterizador de software:
+ *
+ *     GetMortonOffset(x, y, bpp) + (y & ~7) * width * bpp
+ *
+ * y por eso aqui se llama a LA MISMA funcion: si un dia cambia una, tiene que
+ * cambiar la otra o las dos imagenes dejan de coincidir, que es lo unico que
+ * este backend tiene para saber si acierta.
+ *
+ * Nuestra superficie de color es lineal, asi que entrar y salir de ella es
+ * traducir entre los dos ordenes. Se hace en la CPU a proposito: GXM convierte
+ * lineal <-> tiled (32x32) y lineal <-> swizzled (Morton de la imagen entera),
+ * pero lo del 3DS no es ninguno de los dos (Morton de 8x8 dentro de filas de
+ * tiles), asi que sceGxmTransferCopy -- que es lo que habia aqui -- volcaba la
+ * imagen revuelta.
+ *
+ * NO hay volteo vertical. El invitado guarda la fila 0 arriba porque DrawPixel
+ * ya voltea al escribir (y = height - y), y el viewport que DrawBatchOnGpu le
+ * da a GXM deja la superficie en ese mismo sentido.
+ */
+template <u32 kGuestBpp, bool kToGuest>
+void CopyTiledGuestImpl(u8* guest, u8* linear, u32 width, u32 height, u32 linear_stride) {
+    constexpr u32 kSurfaceBpp = kGuestBpp == 3 ? 4 : kGuestBpp;
+    for (u32 y = 0; y < height; y++) {
+        u8* const row = linear + static_cast<std::size_t>(y) * linear_stride;
+        u8* const tile_row = guest + static_cast<std::size_t>(y & ~7u) * width * kGuestBpp;
+        for (u32 x = 0; x < width; x++) {
+            u8* const guest_pixel = tile_row + VideoCore::GetMortonOffset(x, y, kGuestBpp);
+            u8* const linear_pixel = row + x * kSurfaceBpp;
+            if constexpr (kToGuest) {
+                std::memcpy(guest_pixel, linear_pixel, kGuestBpp);
+            } else {
+                std::memcpy(linear_pixel, guest_pixel, kGuestBpp);
+                if constexpr (kGuestBpp == 3) {
+                    // El invitado no guarda alfa en RGB8 y la superficie si
+                    // tiene el byte: dejarlo a cero haria transparente lo que
+                    // la mezcla lea de ahi.
+                    linear_pixel[3] = 0xFF;
+                }
+            }
+        }
+    }
+}
+
+/// Traduce entre el framebuffer del invitado (tiles de 8x8) y nuestra
+/// superficie lineal, en el sentido que diga to_guest.
+void CopyTiledGuest(u8* guest, u8* linear, u32 width, u32 height, u32 linear_stride, u32 bpp,
+                    bool to_guest) {
+    switch (bpp) {
+    case 2:
+        if (to_guest) {
+            CopyTiledGuestImpl<2, true>(guest, linear, width, height, linear_stride);
+        } else {
+            CopyTiledGuestImpl<2, false>(guest, linear, width, height, linear_stride);
+        }
+        break;
+    case 3:
+        if (to_guest) {
+            CopyTiledGuestImpl<3, true>(guest, linear, width, height, linear_stride);
+        } else {
+            CopyTiledGuestImpl<3, false>(guest, linear, width, height, linear_stride);
+        }
+        break;
+    case 4:
+        if (to_guest) {
+            CopyTiledGuestImpl<4, true>(guest, linear, width, height, linear_stride);
+        } else {
+            CopyTiledGuestImpl<4, false>(guest, linear, width, height, linear_stride);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+} // Anonymous namespace
 
 /**
  * Cache de programas de fragmentos: uno por configuracion TEV y mezcla.
@@ -544,226 +714,252 @@ bool RasterizerGXM::EnsureInitialized() {
 }
 
 void RasterizerGXM::NoteSkip(u32 index, const char* reason) {
-    if (index < 5 && !skip_noted[index]) {
+    if (index < 6 && !skip_noted[index]) {
         skip_noted[index] = true;
         Common::VitaNote("gxm skip", reason);
     }
 }
 
 void RasterizerGXM::EndScene() {
+    // Sin escena abierta la GPU ya no lee el buffer de vertices: el contador
+    // vuelve a cero aunque no haya nada que cerrar (ver DrawBatchOnGpu).
+    vertex_used = 0;
     if (open_surface == nullptr) {
         return;
     }
-    // La notificacion se escribe cuando el trabajo de fragmentos ha terminado;
-    // hacerla esperar aqui es lo que garantiza que el volcado no copie una
-    // imagen a medias. En la Fase 4 esto se cambia por sincronizacion sin
-    // bloqueo del hilo.
-    u32* word = static_cast<u32*>(open_surface->notification_word.Data());
-    *word = 0;
-    open_surface->notification.address = word;
-    open_surface->notification.value = 1;
-    sceGxmEndScene(context, nullptr, &open_surface->notification);
-    sceGxmNotificationWait(&open_surface->notification);
+    /**
+     * sceGxmFinish en lugar de la notificacion que habia aqui.
+     *
+     * Lo siguiente que pasa despues de cerrar una escena es que la CPU LEE la
+     * superficie de color para volcarla al invitado, asi que hay que esperar a
+     * la GPU de todas formas. La notificacion, ademas, exige memoria que la GPU
+     * pueda ESCRIBIR, y la nuestra estaba mapeada solo de lectura: con eso
+     * sceGxmNotificationWait no vuelve nunca y la consola se queda colgada sin
+     * dejar ni un volcado. En la Fase 4 esto se cambia por sincronizacion que
+     * no bloquee el hilo.
+     */
+    sceGxmEndScene(context, nullptr, nullptr);
+    sceGxmFinish(context);
     open_surface->scene_open = false;
     open_surface = nullptr;
+}
+
+void RasterizerGXM::WriteBack(Surface& surface) {
+    if (!surface.dirty) {
+        return;
+    }
+    surface.dirty = false;
+    u8* guest = memory.GetPhysicalPointer(surface.guest_address);
+    if (guest == nullptr) {
+        return;
+    }
+    CopyTiledGuest(guest, static_cast<u8*>(surface.color_buffer.Data()), surface.width,
+                   surface.height, surface.color_stride * surface.rt_bpp, surface.bpp, true);
+}
+
+void RasterizerGXM::Reload(Surface& surface) {
+    surface.needs_reload = false;
+    u8* guest = memory.GetPhysicalPointer(surface.guest_address);
+    if (guest == nullptr) {
+        return;
+    }
+    CopyTiledGuest(guest, static_cast<u8*>(surface.color_buffer.Data()), surface.width,
+                   surface.height, surface.color_stride * surface.rt_bpp, surface.bpp, false);
 }
 
 void RasterizerGXM::FlushPending() {
     EndScene();
     for (auto& surface : surfaces) {
-        if (!surface->dirty) {
-            continue;
-        }
-        surface->dirty = false;
-        // Del render target al framebuffer del invitado, con el par de formatos
-        // que describe el mismo orden de canales en los dos lados.
-        const int rc = sceGxmTransferCopy(
-            surface->width, surface->height, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE,
-            surface->copy_src, SCE_GXM_TRANSFER_TILED, surface->color_buffer.Data(), 0, 0,
-            static_cast<int>(surface->rt_stride), surface->copy_dst, SCE_GXM_TRANSFER_LINEAR,
-            memory.GetPhysicalPointer(surface->guest_address), 0, 0,
-            static_cast<int>(surface->guest_stride), nullptr, 0, nullptr);
-        if (rc < 0) {
-            LOG_ERROR(Render, "GXM: el volcado del framebuffer fallo ({:#x})", static_cast<u32>(rc));
-        }
-        // El volcado es asincrono: hasta que no termina, memoria del invitado
-        // podria leerse a medias.
-        sceGxmTransferFinish();
+        WriteBack(*surface);
     }
 }
 
 RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     const auto& config = pica.regs.internal.framebuffer.framebuffer;
+
     /**
-     * Formatos de framebuffer soportados y por que el color surface no siempre
-     * es "RGBA".
+     * Formatos de framebuffer soportados y por que la superficie de color no
+     * siempre se llama "RGBA".
      *
-     * El invitado guarda su RGB8 en el orden B,G,R y su RGBA8 en A,B,G,R. El
-     * render target es siempre de 32 bits (no hay color surface de 24), asi que
-     * lo que se hace es elegir el NOMBRE del formato GXM de forma que la salida
-     * estandar del shader (r,g,b,a) caiga en los bytes que espera el invitado
-     * (los nombres listan los canales del byte mas significativo al menos):
+     * El invitado guarda su RGBA8 en el orden A,B,G,R en memoria y su RGB8 en
+     * B,G,R. El nombre del formato GXM lista los canales del bit mas alto al
+     * mas bajo, asi que se elige el que deja la salida del shader en los bytes
+     * que el invitado espera; con eso, la traduccion de CopyTiledGuest es mover
+     * bytes y no tocar canales.
      *
-     *   invitado RGBA8 [A,B,G,R] <- surface U8U8U8U8_RGBA  (memoria [A,B,G,R])
-     *   invitado RGB8  [B,G,R]   <- surface U8U8U8U8_ARGB  (memoria [B,G,R,A])
-     *
-     * y al volcar, la transferencia copia los bytes 0..2 tal cual a un
-     * destino de 24 bits (BGR), que es lo que describe el mismo orden.
+     * En RGB8 la superficie es de 32 bits (no existe color surface de 24): ahi
+     * lleva un byte de alfa que el invitado no guarda y que la copia rellena.
      */
     const auto guest_format = config.color_format.Value();
     SceGxmColorFormat rt_color_format{};
-    SceGxmTransferFormat copy_src{};
-    SceGxmTransferFormat copy_dst{};
     u32 bpp = 0;
     u32 rt_bpp = 0;
     switch (guest_format) {
     case FramebufferRegs::ColorFormat::RGBA8:
         rt_color_format = SCE_GXM_COLOR_FORMAT_U8U8U8U8_RGBA;
-        copy_src = copy_dst = SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR;
         bpp = rt_bpp = 4;
         break;
     case FramebufferRegs::ColorFormat::RGB8:
-        // El color surface en ARGB deja la memoria en B,G,R,A: los tres
-        // primeros bytes ya son el RGB8 del invitado, y el destino de 24 bits
-        // (BGR) copia esos tres bytes tal cual.
+        // ARGB deja la memoria en B,G,R,A: los tres primeros bytes son ya el
+        // RGB8 del invitado.
         rt_color_format = SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB;
-        copy_src = SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR;
-        copy_dst = SCE_GXM_TRANSFER_FORMAT_U8U8U8_BGR;
         bpp = 3;
         rt_bpp = 4;
         break;
     case FramebufferRegs::ColorFormat::RGB5A1:
-        // Los formatos de 16 bits se eligen con el nombre que pone cada canal
-        // en el bit que espera el invitado (R en los mas significativos).
+        // Los de 16 bits se eligen con el nombre que pone cada canal en el bit
+        // que espera el invitado (R en los mas significativos).
         rt_color_format = SCE_GXM_COLOR_FORMAT_U5U5U5U1_RGBA;
-        copy_src = copy_dst = SCE_GXM_TRANSFER_FORMAT_U1U5U5U5_ABGR;
         bpp = rt_bpp = 2;
         break;
     case FramebufferRegs::ColorFormat::RGB565:
         rt_color_format = SCE_GXM_COLOR_FORMAT_U5U6U5_RGB;
-        copy_src = copy_dst = SCE_GXM_TRANSFER_FORMAT_U5U6U5_BGR;
         bpp = rt_bpp = 2;
         break;
     case FramebufferRegs::ColorFormat::RGBA4:
         rt_color_format = SCE_GXM_COLOR_FORMAT_U4U4U4U4_RGBA;
-        copy_src = copy_dst = SCE_GXM_TRANSFER_FORMAT_U4U4U4U4_ABGR;
         bpp = rt_bpp = 2;
         break;
     default:
+        // Son tres bits del registro: vale 5, 6 o 7 mientras el juego no lo
+        // haya escrito.
+        NoteOnce(fb_noted[0], "gxm fb", "formato de color {}", static_cast<u32>(guest_format));
         return nullptr;
     }
-    PAddr address = config.color_buffer_address * 8;
-    u32 width = config.width;
-    u32 height = config.height;
-    u32 guest_stride = 0;
-    // La configuracion de DIBUJADO no lleva stride, y sus dimensiones pueden
-    // venir a cero (el juego las fija por otro camino). La configuracion de
-    // PANTALLA que usa la misma direccion si lo tiene: se busca por direccion y
-    // se toman de ahi el stride y, si hace falta, las dimensiones.
-    //
-    // OJO con las unidades: la direccion de DIBUJADO es el registro en
-    // unidades de 8 bytes (regs_framebuffer.h la multiplica por 8 al darla
-    // como direccion fisica), pero la de PANTALLA ya es una direccion de bytes
-    // (la escribe GSP y la imprimen las notas "fb" de crash.txt tal cual).
-    for (u32 i = 0; i < 2 && address != 0; i++) {
-        const auto& display = pica.regs.framebuffer_config[i];
-        const PAddr candidates[4] = {display.address_left1, display.address_left2,
-                                     display.address_right1, display.address_right2};
-        bool matches = false;
-        for (const PAddr candidate : candidates) {
-            if (candidate != 0 && candidate == address) {
-                matches = true;
-            }
-        }
-        if (!matches) {
-            continue;
-        }
-        guest_stride = display.stride;
-        if (width == 0 || width > 1024) {
-            width = display.width;
-        }
-        if (height == 0 || height > 1024) {
-            height = display.height;
-        }
-        break;
-    }
+
+    const PAddr address = config.GetColorBufferPhysicalAddress();
+    // GetWidth()/GetHeight() y no los campos crudos: el registro guarda el ALTO
+    // MENOS UNO, y leerlo a pelo dejaba fuera la ultima fila.
+    const u32 width = config.GetWidth();
+    const u32 height = config.GetHeight();
     if (address == 0 || width == 0 || height == 0 || width > 1024 || height > 1024) {
-        static bool noted_once = false;
-        if (!noted_once) {
-            noted_once = true;
-            char note[96];
-            const auto written = fmt::format_to_n(
-                note, sizeof(note) - 1, "rechazado: addr {:#x} {}x{} stride {}", address, width,
-                height, guest_stride);
-            *written.out = 0;
-            Common::VitaNote("gxm fb", note);
-        }
+        NoteOnce(fb_noted[1], "gxm fb", "rechazado: addr {:#x} {}x{}", address, width, height);
         return nullptr;
     }
-    if (guest_stride == 0) {
-        // Sin configuracion de pantalla que case, se usa el stride natural; es
-        // lo correcto para juegos que no alinean las filas.
-        guest_stride = width * bpp;
-    }
-    // El framebuffer del invitado tiene que estar entero mapeado y contiguo:
-    // la copia inicial de contenido y los volcados lo recorren completo.
+    /**
+     * El stride del framebuffer de DIBUJADO es el natural, width*bpp.
+     *
+     * 0.1.0.11 lo fue a buscar a la configuracion de PANTALLA (que si trae
+     * stride, y en NSMB2 vale 512) y estaba mal por dos motivos: esa
+     * configuracion describe OTRO buffer -- lineal, el que barre la pantalla --
+     * y el de dibujado va en tiles y sin hueco entre filas, que es como lo
+     * direcciona el rasterizador de software. Del uno al otro se pasa con una
+     * transferencia; no son el mismo sitio.
+     */
+    const u32 guest_stride = width * bpp;
     if (!GuestSpanMapped(memory, address, guest_stride * height)) {
+        NoteOnce(fb_noted[2], "gxm fb", "sin mapear: addr {:#x} tramo {}", address,
+                 guest_stride * height);
         return nullptr;
     }
-    const bool depth16 = config.depth_format.Value() == FramebufferRegs::DepthFormat::D16;
-    const PAddr depth_address = config.depth_buffer_address * 8;
-    const u32 depth_stride = depth16 ? width * 2 : width * 4;
-    const bool depth_mapped =
-        depth_address != 0 && GuestSpanMapped(memory, depth_address, width * height * depth_stride);
+
     for (auto& surface : surfaces) {
         if (surface->guest_address == address && surface->width == width &&
-            surface->height == height) {
+            surface->height == height && surface->bpp == bpp) {
+            if (surface->needs_reload) {
+                // El invitado la ha cambiado por otro camino desde la ultima vez.
+                EndScene();
+                Reload(*surface);
+            }
             return surface.get();
         }
     }
 
-    // Nueva superficie: reservar color y profundidad y crear el render target.
-    // Antes hay que cerrar cualquier escena abierta: crear un render target con
-    // una escena en marcha no es legal en GXM.
+    if (surfaces.size() >= kMaxSurfaces) {
+        /**
+         * Los juegos alternan framebuffers: doble buffer, pantalla de arriba y
+         * de abajo, efectos aparte. Sin tope, cada uno nuevo se queda con su
+         * color y su profundidad en CDRAM y no los suelta nunca. Al llegar aqui
+         * se vuelca lo sucio y se sueltan todas; la que vuelva a hacer falta se
+         * recrea leyendo del invitado, que es correcto aunque cueste.
+         */
+        FlushPending();
+        surfaces.clear();
+        NoteOnce(fb_noted[7], "gxm fb", "tope de {} superficies", kMaxSurfaces);
+    }
+
+    // Nueva superficie. Antes hay que cerrar cualquier escena abierta: crear un
+    // render target con una escena en marcha no es legal en GXM.
     EndScene();
+    const bool depth16 = config.depth_format.Value() == FramebufferRegs::DepthFormat::D16;
     auto surface = std::make_unique<Surface>();
     surface->guest_address = address;
     surface->width = width;
     surface->height = height;
     surface->bpp = bpp;
+    surface->rt_bpp = rt_bpp;
     surface->guest_stride = guest_stride;
-    surface->copy_src = copy_src;
-    surface->copy_dst = copy_dst;
 
-    const u32 aligned_width = (width + 7) & ~7u;
-    const u32 aligned_height = (height + 7) & ~7u;
-    surface->rt_stride = aligned_width * rt_bpp;
-    surface->color_buffer = Allocate(Pool::Cdram, aligned_width * aligned_height * rt_bpp);
-    surface->depth_buffer =
-        Allocate(Pool::Cdram, aligned_width * aligned_height * (depth16 ? 2 : 4));
-    surface->notification_word = Allocate(Pool::Host, 4);
-    if (!surface->color_buffer.Valid() || !surface->depth_buffer.Valid() ||
-        !surface->notification_word.Valid()) {
+    /**
+     * Las dos alineaciones que exige GXM, que NO son la misma.
+     *
+     * El color va lineal y su stride se redondea a 8 pixeles. La profundidad va
+     * en tiles y su stride se redondea al tile entero (SCE_GXM_TILE_SIZEX, 32),
+     * igual que el alto del bloque. Redondear las dos a 8, como estaba, hacia
+     * que sceGxmDepthStencilSurfaceInit devolviera error con cualquier ancho
+     * que no fuera multiplo de 32 -- 240, que es justo el del 3DS -- y
+     * CurrentSurface devolvia nulo en TODOS los lotes sin decir nada. Ese es el
+     * muro que dejo tg a 0 en 0.1.0.11 y 0.1.0.12.
+     */
+    const u32 color_stride = (width + 7) & ~7u;
+    const u32 depth_stride = (width + SCE_GXM_TILE_SIZEX - 1) & ~(SCE_GXM_TILE_SIZEX - 1);
+    const u32 tiled_height = (height + SCE_GXM_TILE_SIZEY - 1) & ~(SCE_GXM_TILE_SIZEY - 1);
+    surface->color_stride = color_stride;
+
+    // RW y no solo READ: aqui es la GPU la que ESCRIBE. Con el mapeo de lectura
+    // el chip no tiene permiso sobre estas paginas, y eso no falla al reservar:
+    // se ve mucho despues, dibujando.
+    surface->color_buffer =
+        Allocate(Pool::Cdram, color_stride * tiled_height * rt_bpp, SCE_GXM_MEMORY_ATTRIB_RW);
+    surface->depth_buffer = Allocate(Pool::Cdram, depth_stride * tiled_height * (depth16 ? 2 : 4),
+                                     SCE_GXM_MEMORY_ATTRIB_RW);
+    if (!surface->color_buffer.Valid() || !surface->depth_buffer.Valid()) {
         LOG_ERROR(Render, "GXM: sin memoria para la superficie de dibujado");
-        Common::VitaNote("gxm fb", "sin memoria");
+        NoteOnce(fb_noted[3], "gxm fb", "sin memoria para {}x{}", width, height);
         return nullptr;
     }
     std::memset(surface->color_buffer.Data(), 0, surface->color_buffer.Size());
-    std::memset(surface->depth_buffer.Data(), 0, surface->depth_buffer.Size());
+    // 0xFF en toda la profundidad es 1.0 (lo mas lejos) en los dos formatos y
+    // con cualquier orden de tiles: es el "limpio" del que parte la primera
+    // escena.
+    std::memset(surface->depth_buffer.Data(), 0xFF, surface->depth_buffer.Size());
 
-    if (sceGxmColorSurfaceInit(&surface->color_surface, rt_color_format,
-                               SCE_GXM_COLOR_SURFACE_TILED, SCE_GXM_COLOR_SURFACE_SCALE_NONE,
-                               SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, width, height, aligned_width,
-                               surface->color_buffer.Data()) != 0) {
+    const int color_rc = sceGxmColorSurfaceInit(
+        &surface->color_surface, rt_color_format, SCE_GXM_COLOR_SURFACE_LINEAR,
+        SCE_GXM_COLOR_SURFACE_SCALE_NONE, SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, width, height,
+        color_stride, surface->color_buffer.Data());
+    if (color_rc != 0) {
+        NoteOnce(fb_noted[4], "gxm fb", "color {}x{} stride {} err {:#x}", width, height,
+                 color_stride, static_cast<u32>(color_rc));
         return nullptr;
     }
-    const SceGxmDepthStencilFormat depth_format =
+
+    const SceGxmDepthStencilFormat depth_gxm_format =
         depth16 ? SCE_GXM_DEPTH_STENCIL_FORMAT_D16 : SCE_GXM_DEPTH_STENCIL_FORMAT_S8D24;
-    if (sceGxmDepthStencilSurfaceInit(&surface->depth_surface, depth_format,
-                                      SCE_GXM_DEPTH_STENCIL_SURFACE_TILED, aligned_width,
-                                      surface->depth_buffer.Data(), nullptr) != 0) {
+    const int depth_rc = sceGxmDepthStencilSurfaceInit(
+        &surface->depth_surface, depth_gxm_format, SCE_GXM_DEPTH_STENCIL_SURFACE_TILED,
+        depth_stride, surface->depth_buffer.Data(), nullptr);
+    if (depth_rc != 0) {
+        NoteOnce(fb_noted[5], "gxm fb", "prof stride {} err {:#x}", depth_stride,
+                 static_cast<u32>(depth_rc));
         return nullptr;
     }
+    /**
+     * La profundidad se conserva entre escenas y NO se comparte con el invitado.
+     *
+     * Forzar carga y guardado es lo que hace que un lote vea la profundidad que
+     * dejo el anterior, porque cada lote abre y cierra su escena. El buffer de
+     * profundidad del invitado ni se lee ni se escribe: el suyo tambien va en
+     * tiles y el nuestro lo tiene GXM en un formato interno que no se puede
+     * traducir. Mientras el camino GPU y el de software se repartan el mismo
+     * fotograma, un lote que dependa de la profundidad que escribio el otro
+     * saldra mal; es la primera deuda que deja esta fase.
+     */
+    sceGxmDepthStencilSurfaceSetBackgroundDepth(&surface->depth_surface, 1.0f);
+    sceGxmDepthStencilSurfaceSetForceLoadMode(&surface->depth_surface,
+                                              SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
+    sceGxmDepthStencilSurfaceSetForceStoreMode(&surface->depth_surface,
+                                               SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED);
 
     SceGxmRenderTargetParams params{};
     params.flags = 0;
@@ -776,59 +972,50 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
     // SCE_UID_INVALID_UID, asi que depender de un centinela era una suposicion,
     // y con una UID que GXM no reconozca el fallo es una caida.
     unsigned int driver_size = 0;
-    if (sceGxmGetRenderTargetMemSize(&params, &driver_size) < 0 || driver_size == 0) {
+    const int size_rc = sceGxmGetRenderTargetMemSize(&params, &driver_size);
+    if (size_rc < 0 || driver_size == 0) {
+        NoteOnce(fb_noted[6], "gxm fb", "rt memsize err {:#x}", static_cast<u32>(size_rc));
         return nullptr;
     }
+    // sceKernelAllocMemBlock no redondea solo: un tamano que no sea multiplo de
+    // la pagina se rechaza y no dice por que.
+    const SceSize driver_bytes = (driver_size + 0xFFFu) & ~0xFFFu;
     const SceUID driver_uid = sceKernelAllocMemBlock(
-        "azahar_gxm_rt", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, driver_size, nullptr);
+        "azahar_gxm_rt", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, driver_bytes, nullptr);
     if (driver_uid < 0) {
+        NoteOnce(fb_noted[6], "gxm fb", "rt memblock {} err {:#x}", static_cast<u32>(driver_bytes),
+                 static_cast<u32>(driver_uid));
         return nullptr;
     }
     void* driver_mem = nullptr;
     if (sceKernelGetMemBlockBase(driver_uid, &driver_mem) < 0) {
         sceKernelFreeMemBlock(driver_uid);
+        NoteOnce(fb_noted[6], "gxm fb", "rt sin direccion base");
         return nullptr;
     }
     params.driverMemBlock = driver_uid;
-    if (sceGxmCreateRenderTarget(&params, &surface->render_target) != 0) {
+    const int rt_rc = sceGxmCreateRenderTarget(&params, &surface->render_target);
+    if (rt_rc != 0) {
         sceKernelFreeMemBlock(driver_uid);
         LOG_ERROR(Render, "GXM: no se pudo crear el render target");
+        NoteOnce(fb_noted[6], "gxm fb", "rt {}x{} err {:#x}", width, height,
+                 static_cast<u32>(rt_rc));
         return nullptr;
     }
     surface->driver_uid = driver_uid;
 
-    // Copiar dentro lo que ya hubiera en el framebuffer del invitado, en los
-    // dos sentidos de la memoria (color y, si el juego lo usa, profundidad).
-    const u8* guest = memory.GetPhysicalPointer(address);
-    if (guest != nullptr) {
-        sceGxmTransferCopy(width, height, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE, copy_src,
-                           SCE_GXM_TRANSFER_LINEAR, guest, 0, 0, static_cast<int>(guest_stride),
-                           copy_dst, SCE_GXM_TRANSFER_TILED, surface->color_buffer.Data(), 0, 0,
-                           static_cast<int>(surface->rt_stride), nullptr, 0, nullptr);
-    }
-    if (depth_mapped) {
-        const u8* guest_depth = memory.GetPhysicalPointer(depth_address);
-        const SceGxmTransferFormat depth_format =
-            depth16 ? SCE_GXM_TRANSFER_FORMAT_RAW16 : SCE_GXM_TRANSFER_FORMAT_RAW32;
-        const PAddr depth_span = depth16 ? width * height * 2 : width * height * 4;
-        sceGxmTransferCopy(width, height, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE, depth_format,
-                           SCE_GXM_TRANSFER_LINEAR, guest_depth, 0, 0,
-                           static_cast<int>(depth_stride), depth_format,
-                           SCE_GXM_TRANSFER_TILED, surface->depth_buffer.Data(), 0, 0,
-                           static_cast<int>(depth_stride), nullptr, 0, nullptr);
-        (void)depth_span;
-    }
-    sceGxmTransferFinish();
+    // Copiar dentro lo que ya hubiera en el framebuffer del invitado: hay juegos
+    // que dibujan encima de lo anterior sin borrar.
+    Reload(*surface);
 
     Surface* result = surface.get();
     surfaces.emplace_back(std::move(surface));
-    {
-        char note[64];
-        const auto written =
-            fmt::format_to_n(note, sizeof(note) - 1, "addr {:#x} {}x{} creada", address, width,
-                             height);
-        *written.out = 0;
-        Common::VitaNote("gxm fb", note);
+    // Las primeras y calla: con el tope de superficies esto se puede repetir, y
+    // crash.txt no es sitio para un chorro de lineas iguales.
+    static u32 created_notes = 0;
+    if (created_notes < 4) {
+        created_notes++;
+        NoteFmt("gxm fb", "addr {:#x} {}x{} creada", address, width, height);
     }
     return result;
 }
@@ -838,6 +1025,21 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
     if (!batch_decided) {
         batch_decided = true;
         batch_on_gpu = false;
+        /**
+         * La configuracion de DIBUJADO en crash.txt, pase lo que pase con el
+         * lote.
+         *
+         * Va aqui y no dentro de CurrentSurface a proposito: si el lote se
+         * rechaza antes (por el shader, por el scissor...), esos registros
+         * siguen siendo lo primero que hay que mirar, y desde la consola no hay
+         * otra forma de verlos.
+         */
+        const auto& draw_config = pica.regs.internal.framebuffer.framebuffer;
+        NoteDrawConfig(draw_config.GetColorBufferPhysicalAddress(),
+                       draw_config.GetDepthBufferPhysicalAddress(), draw_config.GetWidth(),
+                       draw_config.GetHeight(),
+                       static_cast<u32>(draw_config.color_format.Value()),
+                       static_cast<u32>(draw_config.depth_format.Value()));
         if (EnsureInitialized()) {
             // Lo que aun no reproduce el contexto GXM (scissor, W-buffering) o
             // el generador (iluminacion, niebla, proctex...) manda el lote al
@@ -851,14 +1053,24 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
                                  RasterizerRegs::ScissorMode::Disabled;
             const bool wbuffering = pica.regs.internal.rasterizer.depthmap_enable ==
                                     RasterizerRegs::DepthBuffering::WBuffering;
-            batch_on_gpu = source.has_value() && !scissor && !wbuffering;
+            // La prueba de plantilla no esta mapeada al estado de GXM: si el
+            // juego la enciende y el lote se fuera a la GPU, pintaria donde el
+            // rasterizador de software no pinta. Solo cuenta si el formato de
+            // profundidad tiene plantilla, que es lo que mira el de software.
+            const bool stencil =
+                pica.regs.internal.framebuffer.output_merger.stencil_test.enable != 0 &&
+                pica.regs.internal.framebuffer.HasStencil();
+            batch_on_gpu = source.has_value() && !scissor && !wbuffering && !stencil;
             if (!batch_on_gpu) {
                 // El motivo concreto (iluminacion, proctex, ...) va a crash.txt:
                 // sin el, "skip: shader" no distingue entre causas.
-                NoteSkip(scissor ? 0 : (wbuffering ? 1 : 2),
-                         scissor ? "scissor"
-                                 : (wbuffering ? "wbuffer"
-                                               : (reason != nullptr ? reason : "shader")));
+                const char* why = scissor      ? "scissor"
+                                  : wbuffering ? "wbuffer"
+                                  : stencil    ? "plantilla"
+                                  : reason != nullptr ? reason
+                                                      : "shader";
+                const u32 slot = scissor ? 0 : wbuffering ? 1 : stencil ? 5 : 2;
+                NoteSkip(slot, why);
             }
         }
         if (batch_on_gpu && CurrentSurface() == nullptr) {
@@ -893,15 +1105,32 @@ bool RasterizerGXM::DrawBatchOnGpu() {
     if (vertex_count == 0) {
         return true;
     }
+    /**
+     * El buffer de vertices se REPARTE dentro de la escena, no se reescribe.
+     *
+     * GXM no dibuja cuando se lo pides: apunta el dibujado y lee los vertices
+     * mas tarde, al procesar la escena. Escribir el lote siguiente encima del
+     * anterior -- que es lo que hacia antes, siempre desde el principio del
+     * buffer -- le cambia los vertices a un dibujado que todavia no ha ocurrido.
+     * Por eso cada lote se queda su tramo y el contador solo vuelve a cero
+     * cuando la escena se cierra (EndScene), que es cuando la GPU ya ha
+     * terminado de leer.
+     */
     const u32 needed = vertex_count * kVertexStride;
-    if (needed > vertex_buffer.Size()) {
-        Allocation buffer = Allocate(Pool::Host, needed);
-        if (!buffer.Valid()) {
-            return false;
+    if (vertex_used + needed > vertex_buffer.Size()) {
+        // Lleno: se cierra la escena (que espera a la GPU) y se empieza de cero.
+        // Cambiar de bloque con la escena abierta seria soltarle la memoria
+        // debajo.
+        EndScene();
+        if (needed > vertex_buffer.Size()) {
+            Allocation buffer = Allocate(Pool::Host, needed);
+            if (!buffer.Valid()) {
+                return false;
+            }
+            vertex_buffer = std::move(buffer);
         }
-        vertex_buffer = std::move(buffer);
     }
-    if (vertex_count > index_capacity) {
+    if (index_capacity == 0) {
         Allocation buffer = Allocate(Pool::Host, kMaxVerticesPerDraw * sizeof(u16));
         if (!buffer.Valid()) {
             return false;
@@ -914,7 +1143,9 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         }
     }
 
-    auto* vertices = static_cast<float*>(vertex_buffer.Data());
+    u8* const vertex_slice = static_cast<u8*>(vertex_buffer.Data()) + vertex_used;
+    auto* vertices = reinterpret_cast<float*>(vertex_slice);
+
     for (u32 i = 0; i < vertex_count; i++) {
         const Pica::OutputVertex& v = batch[i];
         float* out = vertices + i * 14;
@@ -940,8 +1171,15 @@ bool RasterizerGXM::DrawBatchOnGpu() {
     }
 
     if (!surface->scene_open) {
-        if (sceGxmBeginScene(context, 0, surface->render_target, nullptr, nullptr, nullptr,
-                             &surface->color_surface, &surface->depth_surface) != 0) {
+        const int scene_rc =
+            sceGxmBeginScene(context, 0, surface->render_target, nullptr, nullptr, nullptr,
+                             &surface->color_surface, &surface->depth_surface);
+        if (scene_rc != 0) {
+            // Se anota el codigo: 0x805b0007 seria "ya hay una escena abierta"
+            // (la de vita2d, si alguna vez se cruzan los dos caminos) y
+            // 0x805b0003 un parametro malo de la superficie.
+            NoteOnce(fb_noted[8], "gxm draw", "beginscene err {:#x}",
+                     static_cast<u32>(scene_rc));
             return false;
         }
         surface->scene_open = true;
@@ -996,7 +1234,7 @@ bool RasterizerGXM::DrawBatchOnGpu() {
 
     sceGxmSetVertexProgram(context, pipelines->vertex_program);
     sceGxmSetFragmentProgram(context, pipeline->program);
-    sceGxmSetVertexStream(context, 0, vertex_buffer.Data());
+    sceGxmSetVertexStream(context, 0, vertex_slice);
 
     // Texturas: por cada sampler que el shader use de verdad, su unidad. Si
     // alguna no se puede servir (formato, borde, unidad apagada...), el lote
@@ -1066,10 +1304,16 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         const int rc = sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
                                   indices, chunk);
         if (rc < 0) {
+            // Hasta ahora este fallo se tragaba en silencio y el lote se iba a
+            // software sin dejar rastro: con el codigo se sabe si es el estado,
+            // los vertices o la escena.
+            NoteOnce(fb_noted[9], "gxm draw", "draw err {:#x} con {} vertices",
+                     static_cast<u32>(rc), chunk);
             return false;
         }
         drawn += chunk;
     }
+    vertex_used += needed;
     surface->dirty = true;
     {
         // Nota unica: con esto, un volcado posterior sabe si la GPU llego a
@@ -1113,7 +1357,15 @@ void RasterizerGXM::FlushAll() {
 }
 
 void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
-    FlushPending();
+    // Volcar SOLO lo que pisa el tramo. Vaciarlo todo en cada aviso deja la
+    // traduccion de tiles a filas (CopyTiledGuest, y eso es CPU) corriendo por
+    // framebuffers que nadie ha pedido.
+    EndScene();
+    for (auto& surface : surfaces) {
+        if (surface->Overlaps(addr, size)) {
+            WriteBack(*surface);
+        }
+    }
     // El cache de texturas se crea en el primer lote, y estos vaciados llegan
     // desde el arranque del juego, mucho antes: sin la comprobacion esto era
     // una desreferencia de puntero nulo (la caida de 0.1.0.2 a 0.1.0.4).
@@ -1124,10 +1376,24 @@ void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
-    FlushPending();
-    // El cache de texturas se crea en el primer lote, y estos vaciados llegan
-    // desde el arranque del juego, mucho antes: sin la comprobacion esto era
-    // una desreferencia de puntero nulo (la caida de 0.1.0.2 a 0.1.0.4).
+    /**
+     * Invalidar NO es volcar: es lo contrario, y confundirlo se comia el
+     * trabajo del juego.
+     *
+     * Este aviso llega DESPUES de que el invitado haya cambiado esa memoria por
+     * otro camino (un relleno de color, una transferencia). Volcar ahi nuestra
+     * superficie -- que es lo que hacia antes, porque llamaba a FlushPending --
+     * le pasaba por encima al borrado que el juego acababa de hacer. Lo
+     * correcto es olvidar lo nuestro y volver a leer del invitado antes del
+     * siguiente lote.
+     */
+    EndScene();
+    for (auto& surface : surfaces) {
+        if (surface->Overlaps(addr, size)) {
+            surface->dirty = false;
+            surface->needs_reload = true;
+        }
+    }
     if (textures != nullptr) {
         textures->InvalidateRange(addr, size);
     }
@@ -1135,10 +1401,15 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
-    FlushPending();
-    // El cache de texturas se crea en el primer lote, y estos vaciados llegan
-    // desde el arranque del juego, mucho antes: sin la comprobacion esto era
-    // una desreferencia de puntero nulo (la caida de 0.1.0.2 a 0.1.0.4).
+    // Las dos cosas y en este orden: el invitado se lleva lo que hemos dibujado
+    // y despues lo que el haga ahi es lo que manda.
+    EndScene();
+    for (auto& surface : surfaces) {
+        if (surface->Overlaps(addr, size)) {
+            WriteBack(*surface);
+            surface->needs_reload = true;
+        }
+    }
     if (textures != nullptr) {
         textures->InvalidateRange(addr, size);
     }

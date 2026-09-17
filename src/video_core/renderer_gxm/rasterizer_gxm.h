@@ -46,9 +46,14 @@ class TextureCache;
  * estado, la escena GXM se cierra y se vuelca.
  *
  * QUE NO SOPORTA TODAVIA (cae a software, por tanto correcto pero sin ganancia):
- * texturas en el shader (falta el cache de texturas), framebuffers que no sean
- * RGBA8 (el volcado al invitado necesita copia byte a byte), iluminacion,
- * niebla, texturas procedurales, shadow maps, scissor, W-buffering, y logic op.
+ * iluminacion por fragmento, texturas procedurales, shadow maps, scissor,
+ * W-buffering, prueba de plantilla y logic op. El motivo de cada rechazo va a
+ * crash.txt: es lo unico que se ve desde la consola.
+ *
+ * LO QUE NO COMPARTE CON EL INVITADO: la profundidad. El buffer del 3DS va en
+ * tiles y el nuestro en el formato interno de GXM, asi que un lote que dependa
+ * de la profundidad que escribio el camino de software sale mal. El color si
+ * viaja en los dos sentidos (ver CopyTiledGuest en el .cpp).
  */
 class RasterizerGXM final : public VideoCore::RasterizerInterface {
 public:
@@ -112,8 +117,16 @@ private:
     /// falta. nullptr si no se puede (formato no soportado, sin memoria).
     Surface* CurrentSurface();
 
-    /// Cierra la escena GXM si hay una abierta.
+    /// Cierra la escena GXM si hay una abierta y espera a que el chip termine.
     void EndScene();
+
+    /// Vuelca la superficie al framebuffer del invitado (de nuestro orden
+    /// lineal al de tiles de la PICA). No hace nada si no esta sucia.
+    void WriteBack(Surface& surface);
+
+    /// Al reves: trae a la superficie lo que el invitado tenga en ese
+    /// framebuffer. Es lo que hace que dibujar encima de lo anterior funcione.
+    void Reload(Surface& surface);
 
     /// Anota UNA vez por motivo el rechazo de un lote (va a crash.txt). Sin
     /// esto, "tg 0" no dice si el problema es el scissor, el shader o el
@@ -144,14 +157,27 @@ private:
     bool batch_decided = false;
     bool batch_on_gpu = false;
     /// Motivos de rechazo ya anotados (scissor, wbuffer, shader, framebuffer,
-    /// textura/pipeline).
-    bool skip_noted[5] = {false, false, false, false, false};
+    /// textura/pipeline, plantilla).
+    bool skip_noted[6] = {};
+    /**
+     * Notas del camino de superficie, una por sitio. En orden: formato de
+     * color, dimensiones, tramo sin mapear, sin memoria, superficie de color,
+     * superficie de profundidad, render target, tope de superficies, comienzo
+     * de escena y dibujado.
+     *
+     * Cada sitio tiene la suya A PROPOSITO: con un unico flag, el primer
+     * rechazo tapaba a los demas y cada prueba en consola solo derribaba un
+     * muro. Ver NoteOnce en el .cpp.
+     */
+    bool fb_noted[10] = {};
 
     /// Buffer de vertices mapeado para la GPU (crece cuando hace falta) y su
     /// buffer de indices secuenciales.
     Allocation vertex_buffer;
     Allocation index_buffer;
-    u32 vertex_capacity = 0;
+    /// Bytes ya repartidos del buffer de vertices en la escena en curso. Vuelve
+    /// a cero al cerrarla: hasta entonces la GPU sigue leyendo lo de antes.
+    u32 vertex_used = 0;
     u32 index_capacity = 0;
 };
 
