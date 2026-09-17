@@ -141,6 +141,13 @@ add_compile_definitions(
     __PSVITA__=1
     NDEBUG
 
+    # La libc de la Vita tiene off_t de 4 bytes y no trae fseeko64/ftello64
+    # (comprobado en libc.a), asi que stdio no puede pasar de 2 GB y stat
+    # trunca st_size. Con esto IOFile va sobre sceIo (SceOff/SceIoStat de 64
+    # bits) y las ROMs de mas de 2 GB dejan de leerse mal. Implementacion y
+    # razonamiento completos en src/common/file_util.h (m_vita_fd).
+    AZAHAR_VITA_NATIVE_IO
+
     # Tiene que ser identico en todo el proyecto: trans_cache_buf se declara
     # extern con este tamano, y si dos ficheros no coinciden el array queda
     # descuadrado y la memoria se corrompe.

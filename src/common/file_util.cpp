@@ -1292,6 +1292,9 @@ IOFile& IOFile::operator=(IOFile&& other) noexcept {
 void IOFile::Swap(IOFile& other) noexcept {
     std::swap(m_file, other.m_file);
     std::swap(m_fd, other.m_fd);
+#ifdef AZAHAR_VITA_NATIVE_IO
+    std::swap(m_vita_fd, other.m_vita_fd);
+#endif
     std::swap(m_good, other.m_good);
     std::swap(filename, other.filename);
     std::swap(openmode, other.openmode);
@@ -1743,6 +1746,11 @@ inline bool IOFile::IsGood() const {
 inline void IOFile::Clear() {
     m_good = true;
 
+#ifdef AZAHAR_VITA_NATIVE_IO
+    // sceIo no tiene buffer de stdio que limpiar; ademas m_file es nulo en
+    // este camino y clearerr(nullptr) seria un desreferencia invalida.
+    return;
+#endif
 #ifdef HAVE_LIBRETRO_VFS
     filestream_rewind(m_file);
 #else
@@ -1813,12 +1821,25 @@ template <>
 void OpenFStream<std::ios_base::in>(
     boost_iostreams<boost::iostreams::file_descriptor_source>& fstream,
     const std::string& filename) {
+#ifdef AZAHAR_VITA_NATIVE_IO
+    // En el camino nativo IOFile no expone un descriptor POSIX (sceIo no es un
+    // fd). Estos ficheros (llaves, cheats) son pequenos, asi que se abre con
+    // stdio solo para obtener un descriptor duplicable.
+    std::FILE* raw = std::fopen(filename.c_str(), "rb");
+    if (raw == nullptr)
+        return;
+    const int fd = dup(fileno(raw));
+    std::fclose(raw);
+    if (fd == -1)
+        return;
+#else
     IOFile file(filename, "r");
     if (file.GetFd() == -1)
         return;
     int fd = dup(file.GetFd());
     if (fd == -1)
         return;
+#endif
     boost::iostreams::file_descriptor_source file_descriptor_source(fd,
                                                                     boost::iostreams::close_handle);
     fstream.open(file_descriptor_source);
@@ -1827,12 +1848,22 @@ void OpenFStream<std::ios_base::in>(
 template <>
 void OpenFStream<std::ios_base::out>(
     boost_iostreams<boost::iostreams::file_descriptor_sink>& fstream, const std::string& filename) {
+#ifdef AZAHAR_VITA_NATIVE_IO
+    std::FILE* raw = std::fopen(filename.c_str(), "wb");
+    if (raw == nullptr)
+        return;
+    const int fd = dup(fileno(raw));
+    std::fclose(raw);
+    if (fd == -1)
+        return;
+#else
     IOFile file(filename, "w");
     if (file.GetFd() == -1)
         return;
     int fd = dup(file.GetFd());
     if (fd == -1)
         return;
+#endif
     boost::iostreams::file_descriptor_sink file_descriptor_sink(fd, boost::iostreams::close_handle);
     fstream.open(file_descriptor_sink);
 }
