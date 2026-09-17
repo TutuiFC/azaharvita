@@ -13,9 +13,6 @@
 #include "core/loader/loader.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/gpu.h"
-#ifdef __PSVITA__
-#include "common/vita_diag.h"
-#endif
 #include "video_core/gpu_debugger.h"
 #include "video_core/gpu_impl.h"
 #include "video_core/pica/pica_core.h"
@@ -515,21 +512,9 @@ void GPU::MemoryTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
-#ifdef __PSVITA__
-    // El VBlank tendria que saltar cada ~4 rodajas de emulacion, o sea unas
-    // cuatro veces antes del punto donde se muere. Si no aparece ninguna de
-    // estas lineas en crash.txt, es que el evento no llega a dispararse; si
-    // aparece "vblank" pero no "vblank-gpu", muere dentro del aviso a GSP.
-    Common::VitaNote("vblank", "entrando");
-#endif
-
     // Signal to GSP that GPU interrupt has occurred
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
-
-#ifdef __PSVITA__
-    Common::VitaNote("vblank-gpu", "interrupciones avisadas, presentando");
-#endif
 
     // Present renderered frame.
     impl->renderer->SwapBuffers();
