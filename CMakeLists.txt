@@ -143,9 +143,10 @@ add_compile_definitions(
 
     # La libc de la Vita tiene off_t de 4 bytes y no trae fseeko64/ftello64
     # (comprobado en libc.a), asi que stdio no puede pasar de 2 GB y stat
-    # trunca st_size. Con esto IOFile va sobre sceIo (SceOff/SceIoStat de 64
-    # bits) y las ROMs de mas de 2 GB dejan de leerse mal. Implementacion y
-    # razonamiento completos en src/common/file_util.h (m_vita_fd).
+    # trunca st_size. Con esto, IOFile usa sceIo (SceOff/SceIoStat de 64 bits)
+    # SOLO para ficheros que no caben en 2 GB; el resto sigue con stdio, que
+    # trae buffer de lectura. Implementacion y razonamiento en
+    # src/common/file_util.h (m_vita_fd).
     AZAHAR_VITA_NATIVE_IO
 
     # Tiene que ser identico en todo el proyecto: trans_cache_buf se declara

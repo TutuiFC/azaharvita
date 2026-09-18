@@ -27,9 +27,9 @@ namespace VitaFrontend {
  * por GXM identica al camino de software) y se abre la Fase 3 con el generador
  * de shaders Cg.
  */
-constexpr char kVersion[] = "version 0.1.0.17";
+constexpr char kVersion[] = "version 0.1.0.18";
 
-/// La misma version con el nombre delante, para el overlay ("Azahar 0.1.0.17").
-constexpr char kOverlayBuild[] = "Azahar 0.1.0.17";
+/// La misma version con el nombre delante, para el overlay ("Azahar 0.1.0.18").
+constexpr char kOverlayBuild[] = "Azahar 0.1.0.18";
 
 } // namespace VitaFrontend
