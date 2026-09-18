@@ -519,6 +519,12 @@ public:
     void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                      const Pica::OutputVertex& v2) override;
     void DrawTriangles() override {}
+
+    /// Fotograma que el salto de fotogramas no va a dibujar: PicaCore se salta
+    /// tambien la fase de vertices. Ver RasterizerInterface::ShouldSkipDraw.
+    bool ShouldSkipDraw() const override {
+        return !FrameSkip::ShouldRender();
+    }
     void FlushAll() override {}
     void FlushRegion(PAddr addr, u32 size) override {}
     void InvalidateRegion(PAddr addr, u32 size) override {}

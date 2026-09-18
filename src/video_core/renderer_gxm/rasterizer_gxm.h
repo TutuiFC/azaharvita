@@ -65,6 +65,13 @@ public:
                      const Pica::OutputVertex& v2) override;
     void DrawTriangles() override;
 
+    /// GXM delega el rasterizado en el de software, asi que el salto de
+    /// fotogramas es el mismo para los dos. Ver
+    /// RasterizerInterface::ShouldSkipDraw.
+    bool ShouldSkipDraw() const override {
+        return software.ShouldSkipDraw();
+    }
+
     void FlushAll() override;
     void FlushRegion(PAddr addr, u32 size) override;
     void InvalidateRegion(PAddr addr, u32 size) override;

@@ -1052,6 +1052,22 @@ void PicaCore::DrawArrays(bool is_indexed) {
         debug_context->OnEvent(DebugContext::Event::IncomingPrimitiveBatch, nullptr);
     }
 
+    /**
+     * Fotograma saltado: no hay que ejecutar nada de la fase de vertices.
+     *
+     * Sin esto el salto de fotogramas solo evitaba el rasterizado (AddTriangle
+     * del camino de software), pero se seguia pagando el vertex loader, el
+     * interprete de shaders por vertice y el ensamblado de primitivas para un
+     * fotograma que no se iba a presentar. El backend GXM ademas acumulaba y
+     * dibujaba el lote. Con el salto aqui se evitan las tres cosas.
+     *
+     * El estado de registros y el ensamblado se reinician por draw, asi que
+     * saltarse el draw entero no arrastra nada al siguiente.
+     */
+    if (rasterizer->ShouldSkipDraw() && !debug_context) {
+        return;
+    }
+
     const bool accelerate_draw = [this] {
         // Geometry shaders cannot be accelerated due to register preservation.
         if (regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes) {
