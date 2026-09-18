@@ -290,9 +290,6 @@ void RasterizerSoftware::AddTriangle(const Pica::OutputVertex& v0, const Pica::O
     FlipQuaternionIfOpposite(buffer_a[1].quat, buffer_a[0].quat);
     FlipQuaternionIfOpposite(buffer_a[2].quat, buffer_a[0].quat);
 
-    auto* output_list = &buffer_a;
-    auto* input_list = &buffer_b;
-
     // NOTE: We clip against a w=epsilon plane to guarantee that the output has a positive w value.
     // TODO: Not sure if this is a valid approach. Also should probably instead use the smallest
     //       epsilon possible within f24 accuracy.
@@ -309,39 +306,72 @@ void RasterizerSoftware::AddTriangle(const Pica::OutputVertex& v0, const Pica::O
         {Common::MakeVec(f0, f0, f0, f1), Common::Vec4<f24>(f0, f0, f0, EPSILON)}, // w = EPSILON
     }};
 
-    // Simple implementation of the Sutherland-Hodgman clipping algorithm.
-    // TODO: Make this less inefficient (currently lots of useless buffering overhead happens here)
-    const auto clip = [&](const ClippingEdge& edge) {
-        std::swap(input_list, output_list);
-        output_list->clear();
+    auto* output_list = &buffer_a;
+    auto* input_list = &buffer_b;
 
-        const Vertex* reference_vertex = &input_list->back();
-        for (const auto& vertex : *input_list) {
-            // NOTE: This algorithm changes vertex order in some cases!
-            if (edge.IsInside(vertex)) {
-                if (edge.IsOutSide(*reference_vertex)) {
-                    output_list->push_back(edge.GetIntersection(vertex, *reference_vertex));
-                }
-                output_list->push_back(vertex);
-            } else if (edge.IsInside(*reference_vertex)) {
-                output_list->push_back(edge.GetIntersection(vertex, *reference_vertex));
-            }
-            reference_vertex = &vertex;
-        }
-    };
-
+    /**
+     * Aceptacion trivial del recorte.
+     *
+     * Sutherland-Hodgman copia el triangulo entero en cada plano que se le
+     * pide. Si los tres vertices ya estan dentro de los 7 planos (y del plano
+     * custom), el resultado es el mismo triangulo sin tocar, asi que las 7
+     * pasadas sobran. La mayoria de los triangulos de interior caen aqui.
+     *
+     * La condicion es EXACTAMENTE la misma que la de las pasadas (IsInside con
+     * los mismos planos), asi que el resultado no cambia.
+     */
+    bool all_inside = true;
     for (const ClippingEdge& edge : clipping_edges) {
-        clip(edge);
-        if (output_list->size() < 3) {
-            return;
+        if (!edge.IsInside(buffer_a[0]) || !edge.IsInside(buffer_a[1]) ||
+            !edge.IsInside(buffer_a[2])) {
+            all_inside = false;
+            break;
+        }
+    }
+    if (all_inside && regs.rasterizer.clip_enable) {
+        const ClippingEdge custom_edge{regs.rasterizer.GetClipCoef()};
+        if (!custom_edge.IsInside(buffer_a[0]) || !custom_edge.IsInside(buffer_a[1]) ||
+            !custom_edge.IsInside(buffer_a[2])) {
+            all_inside = false;
         }
     }
 
-    if (regs.rasterizer.clip_enable) {
-        const ClippingEdge custom_edge{regs.rasterizer.GetClipCoef()};
-        clip(custom_edge);
-        if (output_list->size() < 3) {
-            return;
+    if (!all_inside) {
+        // Simple implementation of the Sutherland-Hodgman clipping algorithm.
+        // TODO: Make this less inefficient (currently lots of useless buffering overhead happens
+        // here)
+        const auto clip = [&](const ClippingEdge& edge) {
+            std::swap(input_list, output_list);
+            output_list->clear();
+
+            const Vertex* reference_vertex = &input_list->back();
+            for (const auto& vertex : *input_list) {
+                // NOTE: This algorithm changes vertex order in some cases!
+                if (edge.IsInside(vertex)) {
+                    if (edge.IsOutSide(*reference_vertex)) {
+                        output_list->push_back(edge.GetIntersection(vertex, *reference_vertex));
+                    }
+                    output_list->push_back(vertex);
+                } else if (edge.IsInside(*reference_vertex)) {
+                    output_list->push_back(edge.GetIntersection(vertex, *reference_vertex));
+                }
+                reference_vertex = &vertex;
+            }
+        };
+
+        for (const ClippingEdge& edge : clipping_edges) {
+            clip(edge);
+            if (output_list->size() < 3) {
+                return;
+            }
+        }
+
+        if (regs.rasterizer.clip_enable) {
+            const ClippingEdge custom_edge{regs.rasterizer.GetClipCoef()};
+            clip(custom_edge);
+            if (output_list->size() < 3) {
+                return;
+            }
         }
     }
 
