@@ -1316,6 +1316,11 @@ void IOFile::Swap(IOFile& other) noexcept {
     std::swap(m_fd, other.m_fd);
 #ifdef AZAHAR_VITA_NATIVE_IO
     std::swap(m_vita_fd, other.m_vita_fd);
+    std::swap(m_vita_read_buffer, other.m_vita_read_buffer);
+    std::swap(m_vita_pos, other.m_vita_pos);
+    std::swap(m_vita_buf_start, other.m_vita_buf_start);
+    std::swap(m_vita_buf_len, other.m_vita_buf_len);
+    std::swap(m_vita_buf_pos, other.m_vita_buf_pos);
 #endif
     std::swap(m_good, other.m_good);
     std::swap(filename, other.filename);
@@ -1375,8 +1380,14 @@ bool IOFile::Open() {
                 LOG_ERROR(Common_Filesystem, "sceIoOpen fallo en {} (modo {}): {:#x}", filename,
                           openmode, static_cast<unsigned int>(m_vita_fd));
                 NoteVitaIOFailure("io open", filename.c_str());
+                return m_good;
             }
-            return m_good;
+            m_vita_read_buffer.reset();
+            m_vita_pos = 0;
+            m_vita_buf_start = 0;
+            m_vita_buf_len = 0;
+            m_vita_buf_pos = 0;
+            return true;
         }
     }
 #endif
@@ -1510,6 +1521,11 @@ bool IOFile::Close() {
             m_good = false;
         }
         m_vita_fd = -1;
+        m_vita_read_buffer.reset();
+        m_vita_pos = 0;
+        m_vita_buf_start = 0;
+        m_vita_buf_len = 0;
+        m_vita_buf_pos = 0;
         return m_good;
     }
 #endif
@@ -1540,16 +1556,38 @@ u64 IOFile::GetSize() const {
 bool IOFile::Seek(s64 off, int origin) {
 #ifdef AZAHAR_VITA_NATIVE_IO
     if (m_vita_fd >= 0) {
-        // Los SEEK_* de stdio coinciden en valor con los SCE_SEEK_*, pero se
-        // traducen a mano para no depender de esa coincidencia.
-        const int whence = (origin == SEEK_SET)   ? SCE_SEEK_SET
-                           : (origin == SEEK_CUR) ? SCE_SEEK_CUR
-                                                  : SCE_SEEK_END;
-        if (sceIoLseek(m_vita_fd, off, whence) < 0) {
+        // La posicion es logica: el descriptor se coloca de verdad al leer o
+        // escribir. Asi los Seek dentro del buffer no cuestan una llamada al
+        // kernel y el buffer sigue siendo valido.
+        s64 target;
+        switch (origin) {
+        case SEEK_SET:
+            target = off;
+            break;
+        case SEEK_CUR:
+            target = static_cast<s64>(m_vita_pos) + off;
+            break;
+        case SEEK_END:
+            target = static_cast<s64>(GetSize()) + off;
+            break;
+        default:
             m_good = false;
-            NoteVitaIOFailure("io seek", filename.c_str());
+            return false;
         }
-        return m_good;
+        if (target < 0) {
+            m_good = false;
+            return false;
+        }
+        const u64 pos = static_cast<u64>(target);
+        if (m_vita_buf_len > 0 && pos >= m_vita_buf_start &&
+            pos <= m_vita_buf_start + m_vita_buf_len) {
+            m_vita_buf_pos = static_cast<std::size_t>(pos - m_vita_buf_start);
+        } else {
+            m_vita_buf_len = 0;
+            m_vita_buf_pos = 0;
+        }
+        m_vita_pos = pos;
+        return true;
     }
 #endif
     if (!IsOpen() || 0 != FSEEK(m_file, off, origin))
@@ -1561,8 +1599,7 @@ bool IOFile::Seek(s64 off, int origin) {
 u64 IOFile::Tell() const {
 #ifdef AZAHAR_VITA_NATIVE_IO
     if (m_vita_fd >= 0) {
-        const SceOff pos = sceIoLseek(m_vita_fd, 0, SCE_SEEK_CUR);
-        return pos >= 0 ? static_cast<u64>(pos) : std::numeric_limits<u64>::max();
+        return m_vita_pos;
     }
 #endif
     if (IsOpen())
@@ -1598,14 +1635,43 @@ std::size_t IOFile::ReadImpl(void* data, std::size_t length, std::size_t elem_si
 
 #ifdef AZAHAR_VITA_NATIVE_IO
     if (m_vita_fd >= 0) {
-        const SceSSize got =
-            sceIoRead(m_vita_fd, data, static_cast<SceSize>(length * elem_size));
-        if (got < 0) {
-            m_good = false;
-            NoteVitaIOFailure("io read", filename.c_str());
-            return 0;
+        // Lectura con buffer propio: sceIo no tiene, y sin esto una ROM grande
+        // se carga a base de llamadas al kernel y tarda minutos.
+        if (m_vita_read_buffer == nullptr) {
+            m_vita_read_buffer = std::make_unique_for_overwrite<u8[]>(kNativeReadBufferSize);
         }
-        return static_cast<std::size_t>(got) / elem_size;
+        const std::size_t total = length * elem_size;
+        auto* const out = static_cast<u8*>(data);
+        std::size_t done = 0;
+        while (done < total) {
+            if (m_vita_buf_pos >= m_vita_buf_len) {
+                if (sceIoLseek(m_vita_fd, static_cast<SceOff>(m_vita_pos), SCE_SEEK_SET) < 0) {
+                    m_good = false;
+                    NoteVitaIOFailure("io read seek", filename.c_str());
+                    break;
+                }
+                const SceSSize got = sceIoRead(m_vita_fd, m_vita_read_buffer.get(),
+                                               static_cast<SceSize>(kNativeReadBufferSize));
+                if (got < 0) {
+                    m_good = false;
+                    NoteVitaIOFailure("io read", filename.c_str());
+                    break;
+                }
+                if (got == 0) {
+                    break; // EOF
+                }
+                m_vita_buf_start = m_vita_pos;
+                m_vita_buf_len = static_cast<std::size_t>(got);
+                m_vita_buf_pos = 0;
+            }
+            const std::size_t available = m_vita_buf_len - m_vita_buf_pos;
+            const std::size_t take = std::min(available, total - done);
+            std::memcpy(out + done, m_vita_read_buffer.get() + m_vita_buf_pos, take);
+            m_vita_buf_pos += take;
+            m_vita_pos += take;
+            done += take;
+        }
+        return done / elem_size;
     }
 #endif
 
@@ -1658,19 +1724,20 @@ std::size_t IOFile::ReadAtImpl(void* data, std::size_t byte_count, std::size_t o
 
 #ifdef AZAHAR_VITA_NATIVE_IO
     if (m_vita_fd >= 0) {
-        // No hay pread en sceIo: se guarda la posicion, se lee y se restaura.
-        // Todo dentro del mismo descriptor, asi que hay que serializarlo con
-        // los Read/Write normales -- de ahi el mutex.
+        // No hay pread en sceIo: se busca, se lee y se sigue. El buffer de
+        // lectura no se toca porque esto no cambia el contenido del fichero, y
+        // la posicion logica tampoco: cada Read/Write coloca el descriptor
+        // antes de usarlo.
         std::scoped_lock lock(m_file_pos_mutex);
-        const SceOff saved = sceIoLseek(m_vita_fd, 0, SCE_SEEK_CUR);
         if (sceIoLseek(m_vita_fd, static_cast<SceOff>(offset), SCE_SEEK_SET) < 0) {
             m_good = false;
+            NoteVitaIOFailure("io read at seek", filename.c_str());
             return 0;
         }
         const SceSSize got = sceIoRead(m_vita_fd, data, static_cast<SceSize>(byte_count));
-        sceIoLseek(m_vita_fd, saved, SCE_SEEK_SET);
         if (got < 0) {
             m_good = false;
+            NoteVitaIOFailure("io read at", filename.c_str());
             return 0;
         }
         return static_cast<std::size_t>(got);
@@ -1709,6 +1776,15 @@ std::size_t IOFile::WriteImpl(const void* data, std::size_t length, std::size_t 
 
 #ifdef AZAHAR_VITA_NATIVE_IO
     if (m_vita_fd >= 0) {
+        // Escribir invalida el buffer de lectura (el fichero cambia bajo el) y
+        // necesita el descriptor en la posicion logica.
+        m_vita_buf_len = 0;
+        m_vita_buf_pos = 0;
+        if (sceIoLseek(m_vita_fd, static_cast<SceOff>(m_vita_pos), SCE_SEEK_SET) < 0) {
+            m_good = false;
+            NoteVitaIOFailure("io write seek", filename.c_str());
+            return 0;
+        }
         const SceSSize put =
             sceIoWrite(m_vita_fd, data, static_cast<SceSize>(length * elem_size));
         if (put < 0) {
@@ -1716,6 +1792,7 @@ std::size_t IOFile::WriteImpl(const void* data, std::size_t length, std::size_t 
             NoteVitaIOFailure("io write", filename.c_str());
             return 0;
         }
+        m_vita_pos += static_cast<std::size_t>(put);
         return static_cast<std::size_t>(put) / elem_size;
     }
 #endif
@@ -1841,15 +1918,17 @@ bool IOFile::Resize(u64 size) {
         //    usan los archive para crear ficheros; no depende de que FatFs sepa
         //    extender con ftruncate.
         // La posicion del descriptor no debe cambiar para el llamante, que puede
-        // seguir leyendo o escribiendo donde estaba.
-        const SceOff saved = sceIoLseek(m_vita_fd, 0, SCE_SEEK_CUR);
+        // seguir leyendo o escribiendo donde estaba. El buffer se invalida: el
+        // contenido ha cambiado.
+        m_vita_buf_len = 0;
+        m_vita_buf_pos = 0;
         const SceOff current = sceIoLseek(m_vita_fd, 0, SCE_SEEK_END);
-        if (saved < 0 || current < 0) {
+        if (current < 0) {
             m_good = false;
             NoteVitaIOFailure("io resize seek", filename.c_str());
             return false;
         }
-        sceIoLseek(m_vita_fd, saved, SCE_SEEK_SET);
+        sceIoLseek(m_vita_fd, static_cast<SceOff>(m_vita_pos), SCE_SEEK_SET);
 
         if (static_cast<u64>(current) != size) {
             if (static_cast<u64>(current) > size) {
@@ -1881,7 +1960,7 @@ bool IOFile::Resize(u64 size) {
             }
         }
 
-        sceIoLseek(m_vita_fd, saved, SCE_SEEK_SET);
+        sceIoLseek(m_vita_fd, static_cast<SceOff>(m_vita_pos), SCE_SEEK_SET);
         return true;
     }
 #endif

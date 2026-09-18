@@ -669,8 +669,19 @@ private:
      * por sceIo hundia los juegos de 2 fps a 0.3 (miles de lecturas pequenas
      * del romfs pagando una llamada al kernel cada una). Ver kNativeIoThreshold
      * en file_util.cpp.
+     *
+     * Como sceIo no trae buffer, el camino nativo lleva el suyo: sin el,
+     * cargar una ROM grande son miles de lecturas pequenas con una llamada al
+     * kernel cada una y tarda minutos. Se reserva en la primera lectura, no en
+     * Open(), para no pagar 32 KB por cada fichero abierto.
      */
     int m_vita_fd = -1;
+    static constexpr std::size_t kNativeReadBufferSize = 32 * 1024;
+    std::unique_ptr<u8[]> m_vita_read_buffer;
+    u64 m_vita_pos = 0;       // Posicion logica (lo que devuelve Tell).
+    u64 m_vita_buf_start = 0; // Offset del primer byte valido del buffer.
+    std::size_t m_vita_buf_len = 0;
+    std::size_t m_vita_buf_pos = 0;
 #endif
     bool m_good = true;
 #if defined(HAVE_LIBRETRO_VFS) || defined(AZAHAR_VITA_NATIVE_IO)
