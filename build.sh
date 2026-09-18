@@ -98,10 +98,16 @@ if [ -f "$VPK" ]; then
     if [ -n "$VER" ]; then
         mkdir -p "$ROOT/elf"
         cp "$BUILD/src/citra_vita/azahar" "$ROOT/elf/azahar-$VER.elf" 2>/dev/null
+        # Copia del VPK con la version EN EL NOMBRE. azahar.vpk se sobrescribe
+        # en cada build y es facil acabar copiando a la consola uno viejo (ha
+        # pasado: el emulador seguia mostrando 0.1.0.16 con builds mas nuevos ya
+        # hechos). Este nombre no se puede confundir.
+        cp "$VPK" "$ROOT/azahar-$VER.vpk"
     fi
 
     echo
     echo "==> $ROOT/azahar.vpk  ($(du -h "$ROOT/azahar.vpk" | cut -f1))"
+    [ -n "$VER" ] && echo "==> $ROOT/azahar-$VER.vpk  (INSTALA ESTE; el nombre lleva la version)"
     echo "==> $ROOT/azahar.elf  (para analizar volcados de este VPK)"
     [ -n "$VER" ] && echo "==> $ROOT/elf/azahar-$VER.elf  (copia archivada de la version $VER)"
 fi
