@@ -34,9 +34,9 @@ set(CMAKE_C_STANDARD 11)
 # ---------------------------------------------------------------------------
 # Identidad de la app Vita
 # ---------------------------------------------------------------------------
-set(VITA_APP_NAME "Azahar")
-set(VITA_TITLEID  "AZHR00001")
-set(VITA_VERSION  "03.01")
+set(VITA_APP_NAME "Azahar 0.1.0.25")
+set(VITA_TITLEID  "AZHR00025")
+set(VITA_VERSION  "03.25")
 
 # ---------------------------------------------------------------------------
 # Recorte de funcionalidad para Vita
