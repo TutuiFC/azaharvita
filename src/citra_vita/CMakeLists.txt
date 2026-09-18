@@ -2,6 +2,7 @@
 
 add_executable(azahar
     main.cpp
+    vita_build_info.cpp
     vita_input.cpp
     vita_input.h
     vita_jit_probe.cpp

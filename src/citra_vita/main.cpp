@@ -87,7 +87,23 @@ namespace {
 /// Version del port, visible en el menu y en la pantalla de arranque. Se define
 /// en vita_version.h, que es el unico sitio donde se escribe (el overlay del
 /// juego usa la misma constante).
+using VitaFrontend::kBuildInfo;
 using VitaFrontend::kVersion;
+
+/// Version + sello de compilacion en una linea ("version X | fecha | hash").
+///
+/// El sello lo regenera build.sh en CADA compilacion, asi que la linea cambia
+/// siempre, aunque alguien olvide subir kVersion: es lo que permite saber si el
+/// VPK que corre la consola es el ultimo.
+const char* VersionLine() {
+    static char line[128];
+    if (line[0] == '\0') {
+        const auto written =
+            fmt::format_to_n(line, sizeof(line) - 1, "{}  |  {}", kVersion, kBuildInfo);
+        *written.out = '\0';
+    }
+    return line;
+}
 
 constexpr char kUserDir[] = "ux0:/data/azahar/";
 constexpr char kRomDir[] = "ux0:/data/azahar/roms";
@@ -265,7 +281,7 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
     vita2d_clear_screen();
 
     vita2d_pgf_draw_text(font, 40, 50, kColorAccent, 1.4f, "Azahar  -  PS Vita");
-    vita2d_pgf_draw_text(font, 40, 524, kColorDim, 0.85f, kVersion);
+    vita2d_pgf_draw_text(font, 40, 524, kColorDim, 0.85f, VersionLine());
     vita2d_pgf_draw_text(font, 40, 80, kColorDim, 0.9f,
                          "Emulador de Nintendo 3DS  |  interprete + renderizado por software");
 
@@ -1064,7 +1080,7 @@ void DrawStep(vita2d_pgf* font, const char* step) {
     vita2d_start_drawing();
     vita2d_clear_screen();
     vita2d_pgf_draw_text(font, 40, 60, kColorAccent, 1.3f, "Azahar  -  PS Vita");
-    vita2d_pgf_draw_text(font, 40, 90, kColorDim, 0.85f, kVersion);
+    vita2d_pgf_draw_text(font, 40, 90, kColorDim, 0.85f, VersionLine());
     vita2d_pgf_draw_text(font, 40, 140, kColorText, 1.0f, "Iniciando...");
     vita2d_pgf_draw_text(font, 40, 180, kColorDim, 1.0f, step);
 
@@ -1206,6 +1222,7 @@ int main(int argc, char** argv) {
     // build.sh guarda ahora una copia del ELF por version. Con esta linea se
     // sabe cual hay que usar.
     WriteCrashLog("version", kVersion);
+    WriteCrashLog("build", kBuildInfo);
     WriteCrashLog("main", "entrando (inicializadores estaticos superados)");
 
     scePowerSetArmClockFrequency(444);

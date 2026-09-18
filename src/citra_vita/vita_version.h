@@ -27,9 +27,17 @@ namespace VitaFrontend {
  * por GXM identica al camino de software) y se abre la Fase 3 con el generador
  * de shaders Cg.
  */
-constexpr char kVersion[] = "version 0.1.0.22";
+constexpr char kVersion[] = "version 0.1.0.23";
 
-/// La misma version con el nombre delante, para el overlay ("Azahar 0.1.0.22").
-constexpr char kOverlayBuild[] = "Azahar 0.1.0.22";
+/// La misma version con el nombre delante, para el overlay ("Azahar 0.1.0.23").
+constexpr char kOverlayBuild[] = "Azahar 0.1.0.23";
+
+/**
+ * Sello de compilacion ("fecha | hash de git"). Lo genera build.sh en cada
+ * compilacion (vita_build_info.inc, no versionado), asi que cambia SIEMPRE,
+ * aunque se olvide subir kVersion. Con esto se sabe de un vistazo si el VPK
+ * que corre la consola es el ultimo build o uno viejo.
+ */
+extern const char kBuildInfo[];
 
 } // namespace VitaFrontend

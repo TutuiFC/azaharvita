@@ -856,7 +856,13 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     }
 
     // La version en pantalla evita la duda de "seguro que instalaste la nueva?".
-    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 20, 0xFF60C0FF, 0.8f, kOverlayBuild);
+    // Se anade el sello de compilacion (fecha + hash de git), que cambia en cada
+    // build aunque la version no se toque.
+    static char build_line[112];
+    if (build_line[0] == '\0') {
+        BuildLine(build_line, sizeof(build_line), kOverlayBuild, kBuildInfo);
+    }
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 20, 0xFF60C0FF, 0.7f, build_line);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 38, 0xFFA0A0A0, 0.8f, line1);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 56, 0xFFA0A0A0, 0.8f, line2);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 80, 0xFFA0A0A0, 0.8f, line_cpu);

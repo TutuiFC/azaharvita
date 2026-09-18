@@ -30,6 +30,24 @@ fi
 # muere sin mensaje, dejando errores que parecen de codigo y no lo son.
 JOBS="${AZAHAR_JOBS:-4}"
 
+# Sello de compilacion: fecha y hash de git dentro del binario.
+#
+# La version de vita_version.h se sube a mano y es la que identifica al cambio;
+# esto es lo que permite ver de un vistazo si el VPK instalado en la consola es
+# ESTE build o uno viejo. Se regenera en cada compilacion, asi que cambia
+# siempre, aunque alguien olvide subir la version. El fichero no se versiona.
+BUILD_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
+GIT_HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo sin-git)"
+if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null | head -n 1)" ]; then
+    GIT_HASH="$GIT_HASH+"
+fi
+cat > "$ROOT/src/citra_vita/vita_build_info.inc" <<EOF
+// Generado por build.sh en cada compilacion. NO se versiona.
+namespace VitaFrontend {
+const char kBuildInfo[] = "$BUILD_DATE | $GIT_HASH";
+}
+EOF
+
 ninja -C "$BUILD" -j "$JOBS" ${1:+"$1"}
 NINJA_RC=$?
 
