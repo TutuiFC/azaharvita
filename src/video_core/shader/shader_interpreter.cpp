@@ -47,9 +47,34 @@ struct LoopStackElement {
 template <bool Debug>
 static void RunInterpreter(const ShaderSetup& setup, ShaderUnit& state,
                            DebugData<Debug>& debug_data, unsigned entry_point) {
-    boost::circular_buffer<IfStackElement> if_stack(8);
-    boost::circular_buffer<CallStackElement> call_stack(4);
-    boost::circular_buffer<LoopStackElement> loop_stack(4);
+    /**
+     * Pilas reutilizadas por hilo en vez de creadas en cada llamada.
+     *
+     * RunInterpreter se llama UNA VEZ POR VERTICE, y cada circular_buffer
+     * reservaba memoria en el heap al construirse (y la liberaba al salir): en
+     * un fotograma con decenas de miles de vertices eso son decenas de miles de
+     * malloc/free EN EL HILO QUE EMULA LA CPU. Las pilas se vacian al entrar,
+     * asi que el estado no se hereda de un vertice al siguiente.
+     *
+     * thread_local y no static: el rasterizador tiene hilos propios y el motor
+     * de shaders podria acabar usandose desde ellos.
+     */
+    struct Stacks {
+        boost::circular_buffer<IfStackElement> if_stack{8};
+        boost::circular_buffer<CallStackElement> call_stack{4};
+        boost::circular_buffer<LoopStackElement> loop_stack{4};
+
+        void Reset() {
+            if_stack.clear();
+            call_stack.clear();
+            loop_stack.clear();
+        }
+    };
+    static thread_local Stacks stacks;
+    stacks.Reset();
+    auto& if_stack = stacks.if_stack;
+    auto& call_stack = stacks.call_stack;
+    auto& loop_stack = stacks.loop_stack;
     u32 program_counter = entry_point;
 
     const auto do_if = [&](Instruction instr, bool condition) {
