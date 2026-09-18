@@ -41,9 +41,23 @@ FramebufferSignature last_signature[3]{};
 
 void NoteFramebuffer(int i, PAddr address, u32 stride, u32 height, u32 format, u32 color_fill) {
     FramebufferSignature& last = last_signature[i];
-    if (last.seen && last.address == address && last.stride == stride && last.height == height &&
-        last.format == format && last.color_fill == color_fill) {
-        return;
+    const bool same_state =
+        last.seen && last.stride == stride && last.height == height && last.format == format &&
+        last.color_fill == color_fill;
+    /**
+     * La direccion alterna entre los dos buffers del juego en cada fotograma.
+     * Anotarla cada vez son dos escrituras a disco por fotograma (y el registro
+     * es sincrono). Lo que interesa de verdad es el formato, el stride y el
+     * alto, asi que los cambios de direccion se anotan solo las primeras veces.
+     */
+    static int address_notes = 0;
+    if (same_state) {
+        if (last.address == address || address_notes >= 8) {
+            return;
+        }
+        address_notes++;
+    } else {
+        address_notes = 0;
     }
     last = {address, stride, height, format, color_fill, true};
 

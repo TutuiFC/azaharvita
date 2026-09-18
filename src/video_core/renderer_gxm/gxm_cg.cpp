@@ -99,6 +99,30 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
 
     const SceShaccCgCompileOutput* output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     if (output == nullptr || output->programData == nullptr) {
+        /**
+         * Nota a crash.txt solo las primeras veces, y con el PRIMER diagnostico
+         * del compilador dentro.
+         *
+         * Antes se anotaba cada fallo sin mensaje, y ademas el cache no
+         * recordaba el fallo: cada lote con esa configuracion volvia a compilar
+         * y a fallar. En una sesion medida fueron 1.456 intentos. Sin el
+         * mensaje, "gxm shader" tampoco dice por que falla, que es lo que hace
+         * falta para arreglar el generador.
+         */
+        static int noted = 0;
+        if (noted < 4) {
+            noted++;
+            const char* message = nullptr;
+            if (output != nullptr && output->diagnosticCount > 0) {
+                message = output->diagnostics[0].message;
+            }
+            char note[192];
+            const auto written =
+                fmt::format_to_n(note, sizeof(note) - 1, "{}: {}", name,
+                                 message != nullptr ? message : "sin diagnostico");
+            *written.out = 0;
+            Common::VitaNote("gxm shader", note);
+        }
         if (output != nullptr) {
             for (int i = 0; i < output->diagnosticCount && i < 4; i++) {
                 LOG_ERROR(Render, "GXM {}: {}", name,
@@ -110,7 +134,6 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         } else {
             LOG_ERROR(Render, "GXM: el compilador no devolvio nada para {}", name);
         }
-        Common::VitaNote("gxm shader", name);
         return nullptr;
     }
     return output;

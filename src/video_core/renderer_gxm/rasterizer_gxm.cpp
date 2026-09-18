@@ -542,7 +542,16 @@ struct RasterizerGXM::PipelineCache {
 
         const auto it = entries.find(key);
         if (it != entries.end()) {
-            return it->second.get();
+            /**
+             * Una entrada con programa nulo es una configuracion que YA fallo:
+             * se devuelve el fallo sin reintentar la compilacion.
+             *
+             * Sin esto, cada lote con esa configuracion volvia a compilar y a
+             * fallar. En una sesion medida fueron 1.456 intentos de compilacion
+             * del shader de fragmentos, cada uno pagando su tiempo y su nota a
+             * disco: es lo que dejaba la GPU en el 98% a 0.3 fps.
+             */
+            return it->second->program != nullptr ? it->second.get() : nullptr;
         }
 
         const auto source = Pica::Shader::Generator::GXM::GenerateFragmentShader(config);
@@ -551,13 +560,15 @@ struct RasterizerGXM::PipelineCache {
             // antes de aceptar el lote. Si pasa, es que las dos no miran lo
             // mismo, y eso conviene verlo escrito.
             NoteOnce(noted[3], "gxm pipeline", "el generador se echo atras");
+            entries.emplace(key, std::make_unique<Entry>());
             return nullptr;
         }
         auto entry = std::make_unique<Entry>();
         entry->output = CompileCg(SCE_SHACCCG_PROFILE_FP, "azahar_gxm_f.cg", source->c_str());
         if (entry->output == nullptr) {
-            // CompileCg ya deja su nota ("gxm shader") con el fichero; el
-            // mensaje del compilador va al registro normal.
+            // CompileCg ya deja su nota ("gxm shader") con el diagnostico. Se
+            // recuerda el fallo para no repetirlo en cada lote.
+            entries.emplace(key, std::make_unique<Entry>());
             return nullptr;
         }
         const auto* gxp = reinterpret_cast<const SceGxmProgram*>(entry->output->programData);
@@ -566,6 +577,7 @@ struct RasterizerGXM::PipelineCache {
             NoteOnce(noted[4], "gxm pipeline", "registrar err {:#x}",
                      static_cast<u32>(register_rc));
             sceShaccCgDestroyCompileOutput(entry->output);
+            entries.emplace(key, std::make_unique<Entry>());
             return nullptr;
         }
         entry->registered = true;
@@ -577,6 +589,7 @@ struct RasterizerGXM::PipelineCache {
                      static_cast<u32>(program_rc));
             sceGxmShaderPatcherUnregisterProgram(patcher, entry->id);
             sceShaccCgDestroyCompileOutput(entry->output);
+            entries.emplace(key, std::make_unique<Entry>());
             return nullptr;
         }
         entry->const_color = sceGxmProgramFindParameterByName(gxp, "const_color");
