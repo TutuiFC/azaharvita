@@ -58,7 +58,54 @@
 #include "common/logging/log.h"
 #include "core/arm/skyeye_common/vfp/asm_vfp.h"
 #include "core/arm/skyeye_common/vfp/vfp.h"
+#include "core/arm/skyeye_common/vfp/vfp_fastpath.h"
 #include "core/arm/skyeye_common/vfp/vfp_helper.h"
+
+/**
+ * Camino rapido de las operaciones binarias de precision simple.
+ *
+ * El porque completo esta en vfp_fastpath.h. Aqui solo queda la mecanica: si
+ * las condiciones se cumplen se hace la cuenta con la VFP del anfitrion y se
+ * escribe el registro; si no, se devuelve false y el llamante sigue por el
+ * camino de softfloat de siempre, que no se ha tocado.
+ *
+ * 'n' y 'm' son los operandos ya en bits, tal y como los tiene el invitado.
+ * 'op' recibe los dos float y devuelve el resultado.
+ *
+ * OJO AL ORDEN de las comprobaciones: el resultado se valida DESPUES de
+ * calcularlo, asi que una operacion que se acabe rechazando se ha hecho dos
+ * veces (nativa y luego softfloat). Sale a cuenta igualmente porque rechazar es
+ * raro, pero por eso se descartan antes por los operandos todos los casos que
+ * se puede: cuanto antes se rechace, menos se tira.
+ */
+template <typename F>
+static inline bool vfp_single_fast_binop(ARMul_State* state, int sd, s32 n, s32 m, u32 fpscr,
+                                         u32* exceptions, F op) {
+    if (!VfpFast::Usable(fpscr)) {
+        return false;
+    }
+    const u32 n_bits = static_cast<u32>(n);
+    const u32 m_bits = static_cast<u32>(m);
+    if (!VfpFast::SingleIsNormal(n_bits) || !VfpFast::SingleIsNormal(m_bits)) {
+        return false;
+    }
+
+    const float result = op(VfpFast::BitsToSingle(n_bits), VfpFast::BitsToSingle(m_bits));
+    const u32 result_bits = VfpFast::SingleToBits(result);
+    if (!VfpFast::SingleIsNormal(result_bits)) {
+        // Desbordamiento, agotamiento, o el anfitrion ha aplastado un subnormal.
+        // Se deshace lo andado: softfloat lo hara bien, incluidos los bits de
+        // excepcion que toquen.
+        VfpFast::DiscardHostExceptions();
+        return false;
+    }
+
+    if (!VfpFast::FinishHostOp(exceptions)) {
+        return false;
+    }
+    vfp_put_float(state, static_cast<s32>(result_bits), sd);
+    return true;
+}
 
 static struct vfp_single vfp_single_default_qnan = {
     255,
@@ -334,6 +381,30 @@ static u32 vfp_single_fsqrt(ARMul_State* state, int sd, int unused, s32 m, u32 f
     struct vfp_single vsm, vsd, *vsp;
     int ret, tm;
     u32 exceptions = 0;
+
+    /*
+     * Camino rapido: VSQRT.F32 del anfitrion.
+     *
+     * La raiz cuadrada de IEEE 754 esta correctamente redondeada, igual que la
+     * rutina de abajo, asi que con un operando normal y POSITIVO las dos dan el
+     * mismo resultado bit a bit. El signo hay que mirarlo aparte de lo normal:
+     * la raiz de un negativo es invalida (IOC) y la de un normal positivo nunca
+     * desborda ni se agota, pero eso ultimo lo comprueba igualmente el propio
+     * ayudante sobre el resultado.
+     */
+    if (VfpFast::Usable(fpscr)) {
+        const u32 m_bits = static_cast<u32>(m);
+        if (VfpFast::SingleIsNormal(m_bits) && VfpFast::SingleIsPositive(m_bits)) {
+            const float root = __builtin_sqrtf(VfpFast::BitsToSingle(m_bits));
+            const u32 root_bits = VfpFast::SingleToBits(root);
+            u32 raised = 0;
+            if (VfpFast::SingleIsNormal(root_bits) && VfpFast::FinishHostOp(&raised)) {
+                vfp_put_float(state, static_cast<s32>(root_bits), sd);
+                return raised;
+            }
+            VfpFast::DiscardHostExceptions();
+        }
+    }
 
     exceptions |= vfp_single_unpack(&vsm, m, fpscr);
     tm = vfp_single_type(&vsm);
@@ -997,6 +1068,11 @@ static u32 vfp_single_fmul(ARMul_State* state, int sd, int sn, s32 m, u32 fpscr)
 
     LOG_TRACE(Core_ARM11, "s{} = {:08x}", sn, n);
 
+    if (vfp_single_fast_binop(state, sd, n, m, fpscr, &exceptions,
+                              [](float a, float b) { return a * b; })) {
+        return exceptions;
+    }
+
     exceptions |= vfp_single_unpack(&vsn, n, fpscr);
     if (vsn.exponent == 0 && vsn.significand)
         vfp_single_normalise_denormal(&vsn);
@@ -1018,6 +1094,13 @@ static u32 vfp_single_fnmul(ARMul_State* state, int sd, int sn, s32 m, u32 fpscr
     s32 n = vfp_get_float(state, sn);
 
     LOG_TRACE(Core_ARM11, "s{} = {:08x}", sn, n);
+
+    // Negar un resultado normal es exacto (solo cambia el bit de signo), asi que
+    // no altera ni el redondeo ni las excepciones.
+    if (vfp_single_fast_binop(state, sd, n, m, fpscr, &exceptions,
+                              [](float a, float b) { return -(a * b); })) {
+        return exceptions;
+    }
 
     exceptions |= vfp_single_unpack(&vsn, n, fpscr);
     if (vsn.exponent == 0 && vsn.significand)
@@ -1042,6 +1125,11 @@ static u32 vfp_single_fadd(ARMul_State* state, int sd, int sn, s32 m, u32 fpscr)
 
     LOG_TRACE(Core_ARM11, "s{} = {:08x}", sn, n);
 
+    if (vfp_single_fast_binop(state, sd, n, m, fpscr, &exceptions,
+                              [](float a, float b) { return a + b; })) {
+        return exceptions;
+    }
+
     /*
      * Unpack and normalise denormals.
      */
@@ -1063,6 +1151,20 @@ static u32 vfp_single_fadd(ARMul_State* state, int sd, int sn, s32 m, u32 fpscr)
  */
 static u32 vfp_single_fsub(ARMul_State* state, int sd, int sn, s32 m, u32 fpscr) {
     LOG_TRACE(Core_ARM11, "s{} = {:08x}", sn, sd);
+
+    // El camino rapido va ANTES de todo el enredo de abajo a proposito: ese
+    // enredo existe por los subnormales aplastados a cero y por el signo del
+    // cero, y el camino rapido solo acepta operandos normales, donde ninguna de
+    // las dos cosas puede pasar.
+    {
+        u32 exceptions = 0;
+        const s32 n = vfp_get_float(state, sn);
+        if (vfp_single_fast_binop(state, sd, n, m, fpscr, &exceptions,
+                                  [](float a, float b) { return a - b; })) {
+            return exceptions;
+        }
+    }
+
     /*
      * Subtraction is addition with one sign inverted. Unpack the second operand to perform FTZ if
      * necessary, we can't let fadd do this because a denormal in m might get flushed to +0 in FTZ
@@ -1092,6 +1194,13 @@ static u32 vfp_single_fdiv(ARMul_State* state, int sd, int sn, s32 m, u32 fpscr)
     int tm, tn;
 
     LOG_TRACE(Core_ARM11, "s{} = {:08x}", sn, n);
+
+    // El divisor normal no puede ser cero, asi que aqui no hay division por cero
+    // que atrapar: ese caso lo rechaza la comprobacion de operandos.
+    if (vfp_single_fast_binop(state, sd, n, m, fpscr, &exceptions,
+                              [](float a, float b) { return a / b; })) {
+        return exceptions;
+    }
 
     exceptions |= vfp_single_unpack(&vsn, n, fpscr);
     exceptions |= vfp_single_unpack(&vsm, m, fpscr);

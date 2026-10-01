@@ -177,13 +177,16 @@ void VitaPinThreadToUserCore(unsigned int index, const char* role) {
     }
     n += AppendUInt(buffer + n, static_cast<unsigned int>(actual_core));
 
-    // rc distinto de 0 significa que el kernel rechazo la peticion: sin esto,
-    // una afinidad que no se aplica no se distingue de una que si.
-    const char* result = rc == 0 ? ", ok" : ", ERROR rc ";
+    // Solo un rc NEGATIVO es un error. Si sale bien, la llamada devuelve la
+    // mascara ANTERIOR: 0 en un hilo recien creado, pero 0x70000 ("cualquier
+    // nucleo de usuario") en el hilo principal. Hasta 0.1.0.43 esto comparaba
+    // con 0 y anotaba ese 458752 (0x70000) como "ERROR" en el hilo de
+    // emulacion, cuando la afinidad SI se habia aplicado ("real 0").
+    const char* result = rc >= 0 ? ", ok" : ", ERROR rc ";
     for (std::size_t i = 0; result[i] != 0; i++) {
         buffer[n++] = result[i];
     }
-    if (rc != 0) {
+    if (rc < 0) {
         n += AppendUInt(buffer + n, static_cast<unsigned int>(rc));
     }
     buffer[n] = 0;

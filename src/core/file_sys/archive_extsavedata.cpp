@@ -186,21 +186,35 @@ std::string GetExtSaveDataPath(std::string_view mount_point, const Path& path) {
     ExtSaveDataArchivePath path_data;
     std::memcpy(&path_data, vec_data.data(), sizeof(path_data));
 
+    // Aplanado en Vita por el limite de anidamiento del sistema de ficheros de
+    // la consola; ver la nota extensa en archive_source_sd_savedata.cpp.
+#ifdef __PSVITA__
+    return fmt::format("{}{:08X}{:08X}/", mount_point, path_data.save_high, path_data.save_low);
+#else
     return fmt::format("{}{:08X}/{:08X}/", mount_point, path_data.save_high, path_data.save_low);
+#endif
 }
 
 std::string GetExtDataContainerPath(std::string_view mount_point, bool shared) {
     if (shared) {
         return fmt::format("{}data/{}/extdata/", mount_point, SYSTEM_ID);
     }
+#ifdef __PSVITA__
+    return fmt::format("{}e/", mount_point);
+#else
     return fmt::format("{}Nintendo 3DS/{}/{}/extdata/", mount_point, SYSTEM_ID, SDCARD_ID);
+#endif
 }
 
 std::string GetExtDataPathFromId(std::string_view mount_point, u64 extdata_id) {
     const u32 high = static_cast<u32>(extdata_id >> 32);
     const u32 low = static_cast<u32>(extdata_id & 0xFFFFFFFF);
 
+#ifdef __PSVITA__
+    return fmt::format("{}{:08x}{:08x}/", GetExtDataContainerPath(mount_point, false), high, low);
+#else
     return fmt::format("{}{:08x}/{:08x}/", GetExtDataContainerPath(mount_point, false), high, low);
+#endif
 }
 
 Path ConstructExtDataBinaryPath(u32 media_type, u32 high, u32 low) {

@@ -286,6 +286,87 @@ bool Delete(const std::string& filepath) {
 }
 
 bool CreateDir(const std::string& path) {
+#ifdef AZAHAR_VITA_NATIVE_IO
+    /**
+     * Camino nativo: sceIoMkdir directo, sin pasar por la libc.
+     *
+     * Dos motivos, y los dos vienen de haber perseguido esto a ciegas.
+     *
+     * 1. LA BARRA FINAL. CreateFullPath construye la ruta nivel a nivel y a
+     *    cada trozo le deja la barra ("substr(0, position + 1)"), asi que llega
+     *    algo como ".../data/00000001/". sceIoMkdir la rechaza. Aqui se quita
+     *    siempre antes de llamar, en vez de llamar, fallar y reintentar.
+     *
+     * 2. EL CODIGO DE ERROR DE VERDAD. Pasando por la libc, el error de Sony se
+     *    aplasta a un errno generico: todo lo que no sea "ya existe" acaba como
+     *    EINVAL ("Invalid argument"), que no dice nada. El codigo crudo si
+     *    distingue entre ruta demasiado larga, dispositivo no montado, sin
+     *    permiso o ruta mal formada, y desde la consola es lo unico que se ve.
+     *
+     * Por que importa tanto una carpeta: si no se puede crear la del GUARDADO,
+     * el juego no puede abrir su archivo de guardado y se queda a medio cargar
+     * o se rinde con la pantalla de error del 3DS. Es el fallo por el que no
+     * arrancaban varios juegos.
+     */
+    {
+        std::string dir = path;
+        while (dir.size() > 1 && dir.back() == '/' && dir[dir.size() - 2] != ':') {
+            dir.pop_back();
+        }
+
+        const int rc = sceIoMkdir(dir.c_str(), 0777);
+
+        /**
+         * RASTRO DE TODOS LOS NIVELES, con presupuesto.
+         *
+         * Hasta ahora solo se registraba el nivel que fallaba, y eso resulto
+         * enganoso: si un nivel de MAS ARRIBA fallaba y quedaba tapado (ver
+         * abajo), el primer error visible era el de mas abajo, que solo es la
+         * consecuencia. Con el rastro completo se ve de un vistazo donde se
+         * rompe la cadena de verdad.
+         *
+         * El presupuesto existe porque VitaNote y el registro escriben en la
+         * tarjeta: unas pocas decenas de lineas bastan para ver la cadena de
+         * carpetas de un juego, y a partir de ahi solo estorbarian.
+         */
+        static int trace_budget = 60;
+        if (trace_budget > 0) {
+            trace_budget--;
+            LOG_INFO(Common_Filesystem, "mkdir {} -> {:#010x}", dir,
+                     static_cast<unsigned int>(rc));
+        }
+
+        if (rc >= 0) {
+            return true;
+        }
+        // 0x80010011 es EEXIST en los errores de Sony; ya existir no es fallo.
+        if (static_cast<unsigned int>(rc) == 0x80010011u) {
+            return true;
+        }
+
+        /**
+         * LA COMPROBACION DE "PERO SI YA EXISTE" VA POR sceIoGetstat, NO POR
+         * IsDirectory.
+         *
+         * IsDirectory usa el stat de esta libc, que es el mismo camino de 32
+         * bits que no sabe de ficheros grandes y del que ya no nos fiamos. Si
+         * contestara que si sobre una carpeta que NO existe, este metodo
+         * devolveria exito en silencio, el nivel se daria por creado y el
+         * siguiente fallaria sin que nada dijera cual falto de verdad. Que es
+         * exactamente el sintoma que se estaba persiguiendo.
+         *
+         * sceIoGetstat es la version nativa y trae el bit de directorio.
+         */
+        SceIoStat st{};
+        if (sceIoGetstat(dir.c_str(), &st) >= 0 && SCE_S_ISDIR(st.st_mode)) {
+            return true;
+        }
+
+        LOG_ERROR(Common_Filesystem, "sceIoMkdir fallo en {} (largo {}): {:#010x}", dir,
+                  dir.size(), static_cast<unsigned int>(rc));
+        return false;
+    }
+#endif
     LOG_TRACE(Common_Filesystem, "directory {}", path);
 #ifdef _WIN32
     if (::CreateDirectoryW(Common::UTF8ToUTF16W(path).c_str(), nullptr))
@@ -342,6 +423,42 @@ bool CreateDir(const std::string& path) {
         return true;
     }
 
+#ifdef __PSVITA__
+    /**
+     * SEGUNDO INTENTO SIN LA BARRA FINAL.
+     *
+     * CreateFullPath crea la ruta nivel a nivel y a cada trozo le deja la barra
+     * del final ("substr(0, position + 1)"), asi que a mkdir le llega siempre
+     * algo como ".../data/00000001/". En un sistema de ficheros normal eso da
+     * igual; sceIoMkdir, que es lo que hay debajo aqui, la rechaza con EINVAL.
+     *
+     * Y no es un detalle: la ruta que fallaba es la del GUARDADO del juego
+     * (ux0:/data/azahar/sdmc/Nintendo 3DS/.../title/00040000/0007af00/data/
+     * 00000001/). Sin ella, OpenArchive del archivo de guardado falla y el
+     * juego se rinde con la pantalla de "An error has occurred" del 3DS. Es
+     * decir: el juego no arrancaba por una barra.
+     *
+     * No se toca la ruta antes de llamar por primera vez a proposito. Si
+     * algun dia sceIoMkdir aceptara la barra, el primer intento acierta y esto
+     * no se ejecuta; y si falla por otra cosa, el registro de abajo dice por
+     * cual con el codigo crudo, que es lo unico que se ve desde la consola.
+     */
+    if (path.size() > 1 && path.back() == '/' && path[path.size() - 2] != ':') {
+        const std::string trimmed = path.substr(0, path.size() - 1);
+        if (mkdir(trimmed.c_str(), 0755) == 0) {
+            return true;
+        }
+        const int trimmed_err = errno;
+        if (trimmed_err == EEXIST) {
+            return true;
+        }
+        LOG_ERROR(Common_Filesystem,
+                  "mkdir fallo en {} (largo {}): con barra {} ({}), sin barra {} ({})", path,
+                  path.size(), strerror(err), err, strerror(trimmed_err), trimmed_err);
+        return false;
+    }
+#endif
+
     LOG_ERROR(Common_Filesystem, "mkdir failed on {}: {}", path, strerror(err));
     return false;
 #endif
@@ -355,6 +472,45 @@ bool CreateFullPath(const std::string& fullPath) {
         LOG_DEBUG(Common_Filesystem, "path exists {}", fullPath);
         return true;
     }
+
+#ifdef AZAHAR_VITA_NATIVE_IO
+    /**
+     * En Vita se crean TODOS los niveles, sin preguntar antes si existen.
+     *
+     * La version de abajo se salta un nivel cuando IsDirectory dice que ya
+     * esta, y IsDirectory va por el stat de la libc, que en esta consola no es
+     * de fiar (su st_size es de 32 bits y es el mismo camino que no sabe de
+     * ficheros grandes). Si contesta que si sobre una carpeta que NO existe, el
+     * nivel se salta y el siguiente falla con EINVAL -- crear algo dentro de un
+     * padre inexistente -- sin decir cual era el nivel que faltaba de verdad.
+     *
+     * sceIoMkdir ya distingue "ya existe" (0x80010011) de un error real y
+     * CreateDir lo trata como exito, asi que preguntar antes no aporta nada:
+     * sale mas barato intentarlo siempre. Y si falla, el registro dice el
+     * nivel EXACTO y con el codigo crudo de Sony, que es lo unico que se ve
+     * desde la consola.
+     */
+    {
+        std::size_t vita_pos = 0;
+        while (true) {
+            vita_pos = fullPath.find(DIR_SEP_CHR, vita_pos);
+            if (vita_pos == fullPath.npos) {
+                return true;
+            }
+            const std::string level = fullPath.substr(0, vita_pos + 1);
+            // "ux0:/" y demas raices de dispositivo no se crean: existen o no,
+            // pero mkdir sobre ellas no tiene sentido.
+            if (level.size() > 1 && level[level.size() - 2] != ':') {
+                if (!FileUtil::CreateDir(level)) {
+                    LOG_ERROR(Common, "CreateFullPath: fallo creando el nivel {} de {}", level,
+                              fullPath);
+                    return false;
+                }
+            }
+            vita_pos++;
+        }
+    }
+#endif
 
     std::size_t position = 0;
     while (true) {
@@ -1292,6 +1448,23 @@ IOFile& IOFile::operator=(IOFile&& other) noexcept {
 void IOFile::Swap(IOFile& other) noexcept {
     std::swap(m_file, other.m_file);
     std::swap(m_fd, other.m_fd);
+#ifdef AZAHAR_VITA_NATIVE_IO
+    /**
+     * EL DESCRIPTOR NATIVO TAMBIEN, Y SIN ESTO NO ABRE NINGUNA ROM.
+     *
+     * Swap es lo que usan el constructor y la asignacion POR MOVIMIENTO, y un
+     * IOFile se mueve constantemente: se devuelve por valor, se guarda en
+     * contenedores, se pasa de una capa a otra. Al no intercambiar m_vita_fd,
+     * el destino se quedaba con -1 -- o sea IsOpen() falso, "fichero cerrado"
+     * -- mientras el origen conservaba el descriptor bueno y lo cerraba al
+     * destruirse. El fichero se perdia en el primer movimiento.
+     *
+     * No salto a la vista al escribir el camino nativo porque el resto de
+     * metodos si miran m_vita_fd; este es el unico sitio que toca el campo sin
+     * nombrarlo, y estuvo compilado fuera hasta que se activo la macro.
+     */
+    std::swap(m_vita_fd, other.m_vita_fd);
+#endif
     std::swap(m_good, other.m_good);
     std::swap(filename, other.filename);
     std::swap(openmode, other.openmode);
@@ -1328,8 +1501,23 @@ bool IOFile::Open() {
     m_vita_fd = sceIoOpen(filename.c_str(), VitaOpenFlags(openmode), 0666);
     m_good = m_vita_fd >= 0;
     if (!m_good) {
-        LOG_ERROR(Common_Filesystem, "sceIoOpen fallo en {} (modo {}): {:#x}", filename, openmode,
-                  static_cast<unsigned int>(m_vita_fd));
+        /**
+         * "No existe" NO es un error que merezca una linea de registro.
+         *
+         * El emulador tantea ficheros que casi nunca estan (mods, parches,
+         * guardados todavia sin crear) y espera que no esten: abrir y fallar es
+         * parte del funcionamiento normal. Registrarlo como error llenaba el
+         * log -- de 9 KB paso a 87 KB en una sola partida -- y escribir cuesta
+         * tiempo en el hilo que emula la CPU. Los demas codigos si se anotan,
+         * porque esos si son algo que va mal.
+         */
+        constexpr unsigned int kSceErrnoEnoent = 0x80010002u;
+        if (static_cast<unsigned int>(m_vita_fd) == kSceErrnoEnoent) {
+            LOG_DEBUG(Common_Filesystem, "sceIoOpen: no existe {}", filename);
+        } else {
+            LOG_ERROR(Common_Filesystem, "sceIoOpen fallo en {} (modo {}): {:#010x}", filename,
+                      openmode, static_cast<unsigned int>(m_vita_fd));
+        }
     }
     return m_good;
 #endif
@@ -1615,17 +1803,25 @@ std::size_t IOFile::ReadAtImpl(void* data, std::size_t byte_count, std::size_t o
 
 #ifdef AZAHAR_VITA_NATIVE_IO
     {
-        // No hay pread en sceIo: se guarda la posicion, se lee y se restaura.
-        // Todo dentro del mismo descriptor, asi que hay que serializarlo con
-        // los Read/Write normales -- de ahi el mutex.
-        std::scoped_lock lock(m_file_pos_mutex);
-        const SceOff saved = sceIoLseek(m_vita_fd, 0, SCE_SEEK_CUR);
-        if (sceIoLseek(m_vita_fd, static_cast<SceOff>(offset), SCE_SEEK_SET) < 0) {
-            m_good = false;
-            return 0;
-        }
-        const SceSSize got = sceIoRead(m_vita_fd, data, static_cast<SceSize>(byte_count));
-        sceIoLseek(m_vita_fd, saved, SCE_SEEK_SET);
+        /**
+         * sceIoPread: UNA llamada, sin mover la posicion y sin candado.
+         *
+         * Aqui habia guardar la posicion, saltar, leer y volver a saltar, todo
+         * bajo un mutex, porque el comentario daba por hecho que sceIo no tenia
+         * pread. SI LO TIENE: sceIoPread esta declarado en psp2/io/fcntl.h y
+         * exportado en libSceIofilemgr_stub.a, y ademas toma el desplazamiento
+         * como SceOff de 64 bits, que es justo lo que hacia falta.
+         *
+         * Importa mucho mas de lo que parece: este es el camino por el que se
+         * lee el RomFS, o sea CASI TODO lo que un juego carga. Pasar de cuatro
+         * llamadas al sistema y un candado a una sola llamada cambia el coste
+         * de cargar un juego grande, que es justo donde se notaba que no
+         * terminaba nunca. Y al no tocar la posicion del fichero, dos hilos
+         * pueden leer a la vez sin estorbarse.
+         */
+        const SceSSize got =
+            sceIoPread(m_vita_fd, data, static_cast<SceSize>(byte_count),
+                       static_cast<SceOff>(offset));
         if (got < 0) {
             m_good = false;
             return 0;
@@ -1743,7 +1939,12 @@ inline bool IOFile::IsGood() const {
 inline void IOFile::Clear() {
     m_good = true;
 
-#ifdef HAVE_LIBRETRO_VFS
+#if defined(AZAHAR_VITA_NATIVE_IO)
+    // En el camino nativo no hay FILE*: m_file es SIEMPRE nulo, y
+    // std::clearerr(nullptr) no es "no hacer nada", es desreferenciar un puntero
+    // nulo. sceIo no guarda banderas de error por descriptor, asi que poner
+    // m_good a true de arriba es todo lo que hay que limpiar.
+#elif defined(HAVE_LIBRETRO_VFS)
     filestream_rewind(m_file);
 #else
     std::clearerr(m_file);

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/common_types.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
@@ -26,8 +27,14 @@ class RasterizerInterface;
 
 namespace Pica {
 
+#ifdef __PSVITA__
+/// Sombrear cada indice una sola vez por lote (0.1.6.1). Ver pica_core.cpp.
+extern std::atomic<bool> g_full_vertex_dedup;
+#endif
+
 class DebugContext;
 class ShaderEngine;
+class VertexLoader;
 
 class DelayGenerator {
 private:
@@ -142,6 +149,21 @@ private:
     void DrawArrays(bool is_indexed);
 
     void LoadVertices(bool is_indexed);
+
+#ifdef __PSVITA__
+    /**
+     * El sombreado de vertices repartido entre los tres nucleos de la Vita.
+     * Sustituye al bucle de LoadVertices cuando no hay shader de geometria ni
+     * depurador; la explicacion completa, con lo que cambia y lo que no, esta
+     * junto a la implementacion en pica_core.cpp.
+     */
+    void ShadeVerticesParallel(const VertexLoader& loader, PAddr base_address, bool is_indexed,
+                               const u8* index_address_8, const u16* index_address_16,
+                               bool index_u16);
+
+    struct ParallelShading;
+    std::unique_ptr<ParallelShading> parallel_shading;
+#endif
 
 public:
     union Regs {

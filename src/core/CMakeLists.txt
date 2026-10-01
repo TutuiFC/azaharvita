@@ -14,6 +14,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     arm/dyncom/arm_dyncom_thumb.h
     arm/dyncom/arm_dyncom_trans.cpp
     arm/dyncom/arm_dyncom_trans.h
+    arm/dyncom/arm_dyncom_jit.cpp
+    arm/dyncom/arm_dyncom_jit.h
     arm/exclusive_monitor.cpp
     arm/exclusive_monitor.h
     arm/skyeye_common/arm_regformat.h
@@ -24,6 +26,7 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     arm/skyeye_common/vfp/asm_vfp.h
     arm/skyeye_common/vfp/vfp.cpp
     arm/skyeye_common/vfp/vfp.h
+    arm/skyeye_common/vfp/vfp_fastpath.h
     arm/skyeye_common/vfp/vfp_helper.h
     arm/skyeye_common/vfp/vfpdouble.cpp
     arm/skyeye_common/vfp/vfpinstr.cpp
@@ -586,7 +589,28 @@ endif()
 #
 # El enlazador y los archivos ya estan preparados para esto: el CMakeLists raiz
 # mete -flto al enlazar y usa gcc-ar/gcc-ranlib (ver los comentarios de alli).
+#
+# SOBRE memory.cpp, core_timing.cpp Y svc.cpp (anadidos despues).
+#
+# El camino RAPIDO de memoria (Read32Fast y companeros) ya era inmune a esto:
+# vive inline en memory.h, asi que se compila con las opciones del que llama --
+# el interprete, que ya estaba en esta lista. Por eso anadir memory.cpp NO toca
+# el coste del LDR/STR normal.
+#
+# Lo que si estaba a -Os es todo lo demas de esos tres ficheros, y no es poco:
+#   - memory.cpp: el camino LENTO (MMIO, paginas cacheadas por el rasterizador,
+#     sin mapear), GetPhysicalPointer, y las lecturas y escrituras de rangos.
+#     El rasterizador y el presentador pasan por ahi en cada fotograma.
+#   - core_timing.cpp: la cola de eventos se consulta al final de CADA rodaja de
+#     ejecucion del interprete, no una vez por fotograma.
+#   - svc.cpp: cada llamada al sistema del invitado. Un juego hace miles por
+#     fotograma entre sincronizacion de hilos y GSP.
+#
+# Van con -flto por lo mismo que el resto: parte del valor es que el interprete
+# y core_timing se vean a la vez.
 set_source_files_properties(
+    # El JIT del ARM11 (0.1.4.8): TryRun corre una vez por bloque despachado.
+    arm/dyncom/arm_dyncom_jit.cpp
     arm/dyncom/arm_dyncom_interpreter.cpp
     arm/dyncom/arm_dyncom_trans.cpp
     arm/dyncom/arm_dyncom.cpp
@@ -595,6 +619,9 @@ set_source_files_properties(
     arm/skyeye_common/vfp/vfpsingle.cpp
     arm/skyeye_common/vfp/vfpdouble.cpp
     arm/skyeye_common/vfp/vfpinstr.cpp
+    memory.cpp
+    core_timing.cpp
+    hle/kernel/svc.cpp
     PROPERTIES COMPILE_OPTIONS "-O3;-flto"
 )
 set_source_files_properties(

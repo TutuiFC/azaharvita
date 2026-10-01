@@ -173,6 +173,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
     switch (command.id) {
     case CommandId::RequestDma: {
         const GxScopeTimer timer{GxStats::dma_ns};
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         impl->system.Memory().RasterizerFlushVirtualRegion(
             command.dma_request.source_address, command.dma_request.size, Memory::FlushMode::Flush);
         impl->system.Memory().RasterizerFlushVirtualRegion(command.dma_request.dest_address,
@@ -199,6 +200,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     case CommandId::SubmitCmdList: {
         const GxScopeTimer timer{GxStats::cmdlist_ns};
+        GxStats::cmdlist_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         auto& params = command.submit_gpu_cmdlist;
         auto& cmdbuffer = regs.internal.pipeline.command_buffer;
 
@@ -213,6 +216,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     case CommandId::MemoryFill: {
         const GxScopeTimer timer{GxStats::fill_ns};
+        GxStats::fill_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         auto& params = command.memory_fill;
         auto& memfill = regs.memory_fill_config;
 
@@ -237,6 +242,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     case CommandId::DisplayTransfer: {
         const GxScopeTimer timer{GxStats::transfer_ns};
+        GxStats::transfer_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         auto& params = command.display_transfer;
         auto& display_transfer = regs.display_transfer_config;
 
@@ -254,6 +261,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     case CommandId::TextureCopy: {
         const GxScopeTimer timer{GxStats::transfer_ns};
+        GxStats::transfer_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         auto& params = command.texture_copy;
         auto& texture_copy = regs.display_transfer_config;
 
@@ -343,6 +352,24 @@ u32 GPU::ReadReg(VAddr addr) {
 }
 
 void GPU::WriteReg(VAddr addr, u32 data) {
+#ifdef __PSVITA__
+    // 0.1.5.2 (4.7): cuanto del "resto de gx" es decodificar escrituras de
+    // registro PICA. El timer es RAII para que tambien cuente los returns
+    // tempranos de los ASSERT; el overlay lo anota en crash.txt junto al
+    // numero de fills y transfers del intervalo.
+    const auto regw_begin = std::chrono::steady_clock::now();
+    struct RegwTimer {
+        std::chrono::steady_clock::time_point begin;
+        ~RegwTimer() {
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            Common::FrameStats::pica_reg_writes.fetch_add(1, std::memory_order_relaxed);
+            Common::FrameStats::pica_reg_write_ns.fetch_add(
+                static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                std::memory_order_relaxed);
+        }
+    } regw_timer{regw_begin};
+#endif
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -365,18 +392,28 @@ void GPU::WriteReg(VAddr addr, u32 data) {
         switch (index) {
         case GPU_REG_INDEX(memory_fill_config[0].trigger):
             MemoryFill(0, 0);
+            GxStats::fill_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
             break;
         case GPU_REG_INDEX(memory_fill_config[1].trigger):
             MemoryFill(1, 1);
+            GxStats::fill_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
             break;
         case GPU_REG_INDEX(display_transfer_config.trigger):
             MemoryTransfer();
+            GxStats::transfer_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
             break;
         case GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[0]):
             SubmitCmdList(0);
+            GxStats::cmdlist_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
             break;
         case GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[1]):
             SubmitCmdList(1);
+            GxStats::cmdlist_count.fetch_add(1, std::memory_order_relaxed);
+        GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
             break;
         default:
             break;
@@ -520,7 +557,21 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     // cuatro veces antes del punto donde se muere. Si no aparece ninguna de
     // estas lineas en crash.txt, es que el evento no llega a dispararse; si
     // aparece "vblank" pero no "vblank-gpu", muere dentro del aviso a GSP.
-    Common::VitaNote("vblank", "entrando");
+    //
+    // CON PRESUPUESTO, igual que el rastro del interprete (ver g_trace_budget en
+    // arm_dyncom_interpreter.cpp). Sin el, esto se ejecutaba UNA VEZ POR
+    // FOTOGRAMA durante toda la partida, y VitaNote no es barato: cada llamada
+    // hace dos sceIoMkdir, un sceIoOpen con O_APPEND, un sceIoWrite y un
+    // sceIoClose contra la tarjeta de memoria. Eran diez llamadas al sistema de
+    // ficheros por fotograma pagadas para siempre a cambio de un diagnostico
+    // que solo sirve en los primeros fotogramas -- si el evento dispara, lo
+    // sabemos ya; si no dispara, se ve igual de bien en las ocho primeras.
+    static int vblank_budget = 8;
+    const bool note_vblank = vblank_budget > 0;
+    if (note_vblank) {
+        vblank_budget--;
+        Common::VitaNote("vblank", "entrando");
+    }
 #endif
 
     // Signal to GSP that GPU interrupt has occurred
@@ -528,7 +579,9 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
 
 #ifdef __PSVITA__
-    Common::VitaNote("vblank-gpu", "interrupciones avisadas, presentando");
+    if (note_vblank) {
+        Common::VitaNote("vblank-gpu", "interrupciones avisadas, presentando");
+    }
 #endif
 
     // Present renderered frame.

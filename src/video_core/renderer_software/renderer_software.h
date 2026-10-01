@@ -48,6 +48,47 @@ struct ScreenInfo {
     /// saldria NEGRA en vez del color pedido.
     bool fill_enabled{false};
     u8 fill_r{}, fill_g{}, fill_b{};
+
+    /**
+     * Puntero DIRECTO al framebuffer dentro de la memoria del invitado.
+     *
+     * En la Vita este ScreenInfo ya no lleva los pixeles copiados: lleva a donde
+     * estan. 'pixels' se queda vacio y no se usa.
+     *
+     * POR QUE. El camino de presentacion hacia DOS copias del framebuffer por
+     * fotograma y por pantalla: LoadFBToScreenInfo copiaba de la memoria del
+     * 3DS a este vector, y justo despues el presentador copiaba de este vector a
+     * la memoria del chip grafico. La primera copia no aportaba nada -- nadie
+     * modifica los bytes entre una y otra -- y costaba ~230 KB por pantalla y
+     * fotograma movidos por el HILO PRINCIPAL, que es el que emula el ARM11 y el
+     * que va saturado.
+     *
+     * Ahora se apunta y el presentador copia una sola vez, del invitado
+     * directamente a la memoria de la GPU.
+     *
+     * POR QUE EL PUNTERO SE PUEDE GUARDAR. Apunta al almacen de la MemorySystem
+     * (FCRAM o VRAM del invitado), que vive tanto como el emulador y no se mueve.
+     * LoadFBToScreenInfo ya comprueba ANTES de asignarlo que el tramo entero esta
+     * mapeado y es contiguo hasta el ultimo pixel. Y entre que se asigna y que se
+     * consume no corre ni la CPU del invitado ni el rasterizador: las dos cosas
+     * pasan dentro del mismo SwapBuffers, en el mismo hilo.
+     *
+     * nullptr cuando no hay imagen (framebuffer sin mapear o relleno de color).
+     */
+    const u8* source{nullptr};
+
+    /// Bytes utiles a partir de 'source' (stride * alto). Sirve para que el
+    /// consumidor no tenga que recalcularlo y pueda comprobar lo que copia.
+    std::size_t source_size{0};
+
+    /**
+     * Direccion FISICA del framebuffer (0.1.5.2, 4.6).
+     *
+     * 'source' es un puntero a memoria del invitado; para preguntar al
+     * rasterizador GXM si hay una superficie dibujada en la GPU sobre esa
+     * misma direccion hace falta la PAddr. Cero cuando no hay imagen.
+     */
+    u32 source_address{0};
 #endif
 };
 

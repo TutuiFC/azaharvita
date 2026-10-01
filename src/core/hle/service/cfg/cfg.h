@@ -119,6 +119,20 @@ enum SystemLanguage {
     LANGUAGE_TW = 11
 };
 
+#ifdef __PSVITA__
+/**
+ * Idioma del sistema elegido en el menu de ajustes de la Vita (0.1.5.1), con
+ * los valores de SystemLanguage; -1 = no tocar (el que tenga guardado el
+ * config de la NAND emulada, ingles si es nueva).
+ *
+ * Se aplica al construir el modulo CFG, que es al cargar cada juego, y solo en
+ * memoria: no se escribe en la NAND. Despues, con la region en automatico,
+ * UpdatePreferredRegionCode lo corrige igual que en escritorio si el juego no
+ * trae ese idioma (por ejemplo japones en un juego europeo pasa a ingles).
+ */
+extern int g_vita_system_language;
+#endif
+
 enum SoundOutputMode { SOUND_MONO = 0, SOUND_STEREO = 1, SOUND_SURROUND = 2 };
 
 struct EULAVersion {

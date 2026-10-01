@@ -145,6 +145,24 @@ add_compile_definitions(
     # extern con este tamano, y si dos ficheros no coinciden el array queda
     # descuadrado y la memoria se corrompe.
     AZAHAR_TRANS_CACHE_MB=${AZAHAR_TRANS_CACHE_MB}
+
+    # E/S de ficheros sobre sceIo en vez de stdio. SIN ESTO NO ABREN LOS ROM DE
+    # MAS DE 2 GB, y el codigo que lo resuelve ya estaba escrito: file_util.cpp
+    # y file_util.h llevan un camino completo bajo este nombre que nadie
+    # encendia, asi que se compilaba fuera entero.
+    #
+    # El motivo esta en la cabecera de IOFile::m_vita_fd: en esta libc off_t son
+    # 4 bytes, no hay fseeko64, y stat::st_size es del mismo tipo. Un ROM de 4
+    # GB justos mide 0x100000000, que truncado a 32 bits da CERO: el emulador
+    # cree que el fichero esta vacio, falla al leer la cabecera y lo reporta
+    # como "Failed to determine system mode", culpando a algo sin relacion.
+    # SceOff y SceIoStat::st_size si son de 64 bits.
+    #
+    # VA AQUI Y NO EN UN TARGET, y esto no es opcional: la macro anade un campo
+    # (m_vita_fd) a IOFile. Si un fichero la ve y otro no, sizeof(IOFile) no
+    # coincide entre unidades de traduccion y la memoria se corrompe sin avisar,
+    # igual que con AZAHAR_TRANS_CACHE_MB de arriba.
+    AZAHAR_VITA_NATIVE_IO=1
 )
 
 # ---------------------------------------------------------------------------

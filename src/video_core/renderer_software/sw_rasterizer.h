@@ -290,15 +290,20 @@ constexpr u32 kMinInterval = 1;
 constexpr u32 kMaxInterval = 10;
 
 /**
- * Media resolucion vertical: sombrear una linea de cada dos.
+ * Resolucion 0.5x: sombrear un pixel de cada bloque de 2x2.
  *
- * La linea sombreada se escribe tambien en la de abajo, asi que el framebuffer
+ * Hasta 0.1.5.0 era solo media resolucion VERTICAL (una linea de cada dos).
+ * Desde 0.1.5.1 tambien en horizontal: una columna de cada dos, con la misma
+ * alineacion a columna par absoluta que las filas. Se elige en el menu de
+ * ajustes (START mantenido en la lista de juegos) o con L+R en partida.
+ *
+ * El pixel sombreado se escribe tambien en los otros tres del bloque, asi que el framebuffer
  * del juego se rellena entero y conserva su tamano y su disposicion. Eso es
  * deliberado: bajar la resolucion de verdad obligaria a tocar el framebuffer
  * que el juego reserva y lee, y hay titulos que lo leen de vuelta.
  *
- * Se ahorra la mitad del sombreado -- que es la parte cara -- y no se ahorra la
- * escritura, que se hace dos veces. Sale alrededor de un 65% mas rapido.
+ * Se ahorran tres cuartos del sombreado -- que es la parte cara -- y no se ahorra la
+ * escritura, que se hace cuatro veces. (Solo vertical salia ~65% mas rapido.)
  *
  * La profundidad solo se escribe en las lineas sombreadas. No hace falta en las
  * copiadas: como ningun triangulo posterior va a sombrear ahi tampoco, nadie

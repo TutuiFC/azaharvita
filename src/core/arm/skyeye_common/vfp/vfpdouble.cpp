@@ -55,7 +55,42 @@
 #include "common/logging/log.h"
 #include "core/arm/skyeye_common/vfp/asm_vfp.h"
 #include "core/arm/skyeye_common/vfp/vfp.h"
+#include "core/arm/skyeye_common/vfp/vfp_fastpath.h"
 #include "core/arm/skyeye_common/vfp/vfp_helper.h"
+
+/**
+ * Camino rapido de las operaciones binarias de precision doble.
+ *
+ * Mismo planteamiento que el de precision simple (el porque completo esta en
+ * vfp_fastpath.h), con una diferencia de forma: aqui las funciones reciben los
+ * dos operandos como INDICE DE REGISTRO, no el segundo ya en bits, asi que los
+ * lee este ayudante.
+ */
+template <typename F>
+static inline bool vfp_double_fast_binop(ARMul_State* state, int dd, int dn, int dm, u32 fpscr,
+                                         u32* exceptions, F op) {
+    if (!VfpFast::Usable(fpscr)) {
+        return false;
+    }
+    const u64 n_bits = vfp_get_double(state, dn);
+    const u64 m_bits = vfp_get_double(state, dm);
+    if (!VfpFast::DoubleIsNormal(n_bits) || !VfpFast::DoubleIsNormal(m_bits)) {
+        return false;
+    }
+
+    const double result = op(VfpFast::BitsToDouble(n_bits), VfpFast::BitsToDouble(m_bits));
+    const u64 result_bits = VfpFast::DoubleToBits(result);
+    if (!VfpFast::DoubleIsNormal(result_bits)) {
+        VfpFast::DiscardHostExceptions();
+        return false;
+    }
+
+    if (!VfpFast::FinishHostOp(exceptions)) {
+        return false;
+    }
+    vfp_put_double(state, result_bits, dd);
+    return true;
+}
 
 static struct vfp_double vfp_double_default_qnan = {
     2047,
@@ -296,6 +331,23 @@ static u32 vfp_double_fsqrt(ARMul_State* state, int dd, int unused, int dm, u32 
     vfp_double vdm, vdd, *vdp;
     int ret, tm;
     u32 exceptions = 0;
+
+    // VSQRT.F64 del anfitrion. Misma justificacion que en precision simple: la
+    // raiz de IEEE 754 esta correctamente redondeada, y con operando normal y
+    // positivo no hay caso especial ninguno que reproducir.
+    if (VfpFast::Usable(fpscr)) {
+        const u64 m_bits = vfp_get_double(state, dm);
+        if (VfpFast::DoubleIsNormal(m_bits) && VfpFast::DoubleIsPositive(m_bits)) {
+            const double root = __builtin_sqrt(VfpFast::BitsToDouble(m_bits));
+            const u64 root_bits = VfpFast::DoubleToBits(root);
+            u32 raised = 0;
+            if (VfpFast::DoubleIsNormal(root_bits) && VfpFast::FinishHostOp(&raised)) {
+                vfp_put_double(state, root_bits, dd);
+                return raised;
+            }
+            VfpFast::DiscardHostExceptions();
+        }
+    }
 
     exceptions |= vfp_double_unpack(&vdm, vfp_get_double(state, dm), fpscr);
 
@@ -969,6 +1021,11 @@ static u32 vfp_double_fmul(ARMul_State* state, int dd, int dn, int dm, u32 fpscr
     u32 exceptions = 0;
 
     LOG_TRACE(Core_ARM11, "In {}", __FUNCTION__);
+    if (vfp_double_fast_binop(state, dd, dn, dm, fpscr, &exceptions,
+                              [](double a, double b) { return a * b; })) {
+        return exceptions;
+    }
+
     exceptions |= vfp_double_unpack(&vdn, vfp_get_double(state, dn), fpscr);
     if (vdn.exponent == 0 && vdn.significand)
         vfp_double_normalise_denormal(&vdn);
@@ -989,6 +1046,11 @@ static u32 vfp_double_fnmul(ARMul_State* state, int dd, int dn, int dm, u32 fpsc
     u32 exceptions = 0;
 
     LOG_TRACE(Core_ARM11, "In {}", __FUNCTION__);
+    if (vfp_double_fast_binop(state, dd, dn, dm, fpscr, &exceptions,
+                              [](double a, double b) { return -(a * b); })) {
+        return exceptions;
+    }
+
     exceptions |= vfp_double_unpack(&vdn, vfp_get_double(state, dn), fpscr);
     if (vdn.exponent == 0 && vdn.significand)
         vfp_double_normalise_denormal(&vdn);
@@ -1011,6 +1073,11 @@ static u32 vfp_double_fadd(ARMul_State* state, int dd, int dn, int dm, u32 fpscr
     u32 exceptions = 0;
 
     LOG_TRACE(Core_ARM11, "In {}", __FUNCTION__);
+    if (vfp_double_fast_binop(state, dd, dn, dm, fpscr, &exceptions,
+                              [](double a, double b) { return a + b; })) {
+        return exceptions;
+    }
+
     exceptions |= vfp_double_unpack(&vdn, vfp_get_double(state, dn), fpscr);
     if (vdn.exponent == 0 && vdn.significand)
         vfp_double_normalise_denormal(&vdn);
@@ -1032,6 +1099,11 @@ static u32 vfp_double_fsub(ARMul_State* state, int dd, int dn, int dm, u32 fpscr
     u32 exceptions = 0;
 
     LOG_TRACE(Core_ARM11, "In {}", __FUNCTION__);
+    if (vfp_double_fast_binop(state, dd, dn, dm, fpscr, &exceptions,
+                              [](double a, double b) { return a - b; })) {
+        return exceptions;
+    }
+
     exceptions |= vfp_double_unpack(&vdn, vfp_get_double(state, dn), fpscr);
     if (vdn.exponent == 0 && vdn.significand)
         vfp_double_normalise_denormal(&vdn);
@@ -1059,6 +1131,12 @@ static u32 vfp_double_fdiv(ARMul_State* state, int dd, int dn, int dm, u32 fpscr
     int tm, tn;
 
     LOG_TRACE(Core_ARM11, "In {}", __FUNCTION__);
+    // Divisor normal: no puede ser cero, asi que no hay DZC que atrapar.
+    if (vfp_double_fast_binop(state, dd, dn, dm, fpscr, &exceptions,
+                              [](double a, double b) { return a / b; })) {
+        return exceptions;
+    }
+
     exceptions |= vfp_double_unpack(&vdn, vfp_get_double(state, dn), fpscr);
     exceptions |= vfp_double_unpack(&vdm, vfp_get_double(state, dm), fpscr);
 

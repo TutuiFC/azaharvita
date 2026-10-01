@@ -672,14 +672,15 @@ private:
     int m_vita_fd = -1;
 #endif
     bool m_good = true;
-#if defined(HAVE_LIBRETRO_VFS) || defined(AZAHAR_VITA_NATIVE_IO)
+#if defined(HAVE_LIBRETRO_VFS)
     // pread() doesn't touch the file position, so it's safe alongside
     // concurrent fread/fwrite. Libretro VFS has no pread equivalent, so
     // ReadAtImpl emulates it with seek+read+seek, which would corrupt the
     // file position for concurrent Read/Write operations.
     //
-    // sceIo tampoco tiene pread, asi que en Vita pasa lo mismo y hace falta
-    // el mismo candado.
+    // En Vita NO hace falta: sceIoPread tampoco toca la posicion, igual que el
+    // pread de siempre. Aqui se creia que no existia y se emulaba con saltos,
+    // que era lo que obligaba al candado.
     mutable std::mutex m_file_pos_mutex;
 #endif
 

@@ -2,6 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <array>
+#include <vector>
 #include "common/arch.h"
 #include "common/archives.h"
 #include "common/microprofile.h"
@@ -11,15 +14,83 @@
 #include "core/memory.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/pica/pica_core.h"
+#include "common/vita_diag.h"
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader/shader.h"
+#ifdef __PSVITA__
+#include "common/thread_worker.h"
+#endif
 
 namespace Pica {
 
 MICROPROFILE_DEFINE(GPU_Drawing, "GPU", "Drawing", MP_RGB(50, 50, 240));
 
 using namespace DebugUtils;
+
+#ifdef __PSVITA__
+/// Estado del sombreado repartido. Va aqui arriba, antes del destructor de
+/// PicaCore, porque unique_ptr necesita el tipo completo para destruirlo. La
+/// explicacion esta en ShadeVerticesParallel.
+struct PicaCore::ParallelShading {
+    /// Dos hilos atados a los nucleos 1 y 2; el 0 es el de emulacion, que hace
+    /// el primer tramo el mismo (mismo reparto que las bandas del rasterizador).
+    Common::StatefulThreadWorker<> workers{2, "VertexShader workers", {}, true, 1};
+    struct Job {
+        u32 index;  ///< Posicion en el lote (la que recibe LoadVertex).
+        u32 vertex; ///< Vertice a cargar.
+    };
+    std::vector<Job> jobs;
+    /// Por posicion del lote: trabajo del que sale su resultado, o
+    /// kFromSlot | hueco si sale de un segmento anterior (ver slot_data).
+    std::vector<u32> submit;
+    /**
+     * Resultados YA CONVERTIDOS a OutputVertex (0.1.0.45).
+     *
+     * Antes se guardaba la salida cruda del shader y la conversion a
+     * OutputVertex la hacia la entrega, en el nucleo 0, UNA VEZ POR POSICION
+     * del lote: con dibujado indexado cada vertice se entrega unas 2,4 veces,
+     * asi que eran ~30.000 conversiones por vblank en un solo nucleo. La
+     * conversion depende solo de la salida del shader y de los registros del
+     * rasterizador (fijos en todo el lote), asi que ahora se hace una vez por
+     * vertice unico y en el nucleo que lo sombrea. Ademas ocupa 96 bytes en vez
+     * de 256.
+     */
+    std::vector<OutputVertex> outputs;
+    std::array<OutputVertex, 64> slot_data;
+    /// Hueco del cache donde entro cada vertice por ultima vez (los indices son
+    /// de 8 o 16 bits, asi que caben todos). Siempre < 64, empezando en 0.
+    std::array<u8, 65536> slot_of{};
+    /**
+     * Cache COMPLETA por lote (0.1.6.1): trabajo que sombreo cada indice en el
+     * lote actual, valido si stamp_of[indice] == stamp. Ver g_full_vertex_dedup.
+     * El sello evita limpiar 256 KB en cada lote.
+     */
+    std::array<u32, 65536> job_of{};
+    std::array<u32, 65536> stamp_of{};
+    u32 stamp = 0;
+};
+
+/**
+ * SOMBREAR CADA INDICE UNA SOLA VEZ POR LOTE (0.1.6.1).
+ *
+ * El cache de 64 vertices con reemplazo circular es el del hardware, pero aqui
+ * no hace falta imitarlo: el resultado de sombrear un vertice depende solo de
+ * ese vertice (mismo programa y mismos uniforms en todo el lote). Con el cache
+ * pequeno, un indice que vuelve a salir despues de 64 vertices nuevos se
+ * SOMBREA OTRA VEZ entero y da lo mismo. En la cinematica de Rubi Omega se
+ * sombraban ~37.000 vertices por vblank para ~30.000 triangulos, y cada
+ * vertice se entregaba ~2.4 veces (medido en 0.1.0.45): mucho trabajo repetido.
+ *
+ * La unica diferencia posible es la que ya asume el reparto en tres nucleos
+ * (ver la cabecera de ShadeVerticesParallel): un programa que lea un registro
+ * que no escribe en todos los vertices trae el valor del vertice anterior, y
+ * ese "anterior" cambia. Ese programa ya es impredecible en la consola de
+ * verdad. Aun asi hay interruptor en el menu de ajustes ("Cache vertices
+ * completa"): apagado, vuelve el cache de 64 exacto de 0.1.6.0.
+ */
+std::atomic<bool> g_full_vertex_dedup{true};
+#endif
 
 // Class representing implementation details of each internal register
 // The set/get pattern is used instead of a bitfield union to allow
@@ -1113,11 +1184,48 @@ void PicaCore::LoadVertices(bool is_indexed) {
     const bool index_u16 = index_info.format != 0;
 
     // Simple circular-replacement vertex cache
-    const std::size_t VERTEX_CACHE_SIZE = 64;
-    std::array<bool, VERTEX_CACHE_SIZE> vertex_cache_valid{};
-    std::array<u16, VERTEX_CACHE_SIZE> vertex_cache_ids;
+    //
+    // POR QUE LOS IDENTIFICADORES SON u32 Y NO u16 CON UN ARRAY DE bool APARTE.
+    //
+    // La validez vivia en su propio array y la busqueda era
+    // "if (valido[i] && vertice == ids[i])" sobre las 64 entradas, una vez POR
+    // CADA VERTICE INDEXADO del lote. Consultar dos arrays distintos en la misma
+    // condicion impide que GCC vectorice el bucle, asi que quedaba un barrido
+    // escalar de hasta 64 vueltas con dos cargas y dos saltos en cada una.
+    //
+    // Con identificadores de 32 bits y un centinela, el centinela HACE DE BIT DE
+    // VALIDEZ: 'vertice' sale de un indice de 8 o 16 bits, o sea que nunca puede
+    // valer 0xFFFFFFFF. La busqueda queda como un unico barrido de u32 sin
+    // dependencias entre vueltas, que el NEON del Cortex-A9 recorre de cuatro en
+    // cuatro.
+    //
+    // La SEMANTICA no cambia: sigue siendo totalmente asociativa con reemplazo
+    // circular, asi que acierta y falla en exactamente los mismos vertices que
+    // antes. Esto solo abarata el mirar, no cambia lo que se encuentra -- que es
+    // justo lo que hace falta para poder cambiarlo sin poder probar el dibujado.
+    constexpr u32 VERTEX_CACHE_SIZE = 64;
+    constexpr u32 VERTEX_CACHE_EMPTY = 0xFFFFFFFFu;
+    static_assert((VERTEX_CACHE_SIZE & (VERTEX_CACHE_SIZE - 1)) == 0,
+                  "El avance del reemplazo circular usa una mascara, no un modulo");
+
+    std::array<u32, VERTEX_CACHE_SIZE> vertex_cache_ids;
+    vertex_cache_ids.fill(VERTEX_CACHE_EMPTY);
     std::array<AttributeBuffer, VERTEX_CACHE_SIZE> vertex_cache;
     u32 vertex_cache_pos = 0;
+
+    /**
+     * Pista de hueco por indice de vertice: acelera la busqueda sin cambiarla.
+     *
+     * 256 entradas de un byte (el cache tiene 64 huecos, asi que cabe de
+     * sobra). Se rellena con VERTEX_CACHE_SIZE, que es "sin pista" y nunca es
+     * un hueco valido. Ver el uso en el bucle de abajo: es un acelerador, no
+     * una fuente de verdad -- lo que decide si hay acierto sigue siendo
+     * vertex_cache_ids.
+     */
+    constexpr u32 VERTEX_CACHE_HINTS = 256;
+    static_assert(VERTEX_CACHE_SIZE <= 255, "la pista se guarda en un byte");
+    std::array<u8, VERTEX_CACHE_HINTS> vertex_cache_hint;
+    vertex_cache_hint.fill(static_cast<u8>(VERTEX_CACHE_SIZE));
 
     // Compile the vertex shader for this batch.
     ShaderUnit shader_unit;
@@ -1129,29 +1237,84 @@ void PicaCore::LoadVertices(bool is_indexed) {
     geometry_pipeline.Setup(shader_engine.get());
     ASSERT(!geometry_pipeline.NeedIndexInput() || is_indexed);
 
+#ifdef __PSVITA__
+    // El bucle entero, una sola lectura de reloj por llamada de dibujado. Ver
+    // Common::FrameStats::vertices_us: hace falta para separar dentro de
+    // "cmdlist" lo que es shader de vertices de lo que es nuestro camino de GPU.
+    const unsigned long long vertices_begin = Common::VitaMicros();
+
+    /**
+     * Sin shader de geometria y sin depurador, el sombreado va repartido entre
+     * los tres nucleos (ver ShadeVerticesParallel). Con shader de geometria se
+     * queda el bucle de siguiente, que es el de siempre: ahi cada vertice
+     * alimenta a un segundo programa con estado propio y el orden importa
+     * dentro del propio sombreado. Con depurador tambien, porque este le avisa
+     * vertice a vertice y en orden.
+     */
+    if (!debug_context && pipeline.use_gs == PipelineRegs::UseGS::No) {
+        ShadeVerticesParallel(loader, base_address, is_indexed, index_address_8, index_address_16,
+                              index_u16);
+        Common::FrameStats::Add(Common::FrameStats::vertices_us, vertices_begin);
+        return;
+    }
+#endif
     for (u32 index = 0; index < pipeline.num_vertices; ++index) {
         // Indexed rendering doesn't use the start offset
         const u32 vertex = is_indexed
                                ? (index_u16 ? index_address_16[index] : index_address_8[index])
                                : (index + pipeline.vertex_offset);
 
-        bool vertex_cache_hit = false;
+        /**
+         * El resultado del vertice se ENTREGA POR REFERENCIA, no copiandolo.
+         *
+         * Antes esto movia un AttributeBuffer entero -- 16 vectores de cuatro
+         * f24, 256 bytes -- en los dos caminos: del cache a vs_output al
+         * acertar, y de vs_output al cache al fallar. Con unos 15.000 vertices
+         * por fotograma son cerca de 4 MB de copias que no hacian falta, porque
+         * lo unico que se hace despues con el resultado es pasarlo a
+         * SubmitVertex, que lo toma por referencia constante.
+         *
+         * Ahora al acertar se apunta a la entrada del cache y al fallar el
+         * shader escribe DIRECTAMENTE en el hueco que le toca. El resultado es
+         * el mismo byte a byte; solo se ahorra el ir y venir.
+         */
+        const AttributeBuffer* submit = nullptr;
+
         if (is_indexed) {
             if (geometry_pipeline.NeedIndexInput()) {
                 geometry_pipeline.SubmitIndex(vertex);
                 continue;
             }
 
-            for (u32 i = 0; i < VERTEX_CACHE_SIZE; ++i) {
-                if (vertex_cache_valid[i] && vertex == vertex_cache_ids[i]) {
-                    vs_output = vertex_cache[i];
-                    vertex_cache_hit = true;
-                    break;
+            /**
+             * Y la busqueda empieza por una PISTA en vez de por el barrido.
+             *
+             * El cache es completamente asociativo, asi que localizar un
+             * vertice costaba recorrer las 64 entradas, y en los fallos las 64
+             * enteras. Son del orden de un millon de comparaciones por
+             * fotograma solo para buscar.
+             *
+             * hint mapea los ocho bits bajos del indice al hueco donde se
+             * guardo por ultima vez. Es SOLO una pista: lo que decide sigue
+             * siendo la comparacion contra vertex_cache_ids, asi que si la
+             * pista esta obsoleta se cae al barrido de siempre y el resultado
+             * -- y la tasa de acierto -- no cambian. Lo que cambia es que la
+             * mayoria de los aciertos pasan a costar una comparacion.
+             */
+            const u32 hinted = vertex_cache_hint[vertex & (VERTEX_CACHE_HINTS - 1)];
+            if (hinted < VERTEX_CACHE_SIZE && vertex_cache_ids[hinted] == vertex) {
+                submit = std::addressof(vertex_cache[hinted]);
+            } else {
+                for (u32 i = 0; i < VERTEX_CACHE_SIZE; ++i) {
+                    if (vertex_cache_ids[i] == vertex) {
+                        submit = std::addressof(vertex_cache[i]);
+                        break;
+                    }
                 }
             }
         }
 
-        if (!vertex_cache_hit) {
+        if (submit == nullptr) {
             // Initialize data for the current vertex
             AttributeBuffer input;
             loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
@@ -1165,21 +1328,302 @@ void PicaCore::LoadVertices(bool is_indexed) {
             // Invoke the vertex shader for this vertex.
             shader_unit.LoadInput(regs.internal.vs, input);
             shader_engine->Run(vs_setup, shader_unit);
-            shader_unit.WriteOutput(regs.internal.vs, vs_output);
+#ifdef __PSVITA__
+            // Solo se cuentan los que de verdad pasan por el interprete: los
+            // que acierta el cache no llegan aqui.
+            Common::FrameStats::vertices_shaded.fetch_add(1, std::memory_order_relaxed);
+#endif
 
-            // Cache the vertex when doing indexed rendering.
             if (is_indexed) {
-                vertex_cache[vertex_cache_pos] = vs_output;
-                vertex_cache_valid[vertex_cache_pos] = true;
+                // El shader escribe en el hueco del cache y de ahi se entrega.
+                AttributeBuffer& slot = vertex_cache[vertex_cache_pos];
+                shader_unit.WriteOutput(regs.internal.vs, slot);
                 vertex_cache_ids[vertex_cache_pos] = vertex;
-                vertex_cache_pos = (vertex_cache_pos + 1) % VERTEX_CACHE_SIZE;
+                vertex_cache_hint[vertex & (VERTEX_CACHE_HINTS - 1)] =
+                    static_cast<u8>(vertex_cache_pos);
+                submit = std::addressof(slot);
+                vertex_cache_pos = (vertex_cache_pos + 1) & (VERTEX_CACHE_SIZE - 1);
+            } else {
+                shader_unit.WriteOutput(regs.internal.vs, vs_output);
+                submit = std::addressof(vs_output);
             }
         }
 
         // Send to geometry pipeline
-        geometry_pipeline.SubmitVertex(vs_output);
+        geometry_pipeline.SubmitVertex(*submit);
+    }
+#ifdef __PSVITA__
+    Common::FrameStats::Add(Common::FrameStats::vertices_us, vertices_begin);
+#endif
+}
+
+#ifdef __PSVITA__
+/**
+ * SOMBREADO DE VERTICES EN LOS TRES NUCLEOS.
+ *
+ * POR QUE. En 0.1.0.41 (cinematica de Rubi Omega, 444 MHz) el fotograma medio
+ * 706 ms y el shader de vertices se comia unos 370: ~19.000 vertices a unos
+ * 20 us cada uno en el interprete, todos en el nucleo 0. Mientras tanto los
+ * nucleos 1 y 2 -- los del rasterizador de software -- estaban parados, porque
+ * desde que la iluminacion va en la GPU casi no les llega trabajo.
+ *
+ * Sombrear un vertice no depende de los demas: mismo programa, mismos uniforms,
+ * su propia entrada. Asi que el lote se hace en tres fases:
+ *
+ *   1. ORDEN (serie, barato). Se recorre el lote igual que el bucle de siempre,
+ *      con el MISMO cache de 64 vertices y el mismo reemplazo circular, pero
+ *      sin sombrear: solo se apunta que vertices hay que sombrear ("trabajos")
+ *      y, para cada posicion del lote, de que trabajo sale su resultado. Aciertos
+ *      y fallos salen identicos a los del bucle serie, porque es la misma
+ *      busqueda sobre el mismo estado.
+ *   2. SOMBREADO (en paralelo). Los trabajos se parten en tres tramos
+ *      contiguos: el nucleo 0 hace el primero y los nucleos 1 y 2 los otros.
+ *   3. ENTREGA (serie, en orden). Cada posicion entrega su resultado al
+ *      ensamblador de primitivas en el orden original, que es lo unico que ve
+ *      el resto del pipeline.
+ *
+ * LO QUE CAMBIA, DICHO SIN RODEOS. El bucle serie usa UNA ShaderUnit para todo
+ * el lote, asi que un registro que el programa lea sin haberlo escrito antes
+ * -- un temporal, un registro de direccion, el codigo de condicion o una salida
+ * que solo se escribe en una rama -- trae el valor del vertice ANTERIOR. Aqui
+ * cada tramo tiene su propia unidad, y para no perder eso cada tramo que no
+ * empieza el lote SOMBREA ANTES EL VERTICE QUE LE PRECEDE y tira el resultado
+ * ("calentamiento"): asi entra en su primer vertice con el mismo estado que
+ * tendria en serie siempre que ese estado dependa solo del vertice anterior,
+ * que es el caso de cualquier programa que escriba un registro en todos los
+ * vertices o en ninguno. Solo divergiria un programa que lea un registro que
+ * se escribe en unos vertices si y en otros no, y ese programa ya es
+ * impredecible en la consola de verdad: la PICA200 reparte los vertices entre
+ * cuatro unidades de shader, cada una con su propio estado, y ademas es lo
+ * que hace Azahar en escritorio con shaders por hardware (cada vertice parte
+ * de cero). El primer tramo del lote no se calienta: arranca de una unidad
+ * nueva, exactamente como el bucle serie.
+ *
+ * El modo de coma flotante es el mismo en los tres nucleos (FZ y DN, ver
+ * Common::VitaEnableFastFloatMode, que el pool activa en cada hilo), asi que
+ * cada vertice da el mismo resultado bit a bit se sombree donde se sombree.
+ *
+ * MEMORIA. Los resultados se guardan en un vector reutilizable. Para acotarlo,
+ * un lote enorme se procesa en segmentos de kMaxJobs trabajos; entre segmento
+ * y segmento, lo que siga vivo en el cache se copia a slot_data, porque los
+ * resultados del segmento anterior se van a pisar.
+ */
+void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_address,
+                                     bool is_indexed, const u8* index_address_8,
+                                     const u16* index_address_16, bool index_u16) {
+    // Mismo tamano y misma politica que el cache del bucle serie de arriba.
+    constexpr u32 kCacheSize = 64;
+    constexpr u32 kEmpty = 0xFFFFFFFFu;
+    constexpr u32 kFromSlot = 0x80000000u;
+    /// Tope de trabajos por segmento: 1024 resultados de 256 bytes.
+    constexpr u32 kMaxJobs = 1024;
+    /**
+     * Por debajo de esto no se reparte. Encolar y despertar un hilo cuesta del
+     * orden de decenas de microsegundos, y un vertice unos 20: con menos de
+     * ~24 vertices por tramo el reparto cuesta mas de lo que ahorra.
+     */
+    constexpr u32 kMinJobsPerPart = 24;
+
+    if (!parallel_shading) {
+        parallel_shading = std::make_unique<ParallelShading>();
+    }
+    auto& ps = *parallel_shading;
+    const auto& pipeline = regs.internal.pipeline;
+    const u32 num_vertices = pipeline.num_vertices;
+
+    std::array<u32, kCacheSize> cache_ids;
+    cache_ids.fill(kEmpty);
+    // Que hay en cada hueco: un trabajo de este segmento o kFromSlot | hueco.
+    std::array<u32, kCacheSize> cache_ref{};
+    u32 cache_pos = 0;
+
+    // El ultimo trabajo del segmento anterior, para calentar el primer tramo
+    // del siguiente. Ver la cabecera: el lote en si arranca sin calentar.
+    bool has_previous = false;
+    ParallelShading::Job previous{};
+
+    // Sombrea [begin, end) con una unidad propia. 'warmup' es el vertice que
+    // precede al tramo, o null si el tramo abre el lote.
+    const auto shade_range = [&](u32 begin, u32 end, const ParallelShading::Job* warmup) {
+        const unsigned long long busy_begin = Common::VitaMicros();
+        ShaderUnit unit;
+        AttributeBuffer input;
+        AttributeBuffer result;
+        if (warmup != nullptr) {
+            loader.LoadVertex(base_address, warmup->index, warmup->vertex, input,
+                              input_default_attributes);
+            unit.LoadInput(regs.internal.vs, input);
+            shader_engine->Run(vs_setup, unit);
+            // Sin WriteOutput: el resultado ya lo produjo su tramo; aqui solo
+            // interesa el estado en que deja la unidad.
+        }
+        u64 load_us = 0, run_us = 0, out_us = 0, samples = 0;
+        for (u32 j = begin; j < end; ++j) {
+            const auto& job = ps.jobs[j];
+            // Uno de cada 32 se cronometra por partes (0.1.7.2, ver vtx_samples).
+            const bool sample = (j & 31) == 0;
+            const unsigned long long t0 = sample ? Common::VitaMicros() : 0;
+            loader.LoadVertex(base_address, job.index, job.vertex, input,
+                              input_default_attributes);
+            unit.LoadInput(regs.internal.vs, input);
+            const unsigned long long t1 = sample ? Common::VitaMicros() : 0;
+            shader_engine->Run(vs_setup, unit);
+            const unsigned long long t2 = sample ? Common::VitaMicros() : 0;
+            unit.WriteOutput(regs.internal.vs, result);
+            // La misma conversion que hace el manejador de vertices de PicaCore
+            // (ver el constructor) antes de entregar al ensamblador.
+            ps.outputs[j] = OutputVertex(regs.internal.rasterizer, result);
+            if (sample) {
+                const unsigned long long t3 = Common::VitaMicros();
+                load_us += t1 - t0;
+                run_us += t2 - t1;
+                out_us += t3 - t2;
+                samples++;
+            }
+        }
+        if (samples != 0) {
+            Common::FrameStats::vtx_samples.fetch_add(samples, std::memory_order_relaxed);
+            Common::FrameStats::vtx_load_us.fetch_add(load_us, std::memory_order_relaxed);
+            Common::FrameStats::vtx_run_us.fetch_add(run_us, std::memory_order_relaxed);
+            Common::FrameStats::vtx_out_us.fetch_add(out_us, std::memory_order_relaxed);
+        }
+        // Diagnostico: instrucciones ejecutadas (por la ruta rapida y por el
+        // interprete) y tiempo de trabajo de este nucleo. Ver shade_busy_us.
+        Common::FrameStats::shade_fast_ops.fetch_add(unit.fast_ops, std::memory_order_relaxed);
+        Common::FrameStats::shade_slow_instrs.fetch_add(unit.slow_instrs,
+                                                        std::memory_order_relaxed);
+        Common::FrameStats::Add(Common::FrameStats::shade_busy_us, busy_begin);
+    };
+
+    // Cache completa por lote (ver g_full_vertex_dedup): solo con indices, que
+    // es donde se repiten vertices. Sin segmentos: todos los resultados del
+    // lote viven a la vez (como mucho un trabajo por indice distinto).
+    const bool dedup = is_indexed && g_full_vertex_dedup.load(std::memory_order_relaxed);
+    if (dedup) {
+        if (++ps.stamp == 0) {
+            ps.stamp_of.fill(0);
+            ps.stamp = 1;
+        }
+    }
+
+    u32 position = 0;
+    while (position < num_vertices) {
+        // ---- Fase 1: orden ----
+        ps.jobs.clear();
+        ps.submit.clear();
+        for (; position < num_vertices && (dedup || ps.jobs.size() < kMaxJobs); ++position) {
+            const u32 vertex = is_indexed
+                                   ? (index_u16 ? index_address_16[position]
+                                                : index_address_8[position])
+                                   : (position + pipeline.vertex_offset);
+            if (dedup) {
+                if (ps.stamp_of[vertex] == ps.stamp) {
+                    ps.submit.push_back(ps.job_of[vertex]);
+                    continue;
+                }
+                const u32 job = static_cast<u32>(ps.jobs.size());
+                ps.jobs.push_back({position, vertex});
+                ps.stamp_of[vertex] = ps.stamp;
+                ps.job_of[vertex] = job;
+                ps.submit.push_back(job);
+            } else if (is_indexed) {
+                /**
+                 * Busqueda en O(1) con el mapa inverso vertice -> hueco.
+                 *
+                 * Un vertice solo entra al cache cuando no esta, asi que como
+                 * mucho hay UN hueco con su id. slot_of[v] guarda el hueco donde
+                 * se metio v por ultima vez; si ese hueco sigue teniendo a v, es
+                 * un acierto, y si no (lo pisaron despues) v no esta en ningun
+                 * otro sitio. Es la misma respuesta que el barrido de 64 del
+                 * bucle serie, sin el barrido: en un fallo, que es lo que pasa
+                 * con cada vertice nuevo, el barrido era siempre entero.
+                 *
+                 * El mapa no se limpia entre lotes a proposito: un valor viejo
+                 * solo puede apuntar a un hueco que no tiene a v, y eso se lee
+                 * como fallo, que es lo correcto.
+                 */
+                const u32 hinted = ps.slot_of[vertex];
+                if (cache_ids[hinted] == vertex) {
+                    ps.submit.push_back(cache_ref[hinted]);
+                    continue;
+                }
+                const u32 job = static_cast<u32>(ps.jobs.size());
+                ps.jobs.push_back({position, vertex});
+                cache_ids[cache_pos] = vertex;
+                cache_ref[cache_pos] = job;
+                ps.slot_of[vertex] = static_cast<u8>(cache_pos);
+                cache_pos = (cache_pos + 1) & (kCacheSize - 1);
+                ps.submit.push_back(job);
+            } else {
+                const u32 job = static_cast<u32>(ps.jobs.size());
+                ps.jobs.push_back({position, vertex});
+                ps.submit.push_back(job);
+            }
+        }
+
+        // ---- Fase 2: sombreado ----
+        const unsigned long long shade_begin = Common::VitaMicros();
+        const u32 jobs = static_cast<u32>(ps.jobs.size());
+        if (ps.outputs.size() < jobs) {
+            ps.outputs.resize(jobs);
+        }
+        const u32 parts = std::clamp<u32>(jobs / kMinJobsPerPart, 1, 3);
+        const ParallelShading::Job* first_warmup = has_previous ? &previous : nullptr;
+        if (parts == 1) {
+            shade_range(0, jobs, first_warmup);
+        } else {
+            // Los tramos 1.. a los nucleos 1 y 2, encolados ANTES de ponerse
+            // a trabajar para que arranquen cuanto antes.
+            for (u32 part = 1; part < parts; ++part) {
+                const u32 begin = jobs * part / parts;
+                const u32 end = jobs * (part + 1) / parts;
+                ps.workers.QueueWork([&shade_range, &ps, begin, end] {
+                    shade_range(begin, end, &ps.jobs[begin - 1]);
+                });
+            }
+            shade_range(0, jobs / parts, first_warmup);
+            // Misma barrera que las bandas del rasterizador: ver la razon de
+            // la espera activa en WaitForRequestsSpin.
+            ps.workers.WaitForRequestsSpin(4096);
+        }
+        if (jobs != 0) {
+            has_previous = true;
+            previous = ps.jobs[jobs - 1];
+        }
+        Common::FrameStats::vertices_shaded.fetch_add(jobs, std::memory_order_relaxed);
+        Common::FrameStats::Add(Common::FrameStats::shade_us, shade_begin);
+
+        // ---- Fase 3: entrega, en el orden del lote ----
+        //
+        // Directamente al ensamblador de primitivas: es exactamente lo que hace
+        // geometry_pipeline.SubmitVertex sin shader de geometria (llama al
+        // manejador de vertices, que convierte y entrega; ver el constructor),
+        // solo que la conversion ya esta hecha y el std::function del
+        // manejador de triangulos se construye UNA vez por segmento, no una
+        // por vertice.
+        const PrimitiveAssembler::TriangleHandler add_triangle =
+            [this](const OutputVertex& v0, const OutputVertex& v1, const OutputVertex& v2) {
+                rasterizer->AddTriangle(v0, v1, v2);
+            };
+        for (const u32 ref : ps.submit) {
+            const OutputVertex& output =
+                (ref & kFromSlot) != 0 ? ps.slot_data[ref & ~kFromSlot] : ps.outputs[ref];
+            primitive_assembler.SubmitVertex(output, add_triangle);
+        }
+
+        // Lo que siga en el cache tiene que sobrevivir al segmento siguiente,
+        // que reutiliza 'outputs'.
+        if (is_indexed && position < num_vertices) {
+            for (u32 slot = 0; slot < kCacheSize; ++slot) {
+                if (cache_ids[slot] != kEmpty && (cache_ref[slot] & kFromSlot) == 0) {
+                    ps.slot_data[slot] = ps.outputs[cache_ref[slot]];
+                    cache_ref[slot] = kFromSlot | slot;
+                }
+            }
+        }
     }
 }
+#endif
 
 PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u32 size) {
     // Initialize command list tracking.

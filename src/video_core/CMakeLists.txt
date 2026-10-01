@@ -85,6 +85,8 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     shader/shader.h
     shader/shader_interpreter.cpp
     shader/shader_interpreter.h
+    shader/shader_neon_jit.cpp
+    shader/shader_neon_jit.h
     shader/shader_jit.cpp
     shader/shader_jit.h
     shader/shader_jit_a64_compiler.cpp
@@ -141,6 +143,8 @@ if (ENABLE_SOFTWARE_RENDERER)
             # glsl_fs_shader_gen y spv_fs_shader_gen, mismo PicaFSConfig.
             shader/generator/cg_fs_shader_gen.cpp
             shader/generator/cg_fs_shader_gen.h
+            shader/generator/cg_vs_shader_gen.cpp
+            shader/generator/cg_vs_shader_gen.h
         )
     endif()
 endif()
@@ -283,6 +287,25 @@ set_source_files_properties(
     # en linea el entrelazado de Morton ni los decodificadores de color.
     texture/texture_decode.cpp
     texture/etc1.cpp
+
+    # El resto del camino POR VERTICE (0.1.0.42). Se compilaban a -Os aunque
+    # corren una vez por vertice -- unas 19.000 veces por fotograma en Rubi
+    # Omega --: cargar atributos (vertex_loader), meterlos y sacarlos de la
+    # unidad de shader (shader_unit), convertir la salida (output_vertex) y
+    # ensamblar triangulos (primitive_assembly, geometry_pipeline). Con LTO,
+    # ademas, LoadVertex y LoadInput/WriteOutput se meten en linea dentro del
+    # bucle de ShadeVerticesParallel, que es donde se llaman.
+    pica/vertex_loader.cpp
+    pica/shader_unit.cpp
+    pica/output_vertex.cpp
+    pica/primitive_assembly.cpp
+    pica/geometry_pipeline.cpp
+
+    # Y el lado GXM de lo mismo: AddTriangle (por triangulo), el empaquetado
+    # de vertices de DrawBatchOnGpu (por vertice) y la decodificacion de
+    # texturas del cache (por texel).
+    renderer_gxm/rasterizer_gxm.cpp
+    renderer_gxm/gxm_texture_cache.cpp
     PROPERTIES COMPILE_OPTIONS "-O3;-flto"
 )
 

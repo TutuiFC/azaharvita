@@ -1046,6 +1046,10 @@ void Module::SaveMCUConfig() {
     }
 }
 
+#ifdef __PSVITA__
+int g_vita_system_language = -1;
+#endif
+
 Module::Module(Core::System& system_) : system(system_) {
     load_savegame_res = LoadConfigNANDSaveFile();
     LoadMCUConfig();
@@ -1060,6 +1064,14 @@ Module::Module(Core::System& system_) : system(system_) {
         SetEULAVersion(default_version);
         UpdateConfigNANDSavegame();
     }
+#ifdef __PSVITA__
+    // El idioma del menu de ajustes de la Vita, al FINAL: la actualizacion del
+    // EULA de arriba escribe el config en la NAND, y el idioma elegido tiene
+    // que quedarse solo en memoria. Ver g_vita_system_language.
+    if (g_vita_system_language >= LANGUAGE_JP && g_vita_system_language <= LANGUAGE_TW) {
+        SetSystemLanguage(static_cast<SystemLanguage>(g_vita_system_language));
+    }
+#endif
 }
 
 Module::~Module() = default;

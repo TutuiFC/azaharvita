@@ -74,6 +74,19 @@ public:
 
     GeometryEmitter* emitter_ptr;
 
+#ifdef __PSVITA__
+    /// Cuenta de ejecuciones de ESTA unidad para la autocomprobacion por
+    /// muestreo de la ruta rapida del interprete (ver InterpreterEngine::Run).
+    /// Va en la unidad y no en un contador global para no pelearse tres
+    /// nucleos por la misma linea de cache en cada vertice.
+    u32 fast_check_counter = 0;
+    /// Diagnostico (0.1.0.45): instrucciones ejecutadas por la ruta rapida y
+    /// por el interprete en esta unidad. Con los vertices sombreados dan la
+    /// longitud media del programa y cuanto cubre la ruta rapida.
+    u32 fast_ops = 0;
+    u32 slow_instrs = 0;
+#endif
+
 private:
     friend class boost::serialization::access;
     template <class Archive>

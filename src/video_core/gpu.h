@@ -57,12 +57,30 @@ inline std::atomic<u64> cmdlist_ns{0};
 inline std::atomic<u64> fill_ns{0};
 inline std::atomic<u64> transfer_ns{0};
 inline std::atomic<u64> dma_ns{0};
+/// Contadores de COMANDOS en el intervalo (0.1.5.2, 4.7): el tiempo ya estaba;
+/// sin el numero de veces no se sabe si subio porque hay mas o porque cada uno
+/// es mas caro. fill/transfer cuentan tambien los que entran por WriteReg
+/// (registro trigger), que no pasan por Execute().
+inline std::atomic<u64> fill_count{0};
+inline std::atomic<u64> transfer_count{0};
+inline std::atomic<u64> cmdlist_count{0};
+/**
+ * Cuantas operaciones que pueden cambiar la imagen ha hecho la GPU emulada
+ * desde el arranque (0.1.7.1): listas de comandos, rellenos, transferencias y
+ * copias DMA. No se pone a cero. Si entre dos presentaciones no ha cambiado
+ * (ni la direccion de los framebuffers), la imagen es la misma y la Vita no
+ * tiene que volver a subirla ni dibujarla. Ver EmuWindow_Vita::PresentScreens.
+ */
+inline std::atomic<u64> frame_work{0};
 
 inline void Reset() {
     cmdlist_ns.store(0, std::memory_order_relaxed);
     fill_ns.store(0, std::memory_order_relaxed);
     transfer_ns.store(0, std::memory_order_relaxed);
     dma_ns.store(0, std::memory_order_relaxed);
+    fill_count.store(0, std::memory_order_relaxed);
+    transfer_count.store(0, std::memory_order_relaxed);
+    cmdlist_count.store(0, std::memory_order_relaxed);
 }
 } // namespace GxStats
 

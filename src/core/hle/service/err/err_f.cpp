@@ -10,6 +10,10 @@
 #include "common/bit_field.h"
 #include "common/common_types.h"
 #include "common/logging/log.h"
+#ifdef __PSVITA__
+#include <fmt/format.h>
+#include "common/vita_diag.h"
+#endif
 #include "core/core.h"
 #include "core/hle/ipc.h"
 #include "core/hle/ipc_helpers.h"
@@ -170,6 +174,34 @@ void ERR_F::ThrowFatalError(Kernel::HLERequestContext& ctx) {
     const ErrInfo errinfo = rp.PopRaw<ErrInfo>();
     LOG_CRITICAL(Service_ERR, "Fatal error type: {}", GetErrType(errinfo.errinfo_common.specifier));
     system.SetStatus(Core::System::ResultStatus::ErrorUnknown);
+
+#ifdef __PSVITA__
+    /**
+     * EL ERROR FATAL, TAMBIEN A crash.txt.
+     *
+     * Esto es lo que el juego llama cuando se rinde, y es lo que dibuja en la
+     * consola la pantalla de "An error has occurred. Press and hold the POWER
+     * button...". Todo el detalle va por LOG_CRITICAL a azahar_log.txt, pero
+     * ese fichero se escribe con buffer y en una caida aparece cortado -- justo
+     * cuando mas falta hace. crash.txt se vuelca linea a linea, asi que las dos
+     * cosas que identifican el fallo (el tipo y el codigo de resultado, que
+     * lleva dentro el modulo que lo genero) se anotan tambien ahi.
+     *
+     * Sin esto, desde la consola solo se ve la pantalla de error del 3DS, que
+     * no dice nada de por que.
+     */
+    {
+        const Result result_code{errinfo.errinfo_common.result_code};
+        char note[192];
+        const auto written = fmt::format_to_n(
+            note, sizeof(note) - 1, "tipo {} rsl {:#010x} mod {} desc {} pc {:#010x}",
+            GetErrType(errinfo.errinfo_common.specifier), result_code.raw,
+            static_cast<u32>(result_code.module.Value()),
+            static_cast<u32>(result_code.description.Value()), errinfo.errinfo_common.pc_address);
+        *written.out = 0;
+        Common::VitaNote("error fatal", note);
+    }
+#endif
 
     // Generic Info
     LogGenericInfo(errinfo.errinfo_common);

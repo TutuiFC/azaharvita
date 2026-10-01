@@ -11,6 +11,10 @@
 #include "core/arm/skyeye_common/armstate.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#ifdef __PSVITA__
+#include "common/vita_diag.h"
+#include "core/arm/dyncom/arm_dyncom_jit.h"
+#endif
 
 namespace Core {
 
@@ -148,7 +152,17 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
     FlushTransCacheIfNeeded();
 
     state->NumInstrsToExecute = num_instructions;
+#ifdef __PSVITA__
+    const unsigned long long slice_begin = Common::VitaMicros();
+#endif
     const u32 ticks_executed = InterpreterMainLoop(state.get());
+#ifdef __PSVITA__
+    // El tiempo real de la rodaja (JIT + interprete), para separar dentro de
+    // 'cpu' lo que es el ARM de verdad de lo demas (servicios, sonido,
+    // temporizadores). Las instrucciones las cuenta el propio JIT al final de
+    // la rodaja (AbandonPendingCheck).
+    Core::ArmJit::AddSliceTime(Common::VitaMicros() - slice_begin);
+#endif
     if (timer) {
         timer->AddTicks(ticks_executed);
     }
