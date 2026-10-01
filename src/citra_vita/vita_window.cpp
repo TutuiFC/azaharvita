@@ -715,6 +715,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             stats_upload_ms = per_frame_ms(Common::FrameStats::upload_us);
             stats_draw_ms = per_frame_ms(Common::FrameStats::draw_us);
             stats_overlay_ms = per_frame_ms(Common::FrameStats::overlay_us);
+            stats_dsp_ms = per_frame_ms(Common::FrameStats::dsp_us);
             {
                 /**
                  * JIT del ARM11. Desde 0.1.4.9 todo sale de TakeStats: las dos
@@ -773,10 +774,10 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                         Common::VitaNote(
                             "arm tiempos",
                             fmt::format("ms por fotograma: jit {:.1f} (lento {:.1f} vfp {:.1f}) "
-                                        "comprobar {:.1f} compilar {:.1f} resto {:.1f}",
+                                        "comprobar {:.1f} compilar {:.1f} resto {:.1f} dsp {:.1f}",
                                         stats_arm_jit_ms, stats_arm_slow_ms, stats_arm_vfp_ms,
                                         stats_arm_check_ms, stats_arm_compile_ms,
-                                        stats_arm_rest_ms)
+                                        stats_arm_rest_ms, stats_dsp_ms)
                                 .c_str());
                         // Y el desglose de un vertice (0.1.7.2), en us por vertice.
                         const double s = static_cast<double>(
@@ -1643,6 +1644,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         // nuestro camino de GPU. Lo que sobre de gx es decodificar comandos.
         append(" vtx ", stats_vertices_ms);
         append(" lote ", stats_batch_ms);
+        // dsp = sonido emulado (0.1.7.7); no se suma: va dentro de cpu y svc.
+        append(" dsp ", stats_dsp_ms);
         line_ms[n] = '\0';
     }
 
