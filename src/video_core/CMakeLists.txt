@@ -306,6 +306,10 @@ set_source_files_properties(
     # texturas del cache (por texel).
     renderer_gxm/rasterizer_gxm.cpp
     renderer_gxm/gxm_texture_cache.cpp
+
+    # El presentador (0.1.7.6): copia o expande cada pixel de las dos pantallas
+    # en cada fotograma, en el hilo de emulacion ("sub" en el overlay).
+    renderer_gxm/gxm_presenter.cpp
     PROPERTIES COMPILE_OPTIONS "-O3;-flto"
 )
 

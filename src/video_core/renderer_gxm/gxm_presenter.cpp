@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <utility>
+#include <arm_neon.h>
 #include <psp2/kernel/modulemgr.h>
 #include "common/logging/log.h"
 #include "common/vita_diag.h"
@@ -501,7 +502,17 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
             }
             const u8* src_row = src + src_offset;
             u8* dst_row = dest + static_cast<std::size_t>(y) * tight_stride;
-            for (u32 x = 0; x < info.width; x++) {
+            // 0.1.7.6: 16 pixeles por vuelta con NEON (VLD3 separa B, G y R,
+            // VST4 los vuelve a juntar con el alfa). Mismos bytes en el mismo
+            // orden que el bucle de abajo, que se queda para la cola de la fila.
+            u32 x = 0;
+            const uint8x16_t opaque = vdupq_n_u8(0xFF);
+            for (; x + 16 <= info.width; x += 16) {
+                const uint8x16x3_t bgr = vld3q_u8(src_row + x * 3);
+                const uint8x16x4_t bgra = {{bgr.val[0], bgr.val[1], bgr.val[2], opaque}};
+                vst4q_u8(dst_row + x * 4, bgra);
+            }
+            for (; x < info.width; x++) {
                 const u8* pixel = src_row + x * 3;
                 const u32 word = static_cast<u32>(pixel[0]) |
                                  (static_cast<u32>(pixel[1]) << 8) |
