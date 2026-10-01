@@ -50,7 +50,16 @@ constexpr u32 kMaxBlockInstructions = 256;
 /// Comprobaciones: las primeras kFullChecks ejecuciones de cada bloque, y
 /// despues una de cada kSampleEvery (potencia de dos).
 constexpr u32 kFullChecks = 4;
-constexpr u32 kSampleEvery = 512;
+/**
+ * 0.1.7.8: de 512 a 4096. Una comprobacion cuesta del orden de 1.500 ciclos
+ * (la variante, tres copias de ~400 bytes del estado, el bloque interpretado y
+ * la comparacion) frente a ~30 de un bloque tipico de seis instrucciones por el
+ * JIT: cada 512 eso era cerca de un 10 % del codigo generado, y cada vez corta
+ * ademas la cadena de enlaces. Las primeras kFullChecks siguen siendo todas, y
+ * es ahi donde han salido casi todas las DIFERENCIAS; lo que se pierde es
+ * cazar antes un fallo que dependa de los datos. Se mide con "chk" y "rst".
+ */
+constexpr u32 kSampleEvery = 4096;
 /// Escrituras que caben en el diario de una comprobacion.
 constexpr u32 kJournalEntries = 96;
 
@@ -78,7 +87,7 @@ constexpr u32 kCondEq = 0;
 constexpr u32 kCondNe = 1;
 constexpr u32 kCondLo = 3; ///< CC: sin acarreo (resta con prestamo, "menor sin signo")
 /// log2(kSampleEvery): la prueba de muestreo en linea lo necesita.
-constexpr u32 kSampleEveryBits = 9;
+constexpr u32 kSampleEveryBits = 12;
 static_assert((1u << kSampleEveryBits) == kSampleEvery, "kSampleEvery tiene que ser 2^bits");
 /**
  * Huecos de la cache de registros (0.1.5.7): r0-r3 y lr, CINCO (antes tres,
