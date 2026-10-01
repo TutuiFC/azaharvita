@@ -175,6 +175,14 @@ struct Stats {
     u64 links = 0;            ///< saltos entre bloques hechos por el codigo generado
     u64 slow_calls = 0;       ///< accesos a memoria por el camino lento (y LDM/STM)
     u64 vfp_calls = 0;        ///< aritmetica VFP por las funciones del interprete
+    /// Reparto de arm_us (0.1.7.5), en microsegundos. jit_us, slow_us y vfp_us
+    /// son estimaciones por muestreo; slow_us y vfp_us van DENTRO de jit_us.
+    /// arm_us - svc_us - jit_us - check_us - compile_us = interprete y despacho.
+    u64 jit_us = 0;     ///< codigo generado (con los enlazados y sus llamadas)
+    u64 slow_us = 0;    ///< caminos lentos de memoria, LDM/STM y VLDM/VSTM
+    u64 vfp_us = 0;     ///< aritmetica VFP por las funciones del interprete
+    u64 check_us = 0;   ///< comprobaciones contra el interprete (sin su ejecucion)
+    u64 compile_us = 0; ///< analizar, generar codigo y vaciar la cache
 };
 void TakeStats(Stats& out);
 

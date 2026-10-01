@@ -742,6 +742,17 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                             : 0) /
                     n / 1000.0;
                 {
+                    const auto to_ms = [n](u64 us) { return static_cast<double>(us) / n / 1000.0; };
+                    stats_arm_jit_ms = to_ms(jit.jit_us);
+                    stats_arm_slow_ms = to_ms(jit.slow_us);
+                    stats_arm_vfp_ms = to_ms(jit.vfp_us);
+                    stats_arm_check_ms = to_ms(jit.check_us);
+                    stats_arm_compile_ms = to_ms(jit.compile_us);
+                    const double rest = stats_arm_ms - stats_arm_jit_ms - stats_arm_check_ms -
+                                        stats_arm_compile_ms;
+                    stats_arm_rest_ms = rest > 0.0 ? rest : 0.0;
+                }
+                {
                     // Tres veces, cada 10 s, a crash.txt: los datos llegan
                     // aunque no haya captura (0.1.6.3).
                     static u32 arm_ticks = 0;
@@ -758,6 +769,14 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                         stats_arm_dispatches, stats_arm_links, stats_arm_slow,
                                         stats_arm_vfp, stats_arm_interp_k, stats_vertices_ms,
                                         stats_shade_ms, stats_vertices_shaded)
+                                .c_str());
+                        Common::VitaNote(
+                            "arm tiempos",
+                            fmt::format("ms por fotograma: jit {:.1f} (lento {:.1f} vfp {:.1f}) "
+                                        "comprobar {:.1f} compilar {:.1f} resto {:.1f}",
+                                        stats_arm_jit_ms, stats_arm_slow_ms, stats_arm_vfp_ms,
+                                        stats_arm_check_ms, stats_arm_compile_ms,
+                                        stats_arm_rest_ms)
                                 .c_str());
                         // Y el desglose de un vertice (0.1.7.2), en us por vertice.
                         const double s = static_cast<double>(
@@ -1464,6 +1483,22 @@ void EmuWindow_Vita::DrawStatsOverlay() {
 
     // Formatos de textura que se usan de verdad, por unidades y triangulo.
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 380, 0xFFFFA0A0, 0.8f, line_fail);
+    {
+        /**
+         * El reparto de 'arm' en ms por fotograma (0.1.7.5):
+         *   jit = codigo generado; lento y vfp son la parte de jit que se va en
+         *         los caminos lentos de memoria y en la VFP por funcion
+         *   chk = comprobaciones contra el interprete   cmp = compilar
+         *   rst = lo que queda: interprete y despacho
+         */
+        char line_armt[96];
+        std::snprintf(line_armt, sizeof(line_armt),
+                      "jit %.1f (lento %.1f vfp %.1f) chk %.1f cmp %.1f rst %.1f",
+                      stats_arm_jit_ms, stats_arm_slow_ms, stats_arm_vfp_ms, stats_arm_check_ms,
+                      stats_arm_compile_ms, stats_arm_rest_ms);
+        vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX) + 130, 380, 0xFF80FF80,
+                             0.8f, line_armt);
+    }
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 398, 0xFFFFA0A0, 0.8f,
                          stats_format_line);
 

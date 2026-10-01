@@ -264,6 +264,57 @@ LinkContext g_link_ctx;
 /// el resto en FlushLocalStats.
 u64 g_slow_calls = 0;
 u64 g_vfp_calls = 0;
+
+/**
+ * TIEMPO DEL ARM POR PARTES (0.1.7.5). En 0.1.6.3 el bucle del ARM costaba
+ * ~240 ns por instruccion del juego con el 90 % en el JIT: los contadores
+ * decian cuantas veces pasaba cada cosa, pero no cuanto costaba. Esto reparte
+ * 'arm' en codigo generado, caminos lentos de memoria, VFP por funcion,
+ * comprobaciones y compilacion; lo que sobra es el interprete y el despacho.
+ *
+ * Lo frecuente (miles de veces por fotograma) se cronometra UNA DE CADA
+ * kTimeSampleEvery y se multiplica: leer el reloj en cada llamada falsearia
+ * justo lo que se quiere medir. El reloj es de microsegundos y estas llamadas
+ * duran menos, pero el error de redondeo se compensa en promedio porque la
+ * fase del reloj respecto a la llamada es aleatoria. Lo raro (comprobar,
+ * compilar) se cronometra siempre.
+ */
+constexpr u32 kTimeSampleEvery = 16;
+u32 g_run_samples = 0;
+u64 g_jit_us = 0;
+u64 g_slow_us = 0;
+u64 g_vfp_us = 0;
+u64 g_check_us = 0;
+u64 g_compile_us = 0;
+
+bool TimeThisCall(u64 calls) {
+    return (calls & (kTimeSampleEvery - 1)) == 0;
+}
+
+/// Suma a 'slot' el tiempo de su ambito.
+struct ScopedMicros {
+    explicit ScopedMicros(u64& slot_) : slot{slot_}, begin{Common::VitaMicros()} {}
+    ~ScopedMicros() {
+        slot += Common::VitaMicros() - begin;
+    }
+    u64& slot;
+    u64 begin;
+};
+
+/// Como ScopedMicros, pero solo si 'timed', y multiplicado por el muestreo.
+struct SampledMicros {
+    SampledMicros(u64& slot_, bool timed_)
+        : slot{slot_}, timed{timed_}, begin{timed_ ? Common::VitaMicros() : 0} {}
+    ~SampledMicros() {
+        if (timed) {
+            slot += (Common::VitaMicros() - begin) * kTimeSampleEvery;
+        }
+    }
+    u64& slot;
+    bool timed;
+    u64 begin;
+};
+
 constexpr u32 kCtxBudget = 0;
 constexpr u32 kCtxHops = 4;
 /**
@@ -308,14 +359,14 @@ u32 SlowReadRaw(ARMul_State* cpu, u32 address, u32 kind) {
 }
 
 u32 SlowRead(ARMul_State* cpu, u32 address, u32 kind) {
-    g_slow_calls++;
+    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
     const u32 value = SlowReadRaw(cpu, address, kind);
     StopLinksIfRescheduled(cpu);
     return value;
 }
 
 void SlowWrite(ARMul_State* cpu, u32 address, u32 value, u32 kind) {
-    g_slow_calls++;
+    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
     switch (kind) {
     case kWord:
         cpu->WriteMemory32(address, value);
@@ -388,7 +439,7 @@ void BlockTransfer(ARMul_State* cpu, u32 inst, Read&& read, Write&& write) {
 }
 
 void HelperBlockTransfer(ARMul_State* cpu, u32 inst) {
-    g_slow_calls++;
+    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
     BlockTransfer(
         cpu, inst, [cpu](u32 address) { return cpu->ReadMemory32(address); },
         [cpu](u32 address, u32 value) { cpu->WriteMemory32(address, value); });
@@ -536,7 +587,7 @@ bool IsVfpCpdo(int index) {
  * comprobacion usa la misma funcion (StartCheck guarda y repone los dos).
  */
 void HelperVfpCdp(ARMul_State* cpu, u32 inst) {
-    g_vfp_calls++;
+    const SampledMicros timer{g_vfp_us, TimeThisCall(++g_vfp_calls)};
     const u32 fpscr = cpu->VFP[VFP_FPSCR];
     const u32 ret = ((inst >> 8) & 1) != 0 ? vfp_double_cpdo(cpu, inst, fpscr)
                                            : vfp_single_cpdo(cpu, inst, fpscr);
@@ -612,7 +663,7 @@ void VfpTransfer(ARMul_State* cpu, u32 inst, Read&& read, Write&& write) {
 }
 
 void HelperVfpTransfer(ARMul_State* cpu, u32 inst) {
-    g_slow_calls++;
+    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
     VfpTransfer(
         cpu, inst, [cpu](u32 address) { return cpu->ReadMemory32(address); },
         [cpu](u32 address, u32 value) { cpu->WriteMemory32(address, value); });
@@ -756,6 +807,11 @@ struct PublishedStats {
     std::atomic<u64> dispatches{0};
     std::atomic<u64> jit_dispatches{0};
     std::array<std::atomic<u64>, kRejectCount> rejects{};
+    std::atomic<u64> jit_us{0};
+    std::atomic<u64> slow_us{0};
+    std::atomic<u64> vfp_us{0};
+    std::atomic<u64> check_us{0};
+    std::atomic<u64> compile_us{0};
 };
 PublishedStats g_published;
 
@@ -766,6 +822,16 @@ void FlushLocalStats() {
     g_published.vfp_calls.fetch_add(g_vfp_calls, std::memory_order_relaxed);
     g_slow_calls = 0;
     g_vfp_calls = 0;
+    g_published.jit_us.fetch_add(g_jit_us, std::memory_order_relaxed);
+    g_published.slow_us.fetch_add(g_slow_us, std::memory_order_relaxed);
+    g_published.vfp_us.fetch_add(g_vfp_us, std::memory_order_relaxed);
+    g_published.check_us.fetch_add(g_check_us, std::memory_order_relaxed);
+    g_published.compile_us.fetch_add(g_compile_us, std::memory_order_relaxed);
+    g_jit_us = 0;
+    g_slow_us = 0;
+    g_vfp_us = 0;
+    g_check_us = 0;
+    g_compile_us = 0;
     g_published.instructions.fetch_add(g_local.instructions, std::memory_order_relaxed);
     g_published.arm_us.fetch_add(g_local.arm_us, std::memory_order_relaxed);
     g_published.svc_us.fetch_add(g_local.svc_us, std::memory_order_relaxed);
@@ -2832,6 +2898,7 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
     if (++block->visits < kCompileAfterVisits) {
         return nullptr;
     }
+    const ScopedMicros timer{g_compile_us};
     if (!Analyze(cpu, *block)) {
         block->state = BlockState::Rejected;
         g_local.rejects[block->reject]++;
@@ -2911,6 +2978,7 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
         }
     }
     if (g_flush_requested) {
+        const ScopedMicros timer{g_compile_us};
         ResetAll();
     }
     if (cpu->TFlag != 0) {
@@ -2934,10 +3002,12 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
     }
     u8* const* pages = table->RawPointers();
     if (DueForCheck(*block)) {
+        const ScopedMicros timer{g_check_us};
         block->link.runs++;
         StartCheck(cpu, *block, pages);
         return 0; // el interprete ejecuta el bloque de verdad
     }
+    const SampledMicros timer{g_jit_us, TimeThisCall(++g_run_samples)};
     // Los enlazados dentro del codigo generado (EmitLink) ven lo que queda de
     // la rodaja DESPUES de este bloque, igual que el bucle de abajo.
     u64 done = RunCompiled(cpu, *block, pages, budget_left - block->link.count);
@@ -2988,6 +3058,7 @@ void CompletePendingCheck(ARMul_State* cpu) {
     if (!g_pending.active) {
         return;
     }
+    const ScopedMicros timer{g_check_us};
     g_pending.active = false;
     if (g_pending.cpu != cpu || g_pending.block == nullptr) {
         return;
@@ -3133,6 +3204,11 @@ void TakeStats(Stats& out) {
     out.links = g_published.links.exchange(0, std::memory_order_relaxed);
     out.slow_calls = g_published.slow_calls.exchange(0, std::memory_order_relaxed);
     out.vfp_calls = g_published.vfp_calls.exchange(0, std::memory_order_relaxed);
+    out.jit_us = g_published.jit_us.exchange(0, std::memory_order_relaxed);
+    out.slow_us = g_published.slow_us.exchange(0, std::memory_order_relaxed);
+    out.vfp_us = g_published.vfp_us.exchange(0, std::memory_order_relaxed);
+    out.check_us = g_published.check_us.exchange(0, std::memory_order_relaxed);
+    out.compile_us = g_published.compile_us.exchange(0, std::memory_order_relaxed);
     for (u32 i = 0; i < kRejectCount; i++) {
         out.rejects[i] = g_published.rejects[i].exchange(0, std::memory_order_relaxed);
     }

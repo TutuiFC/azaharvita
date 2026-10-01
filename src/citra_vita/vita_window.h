@@ -169,6 +169,15 @@ private:
     double stats_arm_slow = 0.0;
     double stats_arm_vfp = 0.0;
     double stats_arm_interp_k = 0.0;
+    /// Y CUANTO cuesta cada cosa (0.1.7.5), en ms por fotograma: codigo
+    /// generado (con lento y vfp dentro), caminos lentos, VFP por funcion,
+    /// comprobaciones, compilacion, y el resto (interprete y despacho).
+    double stats_arm_jit_ms = 0.0;
+    double stats_arm_slow_ms = 0.0;
+    double stats_arm_vfp_ms = 0.0;
+    double stats_arm_check_ms = 0.0;
+    double stats_arm_compile_ms = 0.0;
+    double stats_arm_rest_ms = 0.0;
     unsigned int stats_jit_top_reject = 0;
     double stats_jit_top_reject_percent = 0.0;
     unsigned int stats_jit_blocks = 0;
