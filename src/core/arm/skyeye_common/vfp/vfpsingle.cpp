@@ -131,8 +131,10 @@ static void vfp_single_normalise_denormal(struct vfp_single* vs) {
     vfp_single_dump("normalise_denormal: out", vs);
 }
 
-u32 vfp_single_normaliseround(ARMul_State* state, int sd, struct vfp_single* vs, u32 fpscr,
-                              u32 exceptions, const char* func) {
+/// El cuerpo de vfp_single_normaliseround sin escribir el registro: deja el
+/// valor redondeado y empaquetado en *packed (0.1.8.1, ver la VMLA).
+static u32 vfp_single_round_pack(struct vfp_single* vs, u32 fpscr, u32 exceptions,
+                                 s32* packed) {
     u32 significand, incr, rmode;
     int exponent, shift, underflow;
 
@@ -269,12 +271,16 @@ u32 vfp_single_normaliseround(ARMul_State* state, int sd, struct vfp_single* vs,
 
 pack:
     vfp_single_dump("pack: final", vs);
-    {
-        s32 d = vfp_single_pack(vs);
-        LOG_TRACE(Core_ARM11, "{}: d(s{})={:08x} exceptions={:08x}", func, sd, d, exceptions);
-        vfp_put_float(state, d, sd);
-    }
+    *packed = vfp_single_pack(vs);
+    return exceptions;
+}
 
+u32 vfp_single_normaliseround(ARMul_State* state, int sd, struct vfp_single* vs, u32 fpscr,
+                              u32 exceptions, const char* func) {
+    s32 d;
+    exceptions = vfp_single_round_pack(vs, fpscr, exceptions, &d);
+    LOG_TRACE(Core_ARM11, "{}: d(s{})={:08x} exceptions={:08x}", func, sd, d, exceptions);
+    vfp_put_float(state, d, sd);
     return exceptions;
 }
 
@@ -985,11 +991,62 @@ static u32 vfp_single_multiply(struct vfp_single* vsd, struct vfp_single* vsn,
 #define NEG_MULTIPLY (1 << 0)
 #define NEG_SUBTRACT (1 << 1)
 
+/**
+ * VMLA y familia por la VFP del anfitrion (0.1.8.1). Producto redondeado y
+ * suma redondeada: lo mismo que el softfloat de abajo y que la VMLA nativa del
+ * JIT. Las garantias son las de vfp_single_fast_binop, con el producto
+ * intermedio tambien normal. La barrera de asm obliga a materializar el
+ * producto redondeado: sin ella el compilador podria fundir las dos
+ * operaciones en una FMA (que redondea una sola vez) si el destino la tuviera.
+ */
+static inline bool vfp_single_fast_mac(ARMul_State* state, int sd, s32 n, s32 m, u32 fpscr,
+                                       u32 negate, u32* exceptions) {
+    if (!VfpFast::Usable(fpscr)) {
+        return false;
+    }
+    const u32 n_bits = static_cast<u32>(n);
+    const u32 m_bits = static_cast<u32>(m);
+    const u32 d_bits = static_cast<u32>(vfp_get_float(state, sd));
+    if (!VfpFast::SingleIsNormal(n_bits) || !VfpFast::SingleIsNormal(m_bits) ||
+        !VfpFast::SingleIsNormal(d_bits)) {
+        return false;
+    }
+    float product = VfpFast::BitsToSingle(n_bits) * VfpFast::BitsToSingle(m_bits);
+    __asm__("" : "+t"(product));
+    if (!VfpFast::SingleIsNormal(VfpFast::SingleToBits(product))) {
+        VfpFast::DiscardHostExceptions();
+        return false;
+    }
+    if (negate & NEG_MULTIPLY) {
+        product = -product;
+    }
+    float addend = VfpFast::BitsToSingle(d_bits);
+    if (negate & NEG_SUBTRACT) {
+        addend = -addend;
+    }
+    const float result = addend + product;
+    const u32 result_bits = VfpFast::SingleToBits(result);
+    if (!VfpFast::SingleIsNormal(result_bits)) {
+        VfpFast::DiscardHostExceptions();
+        return false;
+    }
+    if (!VfpFast::FinishHostOp(exceptions)) {
+        return false;
+    }
+    vfp_put_float(state, static_cast<s32>(result_bits), sd);
+    return true;
+}
+
 static u32 vfp_single_multiply_accumulate(ARMul_State* state, int sd, int sn, s32 m, u32 fpscr,
                                           u32 negate, const char* func) {
     vfp_single vsd, vsp, vsn, vsm;
     u32 exceptions = 0;
     s32 v;
+
+    if (vfp_single_fast_mac(state, sd, vfp_get_float(state, sn), m, fpscr, negate,
+                            &exceptions)) {
+        return exceptions;
+    }
 
     v = vfp_get_float(state, sn);
     LOG_TRACE(Core_ARM11, "s{} = {:08x}", sn, v);
@@ -1002,6 +1059,27 @@ static u32 vfp_single_multiply_accumulate(ARMul_State* state, int sd, int sn, s3
         vfp_single_normalise_denormal(&vsm);
 
     exceptions |= vfp_single_multiply(&vsp, &vsn, &vsm, fpscr);
+
+    /**
+     * EL PRODUCTO SE REDONDEA ANTES DE SUMAR (0.1.8.1). Aqui se mantenia sin
+     * redondear (unos 32 bits de significando con bit pegajoso) y se redondeaba
+     * una sola vez al final: eso es una FMA fusionada. VMLA, VMLS, VNMLA y VNMLS
+     * del VFP del ARM11 no lo son: el manual de ARMv7 las define como
+     * FPAdd(D[d], FPMul(D[n], D[m])), con el producto redondeado, y asi las
+     * hace dynarmic (ir.FPAdd(reg_d, ir.FPMul(reg_n, reg_m))) en el Azahar de
+     * escritorio. Medido en consola: TODOS los bloques que el JIT devolvia al
+     * interprete por "DIFERENCIA ... vfp" llevaban una de estas, con el JIT
+     * (VMLA nativa, no fusionada) a 1-8 ULP del interprete, o 0 frente a un
+     * resto de cancelacion. Los NaN e infinitos no se redondean (no hay nada
+     * que redondear) y siguen el camino de siempre.
+     */
+    if (vsp.exponent != 255) {
+        s32 product;
+        exceptions = vfp_single_round_pack(&vsp, fpscr, exceptions, &product);
+        exceptions |= vfp_single_unpack(&vsp, product, fpscr);
+        if (vsp.exponent == 0 && vsp.significand)
+            vfp_single_normalise_denormal(&vsp);
+    }
 
     if (negate & NEG_MULTIPLY)
         vsp.sign = vfp_sign_negate(vsp.sign);

@@ -61,16 +61,14 @@
 // que un bit PEGAJOSO que el juego casi con seguridad ya tenia puesto aparezca
 // puesto: ningun juego de 3DS decide nada mirando IXC.
 //
-// LO QUE NO SE ACELERA, A PROPOSITO. La familia de multiplicacion con
-// acumulacion (VMLA, VMLS, VNMLA, VNMLS) se queda entera en softfloat. El
-// motivo es que la implementacion de aqui mantiene el producto a unos 32 bits
-// de significando con bit pegajoso y redondea UNA sola vez al final, o sea que
-// se comporta como una operacion fundida; la VMLA real de VFPv3 redondea DOS
-// veces (primero el producto y luego la suma) y el Cortex-A9 no tiene la
-// instruccion fundida con la que se podria reproducir lo primero. Acelerarlas
-// exigiria antes decidir cual de los dos comportamientos es el correcto, y eso
-// es un cambio de semantica, no una optimizacion. Aqui solo se hacen
-// operaciones que son una unica operacion IEEE con un unico redondeo.
+// LA FAMILIA DE MULTIPLICAR Y ACUMULAR (VMLA, VMLS, VNMLA, VNMLS). Hasta
+// 0.1.8.0 se quedaba entera en softfloat, porque softfloat la hacia FUNDIDA (el
+// producto sin redondear, un solo redondeo al final) y la VMLA del VFP redondea
+// DOS veces. La duda de cual era la correcta se resolvio en 0.1.8.1: el manual
+// de ARMv7 la define como FPAdd(D[d], FPMul(D[n], D[m])), dynarmic la hace asi,
+// y el JIT (VMLA nativa) discrepaba del interprete justo en esos bloques.
+// Softfloat redondea ahora el producto, y con eso el camino rapido (producto
+// nativo, barrera, suma nativa) da exactamente lo mismo.
 
 #pragma once
 

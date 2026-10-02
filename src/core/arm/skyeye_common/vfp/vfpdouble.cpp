@@ -118,8 +118,10 @@ static void vfp_double_normalise_denormal(struct vfp_double* vd) {
     vfp_double_dump("normalise_denormal: out", vd);
 }
 
-u32 vfp_double_normaliseround(ARMul_State* state, int dd, struct vfp_double* vd, u32 fpscr,
-                              u32 exceptions, const char* func) {
+/// El cuerpo de vfp_double_normaliseround sin escribir el registro: deja el
+/// valor redondeado y empaquetado en *packed (0.1.8.1, ver la VMLA).
+static u32 vfp_double_round_pack(struct vfp_double* vd, u32 fpscr, u32 exceptions,
+                                 s64* packed) {
     u64 significand, incr;
     int exponent, shift, underflow;
     u32 rmode;
@@ -254,11 +256,16 @@ u32 vfp_double_normaliseround(ARMul_State* state, int dd, struct vfp_double* vd,
 
 pack:
     vfp_double_dump("pack: final", vd);
-    {
-        s64 d = vfp_double_pack(vd);
-        LOG_TRACE(Core_ARM11, "VFP: {}: d(d{})={:016x} exceptions={:08x}", func, dd, d, exceptions);
-        vfp_put_double(state, d, dd);
-    }
+    *packed = vfp_double_pack(vd);
+    return exceptions;
+}
+
+u32 vfp_double_normaliseround(ARMul_State* state, int dd, struct vfp_double* vd, u32 fpscr,
+                              u32 exceptions, const char* func) {
+    s64 d;
+    exceptions = vfp_double_round_pack(vd, fpscr, exceptions, &d);
+    LOG_TRACE(Core_ARM11, "VFP: {}: d(d{})={:016x} exceptions={:08x}", func, dd, d, exceptions);
+    vfp_put_double(state, d, dd);
     return exceptions;
 }
 
@@ -947,10 +954,54 @@ u32 vfp_double_multiply(struct vfp_double* vdd, struct vfp_double* vdn, struct v
 #define NEG_MULTIPLY (1 << 0)
 #define NEG_SUBTRACT (1 << 1)
 
+/// VMLA y familia de doble precision por el anfitrion (0.1.8.1). Ver
+/// vfp_single_fast_mac: mismas garantias y la misma barrera contra la FMA.
+static inline bool vfp_double_fast_mac(ARMul_State* state, int dd, int dn, int dm, u32 fpscr,
+                                       u32 negate, u32* exceptions) {
+    if (!VfpFast::Usable(fpscr)) {
+        return false;
+    }
+    const u64 n_bits = vfp_get_double(state, dn);
+    const u64 m_bits = vfp_get_double(state, dm);
+    const u64 d_bits = vfp_get_double(state, dd);
+    if (!VfpFast::DoubleIsNormal(n_bits) || !VfpFast::DoubleIsNormal(m_bits) ||
+        !VfpFast::DoubleIsNormal(d_bits)) {
+        return false;
+    }
+    double product = VfpFast::BitsToDouble(n_bits) * VfpFast::BitsToDouble(m_bits);
+    __asm__("" : "+w"(product));
+    if (!VfpFast::DoubleIsNormal(VfpFast::DoubleToBits(product))) {
+        VfpFast::DiscardHostExceptions();
+        return false;
+    }
+    if (negate & NEG_MULTIPLY) {
+        product = -product;
+    }
+    double addend = VfpFast::BitsToDouble(d_bits);
+    if (negate & NEG_SUBTRACT) {
+        addend = -addend;
+    }
+    const double result = addend + product;
+    const u64 result_bits = VfpFast::DoubleToBits(result);
+    if (!VfpFast::DoubleIsNormal(result_bits)) {
+        VfpFast::DiscardHostExceptions();
+        return false;
+    }
+    if (!VfpFast::FinishHostOp(exceptions)) {
+        return false;
+    }
+    vfp_put_double(state, result_bits, dd);
+    return true;
+}
+
 static u32 vfp_double_multiply_accumulate(ARMul_State* state, int dd, int dn, int dm, u32 fpscr,
                                           u32 negate, const char* func) {
     struct vfp_double vdd, vdp, vdn, vdm;
     u32 exceptions = 0;
+
+    if (vfp_double_fast_mac(state, dd, dn, dm, fpscr, negate, &exceptions)) {
+        return exceptions;
+    }
 
     exceptions |= vfp_double_unpack(&vdn, vfp_get_double(state, dn), fpscr);
     if (vdn.exponent == 0 && vdn.significand)
@@ -961,6 +1012,15 @@ static u32 vfp_double_multiply_accumulate(ARMul_State* state, int dd, int dn, in
         vfp_double_normalise_denormal(&vdm);
 
     exceptions |= vfp_double_multiply(&vdp, &vdn, &vdm, fpscr);
+    // El producto se redondea antes de sumar: VMLA no es fusionada (0.1.8.1,
+    // ver vfp_single_multiply_accumulate).
+    if (vdp.exponent != 2047) {
+        s64 product;
+        exceptions = vfp_double_round_pack(&vdp, fpscr, exceptions, &product);
+        exceptions |= vfp_double_unpack(&vdp, product, fpscr);
+        if (vdp.exponent == 0 && vdp.significand)
+            vfp_double_normalise_denormal(&vdp);
+    }
     if (negate & NEG_MULTIPLY)
         vdp.sign = vfp_sign_negate(vdp.sign);
 
