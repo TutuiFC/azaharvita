@@ -38,6 +38,15 @@ const char* CgStatus();
 bool CgPoisoned();
 
 /**
+ * Queda poco heap (0.1.7.9): menos de kCgHeapReserveMB libres. Lo opcional
+ * que cuesta compilar -- los programas especializados por booleanos -- se deja
+ * de pedir, para que una escena con muchos shaders nuevos no acabe la partida
+ * con bad_alloc. El lote se queda en la CPU, que es correcto.
+ */
+constexpr unsigned int kCgHeapReserveMB = 32;
+bool CgHeapLow();
+
+/**
  * Cuantas veces se ha descargado y recargado el compilador tras un error
  * interno (0.1.5.9). Un shader que fallo por el compilador roto se puede
  * reintentar cuando esto cambia: el fallo no era del shader.

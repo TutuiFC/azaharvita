@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <malloc.h>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -18,6 +19,9 @@
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/vita_diag.h"
+
+/// Tamano del heap de libc, definido en citra_vita/main.cpp (AZAHAR_HEAP_MB).
+extern unsigned int _newlib_heap_size_user;
 
 namespace Gxm {
 
@@ -181,6 +185,65 @@ const SceShaccCgCompileOutput* LoadCached(const CacheHeader& want, const std::st
     output->diagnostics = nullptr;
     g_cached_outputs.insert(output);
     return output;
+}
+
+/**
+ * Copia en un bloque nuestro, con el mismo formato que LoadCached, de una
+ * salida del compilador (0.1.7.9). Asi la salida de libshacccg se puede
+ * destruir enseguida y soltar el compilador (ver ReleaseCompilerMemory) sin que
+ * el programa registrado en el parcheador apunte a memoria suya.
+ */
+const SceShaccCgCompileOutput* CopyOutput(const SceShaccCgCompileOutput& source) {
+    void* memory = std::malloc(sizeof(SceShaccCgCompileOutput) + source.programSize);
+    if (memory == nullptr) {
+        return nullptr;
+    }
+    auto* output = static_cast<SceShaccCgCompileOutput*>(memory);
+    u8* program = static_cast<u8*>(memory) + sizeof(SceShaccCgCompileOutput);
+    std::memcpy(program, source.programData, source.programSize);
+    output->programData = program;
+    output->programSize = source.programSize;
+    output->diagnosticCount = 0;
+    output->diagnostics = nullptr;
+    g_cached_outputs.insert(output);
+    return output;
+}
+
+std::size_t HeapInUse() {
+    return mallinfo().uordblks;
+}
+
+/**
+ * LA MEMORIA QUE SE QUEDA EL COMPILADOR (0.1.7.9).
+ *
+ * crash.txt de 0.1.7.8, Zafiro Alfa: al entrar en el 3D, justo despues de
+ * "especializado con booleanos ... a la GPU", la emulacion muere con
+ * bad_alloc. Desde 0.1.7.4 cada combinacion de booleanos de un shader de
+ * vertices es un programa nuevo que compilar, y la entrada al 3D pide muchos
+ * de golpe. libshacccg guarda su estado de compilacion entre una llamada y la
+ * siguiente, y ese estado solo se suelta con sceShaccCgReleaseCompiler, que
+ * este proyecto no llamaba nunca. Se llama despues de CADA compilacion: la
+ * siguiente lo vuelve a montar (cuesta algo de tiempo, que la cache de la
+ * tarjeta ya ahorra la segunda vez).
+ *
+ * Las primeras compilaciones anotan el heap en uso antes, al acabar y despues
+ * de soltar, para ver en crash.txt cuanto se queda el compilador.
+ */
+u32 g_mem_notes = 0;
+
+void ReleaseCompilerMemory(const char* name, std::size_t before) {
+    const std::size_t after_compile = HeapInUse();
+    sceShaccCgReleaseCompiler();
+    if (g_mem_notes < 8) {
+        g_mem_notes++;
+        const std::size_t after_release = HeapInUse();
+        Common::VitaNote("gxm mem",
+                         fmt::format("{}: heap en uso {} KB, al compilar {} KB, tras soltar "
+                                     "el compilador {} KB",
+                                     name, before / 1024, after_compile / 1024,
+                                     after_release / 1024)
+                             .c_str());
+    }
 }
 
 void StoreCached(CacheHeader header, const std::string& path,
@@ -411,6 +474,12 @@ bool CgPoisoned() {
     return g_poisoned;
 }
 
+bool CgHeapLow() {
+    const std::size_t total = _newlib_heap_size_user;
+    const std::size_t reserve = static_cast<std::size_t>(kCgHeapReserveMB) * 1024u * 1024u;
+    return HeapInUse() + reserve > total;
+}
+
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
                                          const char* source) {
     // Cache en la tarjeta (0.1.5.8): si este codigo fuente ya se compilo
@@ -450,6 +519,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     options.targetProfile = profile;
     options.entryFunctionName = "main";
 
+    const std::size_t heap_before = HeapInUse();
     g_compile_allocs.clear();
     g_tracking = true;
     const SceShaccCgCompileOutput* output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
@@ -516,6 +586,11 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
             // compilador se recarga limpio para el siguiente.
             StoreBadSource(BadSource{key.hash_city, key.hash_fnv});
             RecoverFromInternalError();
+        } else {
+            // Un error normal (de sintaxis) deja el compilador sano: solo se
+            // suelta su memoria. Con el error interno no se le llama: el
+            // modulo esta roto y RecoverFromInternalError ya lo ha descargado.
+            ReleaseCompilerMemory(name, heap_before);
         }
         g_compile_allocs.clear();
         return nullptr;
@@ -527,7 +602,16 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     NoteCache(fmt::format("{} compilado en {} ms", name,
                           (Common::VitaMicros() - compile_begin_us) / 1000));
     StoreCached(key, cache_path, *output);
-    return output;
+    // 0.1.7.9: la salida pasa a un bloque nuestro y el compilador suelta todo
+    // lo suyo. Si no hay memoria ni para la copia, se devuelve la original
+    // (como antes de 0.1.7.9) y el compilador se queda como estaba.
+    const SceShaccCgCompileOutput* copy = CopyOutput(*output);
+    if (copy == nullptr) {
+        return output;
+    }
+    sceShaccCgDestroyCompileOutput(output);
+    ReleaseCompilerMemory(name, heap_before);
+    return copy;
 }
 
 void ReleaseCgOutput(const SceShaccCgCompileOutput* output) {

@@ -1615,6 +1615,20 @@ public:
     /// Booleanos que lee cada programa (UsedBoolUniforms), por su clave
     /// generica: se miran una vez, al hacer falta el especializado (0.1.7.4).
     std::unordered_map<u64, u32> used_bools;
+
+    /**
+     * Especializados ya pedidos por cada clave generica (0.1.7.9). Un shader
+     * que lea k booleanos puede pedir hasta 2^k programas, y cada uno es una
+     * compilacion entera; en 0.1.7.8 la entrada al 3D de Zafiro Alfa acabo en
+     * bad_alloc justo ahi. Pasado el tope, las combinaciones nuevas de ese
+     * shader se quedan en la CPU.
+     */
+    static constexpr u32 kMaxSpecializedPerProgram = 16;
+    std::unordered_map<u64, u32> specialized_count;
+
+    [[nodiscard]] bool Has(u64 key) const {
+        return programs.find(key) != programs.end();
+    }
 };
 
 RasterizerGXM::RasterizerGXM(VideoCore::RasterizerInterface& software_, Memory::MemorySystem& memory_,
@@ -3546,10 +3560,27 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         const u64 special_key =
             Common::HashCombine(program_key, 0xB0010000ull | (bools & 0xFFFFu));
         const char* special_reason = nullptr;
-        g_cg_const_bools.store(kCgBoolsKnown | bools, std::memory_order_relaxed);
-        program = hw_shaders->GetProgram(special_key, pica.vs_setup, vs_config, inputs,
-                                         pipeline->lit, pipeline->proj, &special_reason);
-        g_cg_const_bools.store(0, std::memory_order_relaxed);
+        // 0.1.7.9: un especializado NUEVO solo si queda hueco en el tope de
+        // ese shader y heap de sobra. Los ya hechos se siguen usando siempre.
+        bool may_build = true;
+        if (!hw_shaders->Has(special_key)) {
+            u32& count = hw_shaders->specialized_count[program_key];
+            if (count >= HwShaderCache::kMaxSpecializedPerProgram) {
+                special_reason = "vs tope de especializados";
+                may_build = false;
+            } else if (CgHeapLow()) {
+                special_reason = "vs sin heap para especializar";
+                may_build = false;
+            } else {
+                count++;
+            }
+        }
+        if (may_build) {
+            g_cg_const_bools.store(kCgBoolsKnown | bools, std::memory_order_relaxed);
+            program = hw_shaders->GetProgram(special_key, pica.vs_setup, vs_config, inputs,
+                                             pipeline->lit, pipeline->proj, &special_reason);
+            g_cg_const_bools.store(0, std::memory_order_relaxed);
+        }
         if (program != nullptr) {
             static u32 special_notes = 0;
             if (special_notes < 4) {
