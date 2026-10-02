@@ -1198,6 +1198,43 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             last_flushes_capacity = by_capacity;
             last_flushes_invalidation = by_invalidation;
         }
+        {
+            /**
+             * EL OVERLAY EN crash.txt (0.1.8.1): cada 10 s, seis veces por
+             * sesion, las lineas que dicen donde se va el fotograma. Sin esto
+             * cada prueba en consola necesitaba una captura de pantalla, y
+             * crash.txt es lo unico que llega siempre. Seis notas son seis
+             * escrituras en la tarjeta en toda la partida.
+             */
+            static u32 frame_ticks = 0;
+            static u32 frame_notes = 0;
+            if (++frame_ticks % 10 == 0 && frame_notes < 6) {
+                frame_notes++;
+                Common::VitaNote(
+                    "fotograma",
+                    fmt::format("fps {:.1f} vel {:.0f}% | ms {:.1f} cpu {:.1f} gx {:.1f} svc {:.1f} "
+                                "vtx {:.1f} lote {:.1f} dsp {:.1f} | conv {:.1f} sub {:.1f} "
+                                "dib {:.1f} ovl {:.1f} esp {:.1f} | sh {:.1f} fin {:.1f} tx {:.1f}",
+                                stats_game_fps, stats_speed_percent, stats_frame_ms, stats_cpu_ms,
+                                stats_gx_ms, stats_svc_ms, stats_vertices_ms, stats_batch_ms,
+                                stats_dsp_ms, stats_convert_ms, stats_upload_ms, stats_draw_ms,
+                                stats_overlay_ms, stats_swapwait_ms, stats_shade_ms,
+                                stats_finish_ms, stats_texdecode_ms)
+                        .c_str());
+                Common::VitaNote(
+                    "gpu",
+                    fmt::format("tri/fot {:.0f} | tg {} ts {} lot {} vsg {} no {} ({}) vsh {} "
+                                "esc {} vol {} | gx tri {:.0f}% rell {:.0f}% tran {:.0f}% | "
+                                "par {:.0f} ins {:.0f} rap {:.0f}%",
+                                stats_triangles_per_frame, stats_tri_gpu, stats_tri_sw,
+                                stats_gpu_batches, stats_hw_vs_batches, stats_hw_vs_rejects,
+                                stats_hw_vs_reason != nullptr ? stats_hw_vs_reason : "-",
+                                stats_vertices_shaded, stats_gpu_scenes, stats_gpu_writebacks,
+                                stats_gx_cmdlist, stats_gx_fill, stats_gx_transfer,
+                                stats_shade_occupancy, stats_instrs_per_vertex, stats_fast_percent)
+                        .c_str());
+            }
+        }
         stats_next_update_us = now_us + 1'000'000;
     }
 
