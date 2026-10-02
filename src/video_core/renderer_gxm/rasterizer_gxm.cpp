@@ -47,6 +47,7 @@ std::atomic<const char*> RasterizerGXM::hw_vs_last_reject{"-"};
 std::atomic<u32> RasterizerGXM::Ablation::mode{0};
 std::atomic<u32> RasterizerGXM::no_finish_wait{1};
 std::atomic<u32> RasterizerGXM::present_direct{1};
+std::atomic<u32> RasterizerGXM::specialize_vs{0};
 RasterizerGXM* RasterizerGXM::s_instance = nullptr;
 
 const char* RasterizerGXM::Ablation::Name(u32 value) {
@@ -3542,6 +3543,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
      * que ya funcionan. La clave lleva los booleanos que el codigo lee.
      */
     if (program == nullptr && reason != nullptr &&
+        specialize_vs.load(std::memory_order_relaxed) != 0 &&
         std::strcmp(reason, "vs tope de programas") != 0 &&
         std::strcmp(reason, "vs compilador roto") != 0 &&
         std::strcmp(reason, "vs con geometria") != 0) {

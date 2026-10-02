@@ -356,6 +356,10 @@ struct UserSettings {
     int screen_layout = 0;
     /// 0.1.7.1: no volver a presentar una imagen que no ha cambiado.
     bool skip_repeated = true;
+    /// 0.1.8.1: programas de vertices especializados por booleanos (0.1.7.4).
+    /// OFF: con ellos la entrada al 3D de Zafiro Alfa agotaba la memoria del
+    /// compilador de shaders y la partida se caia.
+    bool vs_specialize = false;
 };
 UserSettings g_user;
 
@@ -419,6 +423,8 @@ void ApplyUserSettings() {
         std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1),
         std::memory_order_relaxed);
     VitaFrontend::g_skip_repeated_frames.store(g_user.skip_repeated, std::memory_order_relaxed);
+    Gxm::RasterizerGXM::specialize_vs.store(g_user.vs_specialize ? 1u : 0u,
+                                            std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -472,6 +478,7 @@ void LoadUserSettings() {
         g_user.screen_layout = std::clamp(value, 0, VitaFrontend::kScreenLayoutCount - 1);
     }
     read_bool("omitir_repetidas=", g_user.skip_repeated);
+    read_bool("vs_especializar=", g_user.vs_specialize);
 }
 
 void SaveUserSettings() {
@@ -481,12 +488,12 @@ void SaveUserSettings() {
         "volumen=%d\nidioma=%d\nresolucion_media=%d\njit_cache_reg=%d\n"
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
-        "omitir_repetidas=%d\n",
+        "omitir_repetidas=%d\nvs_especializar=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
         g_user.vs_escapes ? 1 : 0, g_user.full_vertex_dedup ? 1 : 0, g_user.sound ? 1 : 0,
-        g_user.screen_layout, g_user.skip_repeated ? 1 : 0);
+        g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0);
     const SceUID fd = sceIoOpen(kSettingsFile, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd < 0) {
         WriteCrashLog("ajustes", "no se pudo guardar ajustes.txt");
@@ -496,7 +503,7 @@ void SaveUserSettings() {
     sceIoClose(fd);
 }
 
-constexpr int kSettingsRows = 13;
+constexpr int kSettingsRows = 14;
 
 void DrawSettings(vita2d_pgf* font, int row) {
     constexpr int kFirstY = 100;
@@ -522,7 +529,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
                                          "Cache de vertices completa",
                                          "Sonido",
                                          "Pantallas",
-                                         "Omitir imagenes repetidas"};
+                                         "Omitir imagenes repetidas",
+                                         "Vertices especializados a GPU"};
     char volume_text[16];
     std::snprintf(volume_text, sizeof(volume_text), "%d %%", g_user.volume_percent);
     const char* values[kSettingsRows] = {
@@ -538,7 +546,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
         g_user.full_vertex_dedup ? "ON" : "OFF",
         g_user.sound ? "ON" : "OFF",
         kLayoutNames[std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1)],
-        g_user.skip_repeated ? "ON" : "OFF"};
+        g_user.skip_repeated ? "ON" : "OFF",
+        g_user.vs_specialize ? "ON" : "OFF"};
 
     for (int i = 0; i < kSettingsRows; i++) {
         const int y = kFirstY + i * kRowStep;
@@ -599,6 +608,9 @@ void DrawSettings(vita2d_pgf* font, int row) {
         {"ON: si el juego no ha dibujado nada nuevo, no se vuelve a mostrar.",
          "Ganancia: ~5-10% de FPS en juegos a 30 FPS o menos.",
          "Contra: si un juego deja la imagen congelada, apagar."},
+        {"ON: los shaders con saltos se compilan una vez por combinacion de opciones.",
+         "Ganancia: mas vertices en la GPU si el compilador de la consola puede con ellos.",
+         "Contra: EXPERIMENTAL. En Pokemon Zafiro Alfa agotaba la memoria al entrar al 3D."},
     };
     vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
     vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);
@@ -627,6 +639,8 @@ void RunSettingsMenu(vita2d_pgf* font) {
     g_user.vs_escapes =
         Pica::Shader::Generator::GXM::g_allow_vs_escapes.load(std::memory_order_relaxed);
     g_user.full_vertex_dedup = Pica::g_full_vertex_dedup.load(std::memory_order_relaxed);
+    g_user.vs_specialize =
+        Gxm::RasterizerGXM::specialize_vs.load(std::memory_order_relaxed) != 0;
 
     int row = 0;
     // Todo lo que ya este pulsado al entrar (el START que la abrio) cuenta como
@@ -691,8 +705,11 @@ void RunSettingsMenu(vita2d_pgf* font) {
                     (g_user.screen_layout + step + VitaFrontend::kScreenLayoutCount) %
                     VitaFrontend::kScreenLayoutCount;
                 break;
-            default:
+            case 12:
                 g_user.skip_repeated = !g_user.skip_repeated;
+                break;
+            default:
+                g_user.vs_specialize = !g_user.vs_specialize;
                 break;
             }
             ApplyUserSettings();
