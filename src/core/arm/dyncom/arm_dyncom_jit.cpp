@@ -267,7 +267,8 @@ struct LinkContext {
     /// ejecutadas, y RunCompiled lo descuenta. Solo lo toca C++.
     u32 withdrawn = 0;
 };
-LinkContext g_link_ctx;
+/// alignas(8): el enlace lee y escribe budget y hops con LDRD/STRD (0.1.8.1).
+alignas(8) LinkContext g_link_ctx;
 /// Diagnostico (0.1.6.3): llamadas a las funciones lentas de memoria y a la
 /// aritmetica VFP. Variables normales (un solo hilo emula); se publican con
 /// el resto en FlushLocalStats.
@@ -289,7 +290,6 @@ u64 g_vfp_calls = 0;
  * compilar) se cronometra siempre.
  */
 constexpr u32 kTimeSampleEvery = 16;
-u32 g_run_samples = 0;
 u64 g_jit_us = 0;
 u64 g_slow_us = 0;
 u64 g_vfp_us = 0;
@@ -326,6 +326,9 @@ struct SampledMicros {
 
 constexpr u32 kCtxBudget = 0;
 constexpr u32 kCtxHops = 4;
+static_assert(offsetof(LinkContext, budget) == kCtxBudget &&
+                  offsetof(LinkContext, hops) == kCtxHops,
+              "el enlace lee budget y hops juntos con LDRD");
 /**
  * NumInstrsToExecute al empezar TryRun (0.1.5.7). El interprete mira el
  * presupuesto en CADA instruccion, asi que si algo lo cambia a mitad de
@@ -742,6 +745,9 @@ struct Block {
     u32 reject = kRejectNone; ///< por que se rechazo (RejectReason)
     BlockFn code = nullptr;
     BlockFn check_code = nullptr;
+    /// Donde entra un enlace (despues del prologo). Se publica en link.entry
+    /// cuando el bloque ha pasado sus kFullChecks comprobaciones (0.1.8.1).
+    u32 chain_entry = 0;
     std::vector<u32> words; ///< Las instrucciones, para crash.txt si difiere.
     /**
      * Cache de registros (0.1.5.2, 4.3): guest -> host (r0-r3 o lr desde
@@ -1444,6 +1450,18 @@ private:
     /// Hay algun registro cacheado (atajo para saltarse los vuelcos).
     bool cache_dirty = false;
     /**
+     * Registros cacheados que el codigo ya emitido ESCRIBE en su hueco
+     * (0.1.8.1). Solo esos hace falta volcar: un registro cacheado que el
+     * bloque solo lee vale lo mismo en su hueco que en cpu->Reg, y volcarlo
+     * era un STR de mas en cada salida y en cada enlace (cientos de miles por
+     * fotograma). Se marca al emitir, y como dentro de un bloque solo hay
+     * saltos hacia delante, el conjunto marcado al emitir un vuelco cubre
+     * todo lo que puede haber escrito cualquier camino que llegue a el. Lo que
+     * escriben las funciones de C (LDM, VLDM...) va directo a cpu->Reg y se
+     * recarga despues: no hace falta marcarlo.
+     */
+    std::array<bool, 16> cache_written{};
+    /**
      * Los flags del juego (N, Z, C, V) se leen despues de la instruccion que
      * se esta compilando? (0.1.5.7, ver ComputeFlagsLiveAfter.) Si no, un
      * acceso a memoria no necesita guardarlos y reponerlos alrededor de su
@@ -1482,7 +1500,7 @@ private:
         }
         for (u32 g = 0; g < 16; g++) {
             const s8 host = cache_map[g];
-            if (host >= 0) {
+            if (host >= 0 && cache_written[g]) {
                 e.StrImm(static_cast<u32>(host), kCpu, RegOffset(g));
             }
         }
@@ -1530,6 +1548,7 @@ private:
             if (static_cast<u32>(cached) != host) {
                 e.MovReg(static_cast<u32>(cached), host);
             }
+            cache_written[guest] = true;
             // NO se escribe a memoria aqui: el vuelco lo hace FlushCachedRegs
             // al salir del bloque o antes de un helper. Si 'host' ya ES el
             // registro cacheado (caso de DataProcessing con Rd cacheado), no
@@ -1576,6 +1595,9 @@ private:
         // La misma instruccion, con los registros cambiados: los flags (y el
         // acarreo que leen ADC/SBC/RSC) son los del juego, que estan en APSR.
         e.Emit(host);
+        if (writes_rd && rd_cached >= 0) {
+            cache_written[rd] = true;
+        }
         if (writes_rd && rd_cached < 0) {
             StoreGuest(kRd, rd);
         }
@@ -2354,36 +2376,29 @@ private:
                 e.AddReg(R0, R0, R2);
             }
         } else {
-            // Directo: el LinkInfo del destino en un literal, saltado por un B.
-            const u32 over = e.BranchPlaceholder(kAlways);
-            e.Emit(static_cast<u32>(reinterpret_cast<uintptr_t>(target)));
-            e.PatchBranch(over, e.Position());
-            e.Emit(0xE51F000Cu | (R0 << 12)); // LDR r0, [pc, #-12] (el literal)
+            // Directo: el LinkInfo del destino es fijo (los elementos de
+            // g_blocks no se mueven): MOVW/MOVT, sin literal ni salto (0.1.8.1).
+            e.Mov32(R0, static_cast<u32>(reinterpret_cast<uintptr_t>(target)));
         }
-        // r0 = LinkInfo* del destino. Enlazable?
+        /**
+         * r0 = LinkInfo* del destino. Enlazable? (0.1.8.1) entry ya implica que
+         * el bloque ha pasado sus kFullChecks comprobaciones (TryRun no lo
+         * publica antes, ver PublishLinkEntry), asi que aqui no se mira ni se
+         * incrementa 'runs': eran cinco instrucciones, dos saltos y un guardado
+         * por enlace. Las comprobaciones por muestreo siguen en las entradas
+         * por TryRun.
+         */
         e.LdrImm(R1, R0, kLinkEntry);
         e.CmpImm0(R1);
         fails.push_back(e.BranchPlaceholder(kCondEq));
-        // DueForCheck: runs < kFullChecks, o (runs & (kSampleEvery - 1)) == 0.
-        e.LdrImm(R2, R0, kLinkRuns);
-        e.Emit(0xE3500000u | (R2 << 16) | kFullChecks); // CMP r2, #kFullChecks
-        fails.push_back(e.BranchPlaceholder(kCondLo));
-        // MOVS r3, r2, LSL #(32 - log2(kSampleEvery)): Z si los bits bajos son 0.
-        e.Emit(0xE1B00000u | (R3 << 12) | ((32u - kSampleEveryBits) << 7) | R2);
-        fails.push_back(e.BranchPlaceholder(kCondEq));
-        // Presupuesto: budget -= count; si no llega, fallo.
+        // Presupuesto y enlaces de una vez: LDRD kRn (budget), kRm (hops).
         e.Mov32(R3, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_link_ctx)));
-        e.LdrImm(kRn, R3, kCtxBudget);
-        e.LdrImm(kRm, R0, kLinkCount);
-        e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | kRm); // SUBS kRn, kRn, kRm
+        e.Emit(0xE1C000D0u | (R3 << 16) | (kRn << 12)); // LDRD kRn, kRm, [r3]
+        e.LdrImm(R2, R0, kLinkCount);
+        e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | R2); // SUBS kRn, kRn, r2
         fails.push_back(e.BranchPlaceholder(kCondLo));
-        // Todo bien: apuntar y saltar (runs++ como RunCompiled, hops++).
-        e.StrImm(kRn, R3, kCtxBudget);
-        e.Emit(0xE2800001u | (R2 << 16) | (R2 << 12)); // ADD r2, r2, #1
-        e.StrImm(R2, R0, kLinkRuns);
-        e.LdrImm(kRm, R3, kCtxHops);
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
-        e.StrImm(kRm, R3, kCtxHops);
+        e.Emit(0xE1C000F0u | (R3 << 16) | (kRn << 12)); // STRD kRn, kRm, [r3]
         e.MsrFlags(kT0);
         e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
         for (const u32 fail : fails) {
@@ -2795,9 +2810,10 @@ BlockFn EmitBlock(Block& block, bool check_mode) {
     g_code_used_words += e.Position();
     if (!check_mode) {
         // Punto de entrada de los enlaces (0.1.5.7): pila, kCpu, kPages y
-        // flags ya los pone el bloque origen; aqui empieza BodyEnter. Con
-        // esto el bloque ya es enlazable (el codigo generado mira entry).
-        block.link.entry = static_cast<u32>(reinterpret_cast<uintptr_t>(start + chain_entry));
+        // flags ya los pone el bloque origen; aqui empieza BodyEnter. NO se
+        // publica todavia en link.entry: eso lo hace TryRun cuando el bloque
+        // ha pasado sus comprobaciones iniciales (0.1.8.1).
+        block.chain_entry = static_cast<u32>(reinterpret_cast<uintptr_t>(start + chain_entry));
     }
     return reinterpret_cast<BlockFn>(start);
 }
@@ -3016,7 +3032,22 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
         StartCheck(cpu, *block, pages);
         return 0; // el interprete ejecuta el bloque de verdad
     }
-    const SampledMicros timer{g_jit_us, TimeThisCall(++g_run_samples)};
+    /**
+     * Ya no le toca comprobacion, asi que ha pasado las kFullChecks iniciales
+     * (la ultima se cerro en el despacho, antes de llegar aqui, y si hubiera
+     * fallado el bloque estaria en la lista negra y Acquire no lo daria): ya
+     * puede ser destino de un enlace del codigo generado (0.1.8.1).
+     */
+    if (block->link.entry == 0) {
+        block->link.entry = block->chain_entry;
+    }
+    /**
+     * 0.1.8.1: se cronometran TODAS las entradas, no una de cada 16. Son pocas
+     * (las demas son enlaces dentro del codigo generado) y muy desiguales: una
+     * puede encadenar miles de bloques, y con el muestreo el reparto entre
+     * "jit" y "resto" del overlay salia con mucho ruido.
+     */
+    const ScopedMicros timer{g_jit_us};
     // Los enlazados dentro del codigo generado (EmitLink) ven lo que queda de
     // la rodaja DESPUES de este bloque, igual que el bucle de abajo.
     u64 done = RunCompiled(cpu, *block, pages, budget_left - block->link.count);
