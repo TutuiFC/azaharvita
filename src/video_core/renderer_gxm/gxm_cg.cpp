@@ -285,6 +285,17 @@ std::size_t FreeHeap() {
 /// retiene (0.1.8.1, ver g_compile_allocs).
 constexpr std::size_t kMinFreeToCompile = 40u * 1024u * 1024u;
 constexpr std::size_t kReclaimBelowFree = 96u * 1024u * 1024u;
+/**
+ * Los shaders de VERTICES son otra cosa (0.1.8.3). Los que llegan aqui son los
+ * de piel de Pokemon especializados por booleanos: enormes. crash.txt de
+ * 0.1.8.0: uno compilo bien empezando con 93 MB libres (y se quedo 18 MB que
+ * no devolvio); el siguiente empezo con 74 MB y el compilador murio por dentro.
+ * Asi que cada compilacion de vertices empieza en las condiciones de la que
+ * salio bien: compilador recien cargado (se descarga DESPUES de cada una, ver
+ * ReleaseCompilerMemory) y al menos kMinFreeToCompileVs libres. Si no los hay,
+ * ese programa no se compila ahora y el lote sombrea en la CPU.
+ */
+constexpr std::size_t kMinFreeToCompileVs = 85u * 1024u * 1024u;
 
 bool ReclaimCompiler(const char* why);
 
@@ -306,7 +317,8 @@ bool ReclaimCompiler(const char* why);
  */
 u32 g_mem_notes = 0;
 
-void ReleaseCompilerMemory(const char* name, std::size_t before, std::size_t live_before) {
+void ReleaseCompilerMemory(const char* name, std::size_t before, std::size_t live_before,
+                           bool vertex) {
     const std::size_t after_compile = HeapInUse();
     sceShaccCgReleaseCompiler();
     if (g_mem_notes < 8) {
@@ -323,7 +335,9 @@ void ReleaseCompilerMemory(const char* name, std::size_t before, std::size_t liv
     }
     // 0.1.8.1: sceShaccCgReleaseCompiler no devuelve lo que retiene (medido).
     // Si el heap va justo, se descarga el modulo y se devuelve todo.
-    if (FreeHeap() < kReclaimBelowFree && g_live_bytes > 1024u * 1024u) {
+    if (vertex && g_live_bytes > 0) {
+        ReclaimCompiler("tras compilar vertices");
+    } else if (FreeHeap() < kReclaimBelowFree && g_live_bytes > 1024u * 1024u) {
         ReclaimCompiler("tras compilar");
     }
 }
@@ -640,10 +654,12 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
      * compila ahora (el lote se dibuja por el otro camino) y se reintentara
      * cuando lo pida otro lote.
      */
-    if (FreeHeap() < kMinFreeToCompile && g_live_bytes > 0) {
+    const bool vertex = profile == SCE_SHACCCG_PROFILE_VP;
+    const std::size_t min_free = vertex ? kMinFreeToCompileVs : kMinFreeToCompile;
+    if (FreeHeap() < min_free && g_live_bytes > 0) {
         ReclaimCompiler("antes de compilar");
     }
-    if (FreeHeap() < kMinFreeToCompile) {
+    if (FreeHeap() < min_free) {
         static u32 skip_notes = 0;
         if (skip_notes < 4) {
             skip_notes++;
@@ -759,7 +775,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
             // Un error normal (de sintaxis) deja el compilador sano: solo se
             // suelta su memoria. Con el error interno no se le llama: el
             // modulo esta roto y RecoverFromInternalError ya lo ha descargado.
-            ReleaseCompilerMemory(name, heap_before, live_before);
+            ReleaseCompilerMemory(name, heap_before, live_before, vertex);
         }
         return nullptr;
     }
@@ -775,7 +791,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         return output;
     }
     sceShaccCgDestroyCompileOutput(output);
-    ReleaseCompilerMemory(name, heap_before, live_before);
+    ReleaseCompilerMemory(name, heap_before, live_before, vertex);
     return copy;
 }
 
