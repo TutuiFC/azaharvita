@@ -247,7 +247,8 @@ u32 ExtOffset(u32 vfp_reg) {
  * TryRun. Ahora todo se comprueba en linea (ver Compiler::EmitLink) con las
  * MISMAS condiciones que el bucle de TryRun, que son las del despacho del
  * interprete entre dos bloques:
- *   - sin interrupcion pendiente sin enmascarar (NirqSig y el bit I de Cpsr)
+ *   - sin interrupcion pendiente sin enmascarar (NirqSig y el bit I de Cpsr);
+ *     desde 0.1.8.2 solo en el despacho y en TryRun, ver EmitLink
  *   - en modo ARM (TFlag = 0) y con el PC alineado
  *   - el destino compilado y enlazable (LinkInfo::entry != 0)
  *   - al destino no le toca comprobacion (DueForCheck con LinkInfo::runs)
@@ -2346,14 +2347,17 @@ private:
         std::vector<u32> fails;
         FlushCachedRegs();
         e.Mrs(kT0);
-        // Interrupcion pendiente y sin enmascarar: !NirqSig && !(Cpsr & 0x80).
-        //   ldr r1, [cpu, #NirqSig]; cmp r1, #0
-        //   ldreq r1, [cpu, #Cpsr];  tsteq r1, #0x80;  beq fallo
-        e.LdrImm(R1, kCpu, g_offsets.nirq);
-        e.CmpImm0(R1);
-        e.Emit(0x05900000u | (kCpu << 16) | (R1 << 12) | g_offsets.cpsr); // LDREQ
-        e.Emit(0x03100080u | (R1 << 16));                                // TSTEQ #0x80
-        fails.push_back(e.BranchPlaceholder(kCondEq));
+        /**
+         * SIN LA PRUEBA DE INTERRUPCION (0.1.8.2). Aqui se miraba lo mismo que el
+         * despacho del interprete (!NirqSig && !(Cpsr & 0x80)): cinco
+         * instrucciones con dos cargas en cada enlace. NirqSig solo se escribe
+         * al crear el estado (NirqSig = HIGH, armstate.cpp) -- el kernel del 3DS
+         * es HLE y no hay IRQ del ARM --, el despacho ya lo comprueba antes de
+         * entrar en TryRun, y nada de lo que corre dentro del codigo generado
+         * (ni las funciones lentas) toca NirqSig ni el bit I (MSR y CPS van al
+         * interprete). O sea que dentro de una cadena de enlaces no puede
+         * cambiar: la prueba nunca fallaba.
+         */
         if (target == nullptr) {
             // Indirecto: tiene que seguir en ARM y con el PC alineado (el
             // despacho alinearia; aqui simplemente no se enlaza).
