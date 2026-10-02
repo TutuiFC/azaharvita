@@ -356,10 +356,13 @@ struct UserSettings {
     int screen_layout = 0;
     /// 0.1.7.1: no volver a presentar una imagen que no ha cambiado.
     bool skip_repeated = true;
-    /// 0.1.8.1: programas de vertices especializados por booleanos (0.1.7.4).
-    /// OFF: con ellos la entrada al 3D de Zafiro Alfa agotaba la memoria del
-    /// compilador de shaders y la partida se caia.
-    bool vs_specialize = false;
+    /// Programas de vertices especializados por booleanos (0.1.7.4). OFF en
+    /// 0.1.8.1 (agotaban la memoria del compilador al entrar al 3D de Zafiro
+    /// Alfa), y la partida bajo a 2.5 FPS con los vertices de piel en la CPU.
+    /// ON otra vez en 0.1.8.3, con el compilador descargado tras cada shader de
+    /// vertices y sin compilar si no hay 85 MB libres (ver gxm_cg.cpp). Clave
+    /// nueva: el ajustes.txt de 0.1.8.2 trae vs_especializar=0.
+    bool vs_specialize = true;
 };
 UserSettings g_user;
 
@@ -478,7 +481,7 @@ void LoadUserSettings() {
         g_user.screen_layout = std::clamp(value, 0, VitaFrontend::kScreenLayoutCount - 1);
     }
     read_bool("omitir_repetidas=", g_user.skip_repeated);
-    read_bool("vs_especializar=", g_user.vs_specialize);
+    read_bool("vs_especializar2=", g_user.vs_specialize);
 }
 
 void SaveUserSettings() {
@@ -488,7 +491,7 @@ void SaveUserSettings() {
         "volumen=%d\nidioma=%d\nresolucion_media=%d\njit_cache_reg=%d\n"
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
-        "omitir_repetidas=%d\nvs_especializar=%d\n",
+        "omitir_repetidas=%d\nvs_especializar2=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -609,8 +612,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
          "Ganancia: ~5-10% de FPS en juegos a 30 FPS o menos.",
          "Contra: si un juego deja la imagen congelada, apagar."},
         {"ON: los shaders con saltos se compilan una vez por combinacion de opciones.",
-         "Ganancia: mas vertices en la GPU si el compilador de la consola puede con ellos.",
-         "Contra: EXPERIMENTAL. En Pokemon Zafiro Alfa agotaba la memoria al entrar al 3D."},
+         "Ganancia: la mayor en 3D (Zafiro Alfa: de ~2.5 FPS con OFF a varias veces mas).",
+         "Contra: la 1a vez que sale cada uno, la escena se para unos segundos. Si crashea, apagar."},
     };
     vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
     vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);

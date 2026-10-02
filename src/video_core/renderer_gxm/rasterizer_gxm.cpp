@@ -47,7 +47,7 @@ std::atomic<const char*> RasterizerGXM::hw_vs_last_reject{"-"};
 std::atomic<u32> RasterizerGXM::Ablation::mode{0};
 std::atomic<u32> RasterizerGXM::no_finish_wait{1};
 std::atomic<u32> RasterizerGXM::present_direct{1};
-std::atomic<u32> RasterizerGXM::specialize_vs{0};
+std::atomic<u32> RasterizerGXM::specialize_vs{1};
 RasterizerGXM* RasterizerGXM::s_instance = nullptr;
 
 const char* RasterizerGXM::Ablation::Name(u32 value) {

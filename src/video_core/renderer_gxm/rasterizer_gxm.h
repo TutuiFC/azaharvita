@@ -230,11 +230,13 @@ public:
 
     /**
      * Programas de vertices ESPECIALIZADOS con los booleanos del lote (0.1.7.4).
-     * APAGADO por defecto desde 0.1.8.1: en Zafiro Alfa la entrada al 3D pedia
-     * varios de golpe, cada uno una compilacion enorme del shader de piel, y el
+     * En 0.1.8.1 se apago: en Zafiro Alfa la entrada al 3D pedia varios de
+     * golpe, cada uno una compilacion enorme del shader de piel, y el
      * compilador de la consola se quedaba sin memoria y tumbaba la partida
-     * (0.1.7.8, 0.1.7.9 y 0.1.8.0). Apagado, esos lotes sombrean los vertices en
-     * la CPU (JIT NEON), como hasta 0.1.7.3. Se guarda en ajustes.txt.
+     * (0.1.7.8 a 0.1.8.0). Apagado, esos lotes sombrean en la CPU y el juego
+     * bajo a 2.5 FPS (crash.txt de 0.1.8.2: 'no 174 vs salto: especializar').
+     * ENCENDIDO otra vez en 0.1.8.3, con la memoria del compilador bajo control
+     * (gxm_cg.cpp: kMinFreeToCompileVs). Se guarda en ajustes.txt.
      */
     static std::atomic<u32> specialize_vs;
 
