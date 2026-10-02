@@ -3092,6 +3092,18 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
         if (next == nullptr || next->link.count > budget_left - done || DueForCheck(*next)) {
             break;
         }
+        /**
+         * Aqui tambien se publica la entrada (0.1.8.3). Un bloque al que solo
+         * se llega por este bucle -- el destino de un enlace que fallo porque
+         * su entrada aun no estaba publicada -- nunca pasaba por arriba de
+         * TryRun, asi que nunca se publicaba y ese enlace fallaba para siempre:
+         * crash.txt de 0.1.8.2, 7.525 enlaces de 19.417 despachos, contra 15.823
+         * de 18.245 en 0.1.8.0 en el mismo punto. No le toca comprobacion, asi
+         * que ya paso (y se cerro en el despacho) la ultima de las iniciales.
+         */
+        if (next->link.entry == 0) {
+            next->link.entry = next->chain_entry;
+        }
         g_local.dispatches++;
         done += RunCompiled(cpu, *next, pages, budget_left - done - next->link.count);
     }
