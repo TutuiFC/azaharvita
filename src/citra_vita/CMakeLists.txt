@@ -91,9 +91,9 @@ target_link_options(azahar PRIVATE
 #
 #     ./build.sh clean && cmake ... -DAZAHAR_EXTENDED_MEMORY=OFF
 #
-# y el VPK vuelve a ser exactamente el de antes: AZAHAR_HEAP_MB se ha dejado en
-# 216, que cabe tambien en el presupuesto normal (ver el CMakeLists raiz), asi
-# que revertir el atributo NO obliga a tocar nada mas.
+# y ademas -DAZAHAR_HEAP_MB=216: desde 0.1.8.0 el heap es de 264 MB, que solo
+# cabe con el modo ampliado (ver el CMakeLists raiz). Con 216 cabe tambien en el
+# presupuesto normal.
 #
 # Para saber si ha surtido efecto no hace falta adivinar: la pantalla de
 # arranque escribe la memoria de usuario libre y dice "modo ampliado SI/no"

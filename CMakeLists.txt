@@ -131,7 +131,19 @@ set(CITRA_WARNINGS_AS_ERRORS      OFF)
 # (vaciados por falta de sitio) sigue siendo la unica prueba de si se queda
 # corta, y hasta hoy ha salido 0 en todas las medidas. Ampliarla "porque ahora
 # cabe" seria gastar presupuesto sin un numero que lo pida.
-set(AZAHAR_HEAP_MB "216" CACHE STRING "Tamano del heap de la aplicacion en MB")
+#
+# 0.1.8.0: EL REPARTO DEFINITIVO, CON EL NUMERO DE LA CONSOLA. crash.txt de la
+# consola del usuario, en todas las sesiones desde 0.1.6.x: "memoria: usuario
+# 344 MB totales / 128 MB libres, heap 216 MB, ... modo ampliado SI". Y la
+# entrada al 3D de Zafiro Alfa (0.1.7.8 y 0.1.7.9) muere con bad_alloc DENTRO
+# del compilador de shaders: falta heap, no presupuesto. Se pasan 48 de esos
+# 128 MB libres al heap (216 -> 264) y quedan ~80 MB para GXM, vita2d, el JIT y
+# el sistema, que se reservan despues de medir esa linea.
+#
+# PRECIO: 264 MB ya NO caben en el presupuesto normal de ~256 MB. Si algun dia
+# este VPK no arranca (pantalla negra y vuelta a la LiveArea), es que el modo
+# ampliado no se ha concedido: se vuelve a 216 con -DAZAHAR_HEAP_MB=216.
+set(AZAHAR_HEAP_MB "264" CACHE STRING "Tamano del heap de la aplicacion en MB")
 set(AZAHAR_TRANS_CACHE_MB "8" CACHE STRING "Cache de traduccion del interprete en MB")
 
 add_compile_definitions(

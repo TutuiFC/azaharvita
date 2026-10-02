@@ -73,17 +73,53 @@ bool g_tracking = false;
 std::unordered_set<void*> g_compile_allocs;
 u32 g_generation = 0;
 
+/**
+ * PRESUPUESTO DE UNA COMPILACION (0.1.8.0).
+ *
+ * Volcado de 0.1.7.9 en Zafiro Alfa: el heap se acaba DENTRO de
+ * sceShaccCgCompileProgram, compilando un shader de vertices especializado.
+ * CgAlloc apuntaba el bloque en g_compile_allocs, ese insert lanzo bad_alloc,
+ * y una excepcion de C++ no puede atravesar libshacccg (es C): std::unexpected
+ * y abort(), con la partida entera.
+ *
+ * Ahora CgAlloc no lanza nunca, y cada compilacion tiene un tope: lo que haya
+ * libre en el heap al empezar menos kEmulatorReserve, que se deja para la
+ * emulacion. Pasado el tope el compilador recibe NULL, que es lo que devolveria
+ * malloc sin memoria: la compilacion falla, el lote se queda en la CPU y la
+ * partida sigue.
+ */
+constexpr std::size_t kEmulatorReserve = 24u * 1024u * 1024u;
+std::size_t g_compile_bytes = 0;
+std::size_t g_compile_budget = static_cast<std::size_t>(-1);
+bool g_compile_over_budget = false;
+
 void* CgAlloc(unsigned int size) {
-    void* pointer = std::malloc(size);
-    if (g_tracking && pointer != nullptr) {
-        g_compile_allocs.insert(pointer);
+    if (g_tracking && g_compile_bytes + size > g_compile_budget) {
+        g_compile_over_budget = true;
+        return nullptr;
     }
+    void* pointer = std::malloc(size);
+    if (pointer == nullptr || !g_tracking) {
+        return pointer;
+    }
+    try {
+        g_compile_allocs.insert(pointer);
+    } catch (...) {
+        std::free(pointer);
+        g_compile_over_budget = true;
+        return nullptr;
+    }
+    g_compile_bytes += malloc_usable_size(pointer);
     return pointer;
 }
 
 void CgFree(void* pointer) {
-    if (pointer != nullptr) {
-        g_compile_allocs.erase(pointer);
+    if (pointer == nullptr) {
+        return;
+    }
+    if (g_compile_allocs.erase(pointer) != 0) {
+        const std::size_t size = malloc_usable_size(pointer);
+        g_compile_bytes = g_compile_bytes > size ? g_compile_bytes - size : 0;
     }
     std::free(pointer);
 }
@@ -520,10 +556,39 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     options.entryFunctionName = "main";
 
     const std::size_t heap_before = HeapInUse();
+    {
+        const std::size_t total = _newlib_heap_size_user;
+        const std::size_t free_now = total > heap_before ? total - heap_before : 0;
+        if (free_now <= kEmulatorReserve + 4u * 1024u * 1024u) {
+            static u32 skip_notes = 0;
+            if (skip_notes < 4) {
+                skip_notes++;
+                Common::VitaNote("gxm mem", fmt::format("{}: sin compilar, solo quedan {} KB de "
+                                                        "heap",
+                                                        name, free_now / 1024)
+                                                .c_str());
+            }
+            return nullptr;
+        }
+        g_compile_budget = free_now - kEmulatorReserve;
+    }
+    g_compile_bytes = 0;
+    g_compile_over_budget = false;
     g_compile_allocs.clear();
     g_tracking = true;
     const SceShaccCgCompileOutput* output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     g_tracking = false;
+    g_compile_budget = static_cast<std::size_t>(-1);
+    if (g_compile_over_budget) {
+        static u32 budget_notes = 0;
+        if (budget_notes < 4) {
+            budget_notes++;
+            Common::VitaNote("gxm mem", fmt::format("{}: el compilador agoto su presupuesto "
+                                                    "({} KB); la compilacion se corta",
+                                                    name, g_compile_bytes / 1024)
+                                            .c_str());
+        }
+    }
     if (output == nullptr || output->programData == nullptr) {
         /**
          * EL MENSAJE DEL COMPILADOR VA A crash.txt, no solo al registro.
@@ -585,6 +650,12 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
             // Ese codigo no se vuelve a mandar (ni en otra sesion) y el
             // compilador se recarga limpio para el siguiente.
             StoreBadSource(BadSource{key.hash_city, key.hash_fnv});
+            RecoverFromInternalError();
+        } else if (g_compile_over_budget) {
+            // Sin memoria a mitad de compilacion su estado puede quedar a
+            // medias: se descarga y se recarga limpio, como tras un error
+            // interno, pero el codigo NO va a la lista negra (no lo rompio el
+            // shader, sino la falta de heap en ese momento).
             RecoverFromInternalError();
         } else {
             // Un error normal (de sintaxis) deja el compilador sano: solo se
