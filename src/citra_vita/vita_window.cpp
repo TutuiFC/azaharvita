@@ -754,11 +754,13 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                     stats_arm_rest_ms = rest > 0.0 ? rest : 0.0;
                 }
                 {
-                    // Tres veces, cada 10 s, a crash.txt: los datos llegan
-                    // aunque no haya captura (0.1.6.3).
+                    // Cada 10 s a crash.txt: los datos llegan aunque no haya
+                    // captura (0.1.6.3). Nueve veces desde 0.1.8.3: con tres
+                    // solo salian los primeros 30 s, que son la carga y no el
+                    // juego (crash.txt de 0.1.8.2).
                     static u32 arm_ticks = 0;
                     static u32 arm_notes = 0;
-                    if (++arm_ticks % 10 == 0 && arm_notes < 3) {
+                    if (++arm_ticks % 10 == 0 && arm_notes < 9) {
                         arm_notes++;
                         Common::VitaNote(
                             "arm desglose",
@@ -874,9 +876,13 @@ void EmuWindow_Vita::DrawStatsOverlay() {
              * que presenta: una por segundo subio "ovl" de 2 a 17 ms por
              * fotograma en 0.1.5.7 (202 notas en una sesion).
              */
-            static u32 gx_notes_left = 5;
-            if (gx_notes_left > 0) {
-                gx_notes_left--;
+            // 0.1.8.3: cada 10 s y seis veces, no los cinco primeros segundos:
+            // esos son el menu y la carga, y el shader que importa (el de piel
+            // en el 3D) no salia nunca (crash.txt de 0.1.8.2).
+            static u32 gx_ticks = 0;
+            static u32 gx_notes = 0;
+            if (++gx_ticks % 10 == 0 && gx_notes < 6) {
+                gx_notes++;
                 struct {
                     u32 op;
                     unsigned long long count;

@@ -36,10 +36,10 @@ namespace VitaFrontend {
  * viene 0.1.5.0. Las versiones anteriores (0.1.0.1 a 0.1.0.44) se quedan con
  * su nombre en elf/, y ninguna choca con las nuevas.
  */
-constexpr char kVersion[] = "version 0.1.8.2";
+constexpr char kVersion[] = "version 0.1.8.3";
 
-/// La misma version con el nombre delante, para el overlay ("Azahar 0.1.8.2").
-constexpr char kOverlayBuild[] = "Azahar 0.1.8.2";
+/// La misma version con el nombre delante, para el overlay ("Azahar 0.1.8.3").
+constexpr char kOverlayBuild[] = "Azahar 0.1.8.3";
 
 /**
  * Y AHORA EL COMPILADOR VIGILA QUE LAS DOS DIGAN LO MISMO.
