@@ -618,11 +618,18 @@ struct RasterizerGXM::Surface {
     /// Su contenido ya se lo ha llevado una copia de pantalla en la GPU y no
     /// ha cambiado desde (0.1.8.7): FlushForPresent no la vuelca.
     bool copied = false;
-    /// Un relleno de color del invitado que todavia no se ha pintado: lo hace
-    /// la siguiente escena (0.1.9.6, ver AccelerateFill). clear_texel son los
-    /// cuatro bytes del pixel tal como van en color_buffer.
+    /// Rellenos de color del invitado que todavia no se han pintado: los hace
+    /// la siguiente escena (0.1.9.6, ver AccelerateFill). Cada uno es una
+    /// franja de filas y los cuatro bytes del pixel tal como van en
+    /// color_buffer.
+    struct PendingClear {
+        u32 first_row = 0;
+        u32 rows = 0;
+        u32 texel = 0;
+    };
     bool clear_pending = false;
-    u32 clear_texel = 0;
+    u32 clear_count = 0;
+    std::array<PendingClear, 4> clears{};
     /// El invitado ha cambiado este framebuffer por otro camino (un relleno de
     /// color, una transferencia): hay que volver a leerlo antes de dibujar.
     bool needs_reload = false;
@@ -2209,6 +2216,7 @@ void RasterizerGXM::WriteBack(Surface& surface) {
 void RasterizerGXM::Reload(Surface& surface) {
     surface.copied = false;
     surface.clear_pending = false;
+    surface.clear_count = 0;
     // Lo que lee del invitado tiene que estar escrito: una copia de pantalla
     // en la GPU que pise el tramo, primero a la memoria.
     MaterializeCopies(surface.guest_address, surface.guest_stride * surface.height);
@@ -2812,15 +2820,40 @@ bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
     }
     const PAddr start = config.GetStartAddress();
     const PAddr end = config.GetEndAddress();
+    /**
+     * Filas de mosaicos enteras de una superficie (0.1.9.6): Zafiro Alfa
+     * dibuja las dos pantallas en franjas distintas de la misma superficie de
+     * 256x512, y puede borrar solo la suya. Nuestra fila y es la fila y del
+     * invitado (CopyTiledGuest no voltea), asi que una franja de filas del
+     * invitado es una franja de filas nuestra.
+     */
     Surface* target = nullptr;
+    u32 first_row = 0;
+    u32 rows = 0;
     for (auto& surface : surfaces) {
-        if (surface->guest_address == start &&
-            start + surface->guest_stride * surface->height == end) {
-            target = surface.get();
-            break;
+        const u32 row_bytes = surface->guest_stride;
+        const PAddr surface_end = surface->guest_address + row_bytes * surface->height;
+        if (row_bytes == 0 || start < surface->guest_address || end > surface_end ||
+            end <= start) {
+            continue;
         }
+        const u32 offset = start - surface->guest_address;
+        const u32 bytes = end - start;
+        if (offset % (row_bytes * 8) != 0 || bytes % (row_bytes * 8) != 0) {
+            continue;
+        }
+        target = surface.get();
+        first_row = offset / row_bytes;
+        rows = bytes / row_bytes;
+        break;
     }
     if (target == nullptr) {
+        return false;
+    }
+    const bool whole = first_row == 0 && rows == target->height;
+    // Una franja deja el resto como estaba: si el invitado iba por delante de
+    // nosotros en ese resto, o ya hay demasiadas franjas apuntadas, software.
+    if (!whole && (target->needs_reload || target->clear_count == target->clears.size())) {
         return false;
     }
     /**
@@ -2876,10 +2909,14 @@ bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
             std::memcpy(guest + offset, &texel, 3);
         }
     }
+    if (whole) {
+        // Todo el color es el relleno: lo de antes ya no cuenta.
+        target->clear_count = 0;
+        target->needs_reload = false;
+        target->dirty = false;
+    }
+    target->clears[target->clear_count++] = {first_row, rows, texel};
     target->clear_pending = true;
-    target->clear_texel = texel;
-    target->needs_reload = false;
-    target->dirty = false;
     target->copied = false;
     // Lo demas que pudiera tener esa memoria, como en el relleno por software.
     DropCopies(start, end - start);
@@ -2889,8 +2926,9 @@ bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
     software.InvalidateRegion(start, end - start);
     gpu_fills.fetch_add(1, std::memory_order_relaxed);
     static bool noted = false;
-    NoteOnce(noted, "gxm relleno", "superficie {:#010x} {}x{} rellenada en la GPU", start,
-             target->width, target->height);
+    NoteOnce(noted, "gxm relleno", "superficie {:#010x} {}x{}, filas {}-{}, rellenada en la GPU",
+             target->guest_address, target->width, target->height, first_row,
+             first_row + rows - 1);
     return true;
 }
 
@@ -2903,22 +2941,12 @@ bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
  */
 void RasterizerGXM::DrawClearQuad(Surface& surface) {
     surface.clear_pending = false;
+    const u32 count = surface.clear_count;
+    surface.clear_count = 0;
     SceGxmTextureFormat tex_format{};
     if (!PresentTextureFormat(surface.gxm_color_format, tex_format)) {
         return;
     }
-    u8* texel = static_cast<u8*>(clear_texels.Data()) + (clear_texel_next % 256) * 16;
-    clear_texel_next++;
-    std::memcpy(texel, &surface.clear_texel, sizeof(u32));
-    SceGxmTexture texture{};
-    if (sceGxmTextureInitLinear(&texture, texel, tex_format, 1, 1, 1) < 0) {
-        return;
-    }
-    sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
-    sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
-    const float half_width = static_cast<float>(surface.width) * 0.5f;
-    const float half_height = static_cast<float>(surface.height) * 0.5f;
-    sceGxmSetViewport(context, half_width, half_width, half_height, -half_height, 0.5f, 0.5f);
     sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_NONE, 0, 0, 0, 0);
     sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
     sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
@@ -2935,9 +2963,27 @@ void RasterizerGXM::DrawClearQuad(Surface& surface) {
     sceGxmSetFragmentProgram(context, blit->fragment_program);
     const u8* quad = static_cast<const u8*>(blit->quad.Data());
     sceGxmSetVertexStream(context, 0, quad);
-    sceGxmSetFragmentTexture(context, blit->texture_unit, &texture);
-    sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
-               quad + 8 * kBlitVertexStride, 4);
+    const float half_width = static_cast<float>(surface.width) * 0.5f;
+    for (u32 i = 0; i < count; i++) {
+        const Surface::PendingClear& clear = surface.clears[i];
+        u8* texel = static_cast<u8*>(clear_texels.Data()) + (clear_texel_next % 256) * 16;
+        clear_texel_next++;
+        std::memcpy(texel, &clear.texel, sizeof(u32));
+        SceGxmTexture texture{};
+        if (sceGxmTextureInitLinear(&texture, texel, tex_format, 1, 1, 1) < 0) {
+            continue;
+        }
+        sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+        // El quad (de -1 a 1) cubre justo las filas de la franja.
+        const float half_rows = static_cast<float>(clear.rows) * 0.5f;
+        sceGxmSetViewport(context, half_width, half_width,
+                          static_cast<float>(clear.first_row) + half_rows, -half_rows, 0.5f,
+                          0.5f);
+        sceGxmSetFragmentTexture(context, blit->texture_unit, &texture);
+        sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
+                   quad + 8 * kBlitVertexStride, 4);
+    }
 }
 
 /// Una escena solo para pintar el relleno (cuando algo va a leer la
@@ -2959,6 +3005,8 @@ void RasterizerGXM::FlushClear(Surface& surface) {
 /// El relleno a mano, para quien vaya a leer color_buffer con la CPU.
 void RasterizerGXM::ApplyClearOnCpu(Surface& surface) {
     surface.clear_pending = false;
+    const u32 count = surface.clear_count;
+    surface.clear_count = 0;
     if (open_surface == &surface) {
         EndScene();
     }
@@ -2966,9 +3014,13 @@ void RasterizerGXM::ApplyClearOnCpu(Surface& surface) {
     u8* const base = static_cast<u8*>(surface.color_buffer.Data());
     const u32 stride = surface.color_stride * surface.rt_bpp;
     alignas(16) u32 row[1024];
-    std::fill_n(row, std::min<u32>(surface.width, 1024), surface.clear_texel);
-    for (u32 y = 0; y < surface.height; y++) {
-        std::memcpy(base + static_cast<std::size_t>(y) * stride, row, surface.width * 4);
+    for (u32 i = 0; i < count; i++) {
+        const Surface::PendingClear& clear = surface.clears[i];
+        std::fill_n(row, std::min<u32>(surface.width, 1024), clear.texel);
+        for (u32 y = clear.first_row; y < clear.first_row + clear.rows && y < surface.height;
+             y++) {
+            std::memcpy(base + static_cast<std::size_t>(y) * stride, row, surface.width * 4);
+        }
     }
 }
 
@@ -4393,6 +4445,7 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
             surface->dirty = false;
             surface->needs_reload = true;
             surface->clear_pending = false;
+            surface->clear_count = 0;
         }
         if (hits_depth) {
             surface->depth_needs_clear = true;
