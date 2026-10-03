@@ -3611,6 +3611,13 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     std::array<u8, 12> stream_of_loader;
     stream_of_loader.fill(0xFF);
     std::array<u8, 12> loader_of_stream{};
+    /// De donde sale cada atributo, para convertirlo si hace falta (0.1.8.5).
+    struct AttributeSource {
+        u8 stream = 0;
+        u8 format = 0;
+        u16 offset = 0;
+    };
+    std::array<AttributeSource, 16> attribute_sources{};
     u32 attribute_count = 0;
     u32 stream_count = 0;
     u64 layout_key = program_key;
@@ -3628,6 +3635,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             gxm_streams[stream_count].indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
             stream_count++;
         }
+        attribute_sources[attribute_count] = {
+            stream_of_loader[location.loader],
+            static_cast<u8>(attributes.GetFormat(attribute)), location.offset};
         SceGxmVertexAttribute& out = gxm_attributes[attribute_count++];
         out.streamIndex = stream_of_loader[location.loader];
         out.offset = location.offset;
@@ -3660,6 +3670,46 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     SceGxmVertexProgram* vertex_program =
         hw_shaders->GetLinked(layout_key, *program, gxm_attributes.data(), attribute_count,
                               gxm_streams.data(), stream_count);
+    /**
+     * DISPOSICION CONVERTIDA (0.1.8.5). crash.txt de 0.1.8.4, Zafiro Alfa: el
+     * shader de piel ya compila especializado, pero GXM rechaza enlazarlo con
+     * los atributos tal como los guarda el 3DS ("crear programa de vertices err
+     * 0x805b0023 (5 atributos, 1 flujos)") y 213 de 246 lotes por segundo
+     * vuelven a la CPU. Esos modelos llevan indices y pesos de huesos en bytes,
+     * con desplazamientos y paso que no son multiplos de 4. Si la disposicion
+     * original no vale, se prueba la mas sencilla que hay: un solo flujo con
+     * todos los atributos en float de 32 bits seguidos y alineados, convertidos
+     * en la CPU solo para los vertices del lote. Los valores son los mismos: la
+     * PICA pasa los enteros a float tal cual, sin normalizar.
+     */
+    bool converted = false;
+    u32 converted_stride = 0;
+    if (vertex_program == nullptr) {
+        u64 converted_key = Common::HashCombine(program_key, 0xF32F32F3ull);
+        for (u32 i = 0; i < attribute_count; i++) {
+            SceGxmVertexAttribute& out = gxm_attributes[i];
+            out.streamIndex = 0;
+            out.offset = static_cast<u16>(converted_stride);
+            out.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+            converted_stride += out.componentCount * 4u;
+            converted_key = Common::HashCombine(
+                converted_key, (static_cast<u64>(out.componentCount) << 16) | out.regIndex);
+        }
+        SceGxmVertexStream converted_stream{};
+        converted_stream.stride = static_cast<u16>(converted_stride);
+        converted_stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+        if (attribute_count > 0) {
+            vertex_program = hw_shaders->GetLinked(converted_key, *program, gxm_attributes.data(),
+                                                   attribute_count, &converted_stream, 1);
+        }
+        if (vertex_program != nullptr) {
+            converted = true;
+            static bool noted_converted = false;
+            NoteOnce(noted_converted, "gxm vs",
+                     "atributos convertidos a float: enlaza ({} atributos, paso {})",
+                     attribute_count, converted_stride);
+        }
+    }
     if (vertex_program == nullptr) {
         NoteSkip(5, "vs enlazar atributos");
         return HwVsReject("vs enlazar atributos");
@@ -3686,6 +3736,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         stream_source[stream] = first;
         stream_bytes[stream] = bytes;
         total_bytes += (bytes + 15u) & ~15u;
+    }
+    if (converted) {
+        total_bytes = (converted_stride * vertex_range + 15u) & ~15u;
     }
     const u32 index_bytes = is_indexed ? ((num_vertices * 2u + 15u) & ~15u) : 0u;
     total_bytes += index_bytes;
@@ -3732,10 +3785,49 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         return HwVsReject("memoria vertices");
     }
     std::array<const u8*, 12> stream_data{};
-    for (u32 stream = 0; stream < stream_count; stream++) {
-        std::memcpy(space, stream_source[stream], stream_bytes[stream]);
-        stream_data[stream] = space;
-        space += (stream_bytes[stream] + 15u) & ~15u;
+    if (converted) {
+        // Un float por componente, en el orden de gxm_attributes (ver arriba).
+        float* out = reinterpret_cast<float*>(space);
+        for (u32 v = 0; v < vertex_range; v++) {
+            for (u32 i = 0; i < attribute_count; i++) {
+                const AttributeSource& source = attribute_sources[i];
+                const u32 stride =
+                    attributes.attribute_loaders[loader_of_stream[source.stream]].byte_count;
+                const u8* in = stream_source[source.stream] + v * stride + source.offset;
+                const u32 components = gxm_attributes[i].componentCount;
+                for (u32 c = 0; c < components; c++) {
+                    switch (static_cast<PipelineRegs::VertexAttributeFormat>(source.format)) {
+                    case PipelineRegs::VertexAttributeFormat::BYTE:
+                        *out++ = static_cast<float>(static_cast<s8>(in[c]));
+                        break;
+                    case PipelineRegs::VertexAttributeFormat::UBYTE:
+                        *out++ = static_cast<float>(in[c]);
+                        break;
+                    case PipelineRegs::VertexAttributeFormat::SHORT: {
+                        s16 value;
+                        std::memcpy(&value, in + c * 2, sizeof(value));
+                        *out++ = static_cast<float>(value);
+                        break;
+                    }
+                    default: {
+                        float value;
+                        std::memcpy(&value, in + c * 4, sizeof(value));
+                        *out++ = value;
+                        break;
+                    }
+                    }
+                }
+            }
+        }
+        stream_data[0] = space;
+        space += (converted_stride * vertex_range + 15u) & ~15u;
+        stream_count = 1;
+    } else {
+        for (u32 stream = 0; stream < stream_count; stream++) {
+            std::memcpy(space, stream_source[stream], stream_bytes[stream]);
+            stream_data[stream] = space;
+            space += (stream_bytes[stream] + 15u) & ~15u;
+        }
     }
     const u16* draw_indices = static_cast<const u16*>(index_buffer.Data());
     if (is_indexed) {
