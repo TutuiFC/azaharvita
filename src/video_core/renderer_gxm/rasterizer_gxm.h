@@ -437,6 +437,13 @@ private:
     const char* status = "sin inicializar";
     SceGxmContext* context = nullptr;
     SceGxmShaderPatcher* patcher = nullptr;
+    /// El parcheador propio (0.1.9.3) y sus tres bloques: buffer, USSE de
+    /// vertices y USSE de fragmentos. Ver CreateShaderPatcher.
+    SceGxmShaderPatcher* own_patcher = nullptr;
+    std::array<SceUID, 3> patcher_blocks{-1, -1, -1};
+    std::array<void*, 3> patcher_memory{};
+    bool CreateShaderPatcher();
+    void DestroyShaderPatcher();
 
     std::unique_ptr<PipelineCache> pipelines;
     std::unique_ptr<TextureCache> textures;

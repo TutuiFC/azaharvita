@@ -1811,6 +1811,114 @@ RasterizerGXM::~RasterizerGXM() {
     surfaces.clear();
     vertex_buffer = Allocation{};
     index_buffer = Allocation{};
+    DestroyShaderPatcher();
+}
+
+namespace {
+void* PatcherHostAlloc(void* /*user_data*/, SceSize size) {
+    return std::malloc(size);
+}
+void PatcherHostFree(void* /*user_data*/, void* memory) {
+    std::free(memory);
+}
+} // Anonymous namespace
+
+/**
+ * UN PARCHEADOR DE SHADERS PROPIO Y GRANDE (0.1.9.3).
+ *
+ * El de vita2d es para unos pocos programas 2D: su memoria USSE (donde vive el
+ * codigo de cada programa de vertices y de fragmentos ya enlazado) es fija y
+ * pequena, sin funciones para crecer. crash.txt de 0.1.9.2 en Zafiro Alfa:
+ * pasado el titulo, TODO programa de vertices nuevo falla con 0x805b0023 --
+ * tambien uno de dos entradas en float, asi que no eran los atributos -- y
+ * despues tambien los de fragmentos ("gxm skip: programa de fragmentos", el
+ * texto sin dibujar). Es el patron de quedarse sin esa memoria. Este es solo
+ * del rasterizador; el presentador sigue con el de vita2d.
+ */
+bool RasterizerGXM::CreateShaderPatcher() {
+    constexpr SceSize kBufferBytes = 1u * 1024u * 1024u;
+    constexpr SceSize kVertexUsseBytes = 2u * 1024u * 1024u;
+    constexpr SceSize kFragmentUsseBytes = 2u * 1024u * 1024u;
+    constexpr std::array<SceSize, 3> sizes{kBufferBytes, kVertexUsseBytes, kFragmentUsseBytes};
+    const auto fail = [this](const char* what, int rc) {
+        NoteFmt("gxm init", "parcheador propio: {} err {:#x}; se usa el de vita2d", what,
+                static_cast<u32>(rc));
+        DestroyShaderPatcher();
+        return false;
+    };
+    std::array<void*, 3> bases{};
+    for (u32 i = 0; i < 3; i++) {
+        const SceUID uid = sceKernelAllocMemBlock("azahar_gxm_patcher",
+                                                  SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE,
+                                                  sizes[i], nullptr);
+        if (uid < 0) {
+            return fail("memoria", uid);
+        }
+        patcher_blocks[i] = uid;
+        if (sceKernelGetMemBlockBase(uid, &bases[i]) < 0) {
+            return fail("base", 0);
+        }
+    }
+    unsigned int vertex_offset = 0;
+    unsigned int fragment_offset = 0;
+    // patcher_memory solo guarda lo ya mapeado: es lo que se desmapea.
+    int rc = sceGxmMapMemory(bases[0], sizes[0],
+                             static_cast<SceGxmMemoryAttribFlags>(SCE_GXM_MEMORY_ATTRIB_RW));
+    if (rc < 0) {
+        return fail("mapear buffer", rc);
+    }
+    patcher_memory[0] = bases[0];
+    rc = sceGxmMapVertexUsseMemory(bases[1], sizes[1], &vertex_offset);
+    if (rc < 0) {
+        return fail("mapear usse de vertices", rc);
+    }
+    patcher_memory[1] = bases[1];
+    rc = sceGxmMapFragmentUsseMemory(bases[2], sizes[2], &fragment_offset);
+    if (rc < 0) {
+        return fail("mapear usse de fragmentos", rc);
+    }
+    patcher_memory[2] = bases[2];
+    SceGxmShaderPatcherParams params{};
+    params.hostAllocCallback = &PatcherHostAlloc;
+    params.hostFreeCallback = &PatcherHostFree;
+    params.bufferMem = patcher_memory[0];
+    params.bufferMemSize = sizes[0];
+    params.vertexUsseMem = patcher_memory[1];
+    params.vertexUsseMemSize = sizes[1];
+    params.vertexUsseOffset = vertex_offset;
+    params.fragmentUsseMem = patcher_memory[2];
+    params.fragmentUsseMemSize = sizes[2];
+    params.fragmentUsseOffset = fragment_offset;
+    rc = sceGxmShaderPatcherCreate(&params, &own_patcher);
+    if (rc < 0) {
+        own_patcher = nullptr;
+        return fail("crear", rc);
+    }
+    Common::VitaNote("gxm init", "parcheador propio: 1 MB de buffer y 2+2 MB de USSE");
+    return true;
+}
+
+void RasterizerGXM::DestroyShaderPatcher() {
+    if (own_patcher != nullptr) {
+        sceGxmShaderPatcherDestroy(own_patcher);
+        own_patcher = nullptr;
+    }
+    if (patcher_memory[0] != nullptr) {
+        sceGxmUnmapMemory(patcher_memory[0]);
+    }
+    if (patcher_memory[1] != nullptr) {
+        sceGxmUnmapVertexUsseMemory(patcher_memory[1]);
+    }
+    if (patcher_memory[2] != nullptr) {
+        sceGxmUnmapFragmentUsseMemory(patcher_memory[2]);
+    }
+    patcher_memory = {};
+    for (SceUID& uid : patcher_blocks) {
+        if (uid >= 0) {
+            sceKernelFreeMemBlock(uid);
+            uid = -1;
+        }
+    }
 }
 
 bool RasterizerGXM::EnsureInitialized() {
@@ -1835,7 +1943,7 @@ bool RasterizerGXM::EnsureInitialized() {
         return true;
     }
     context = vita2d_get_context();
-    patcher = vita2d_get_shader_patcher();
+    patcher = CreateShaderPatcher() ? own_patcher : vita2d_get_shader_patcher();
     if (context == nullptr || patcher == nullptr) {
         status = "sin contexto gxm";
         Common::VitaNote("gxm init", "sin contexto");
