@@ -647,7 +647,11 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     g_compiles_since_load++;
     const bool fresh_compiler = g_compiles_since_load == 1;
     g_tracking = true;
-    const SceShaccCgCompileOutput* output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
+    const SceShaccCgCompileOutput* output = nullptr;
+    {
+        const Common::ScopedVitaStage stage{"compilando shader"};
+        output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
+    }
     g_tracking = false;
     g_compile_budget = static_cast<std::size_t>(-1);
     if (g_compile_over_budget) {

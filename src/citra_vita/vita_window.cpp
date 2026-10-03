@@ -511,6 +511,7 @@ void EmuWindow_Vita::PresentScreens() {
     // dibujos y esperar al barrido son tres cosas con costes muy distintos, y
     // sumadas no dicen nada sobre cual hay que arreglar.
     const unsigned long long draw_begin = Common::VitaMicros();
+    const Common::ScopedVitaStage stage{"presentar"};
     vita2d_start_drawing();
     vita2d_clear_screen();
     if (use_gxm) {
@@ -549,6 +550,7 @@ void EmuWindow_Vita::PresentScreens() {
     // Casi todo lo que se mida aqui es la consola PARADA, no trabajo: por eso va
     // en su propio contador y el overlay lo pinta aparte.
     const unsigned long long swap_begin = Common::VitaMicros();
+    Common::vita_stage.store("presentar: swap", std::memory_order_relaxed);
     vita2d_swap_buffers();
     Common::FrameStats::Add(Common::FrameStats::swap_us, swap_begin);
 

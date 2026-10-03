@@ -223,6 +223,28 @@ inline void Reset() {
 /// cualquier momento, incluido antes de main o con el heap agotado.
 void VitaNote(const char* title, const char* detail);
 
+/**
+ * Donde esta ahora el hilo de emulacion, para el vigilante de main.cpp
+ * (0.1.9.0): si el emulador se queda congelado sin crashear, crash.txt dice en
+ * que paso (esperando a la GPU, abriendo una escena, compilando un shader...).
+ * Literales de cadena: el vigilante solo lee el puntero.
+ */
+inline std::atomic<const char*> vita_stage{"-"};
+
+class ScopedVitaStage {
+public:
+    explicit ScopedVitaStage(const char* stage)
+        : previous{vita_stage.exchange(stage, std::memory_order_relaxed)} {}
+    ~ScopedVitaStage() {
+        vita_stage.store(previous, std::memory_order_relaxed);
+    }
+    ScopedVitaStage(const ScopedVitaStage&) = delete;
+    ScopedVitaStage& operator=(const ScopedVitaStage&) = delete;
+
+private:
+    const char* previous;
+};
+
 /// Deja constancia de un assert fallido y termina el proceso.
 ///
 /// El texto del assert no viaja por aqui: lo escribe el propio LOG_CRITICAL del

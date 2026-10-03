@@ -5,6 +5,7 @@
 // Punto de entrada de Azahar en PS Vita.
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <pthread.h>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <typeinfo>
 #include <vector>
 
@@ -1382,6 +1384,36 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
     // los argumentos, lee basura y acaba saltando a una direccion invalida.
     // Es el mismo fallo que tenia sscanf con %zd.
     unsigned int loops = 0;
+    /**
+     * VIGILANTE DE CONGELACIONES (0.1.9.0). En 0.1.8.9, al pulsar A en el
+     * titulo de Zafiro Alfa el emulador se quedaba parado sin crashear y sin
+     * escribir nada mas en crash.txt. Este hilo mira si el bucle avanza; si
+     * pasan 6 segundos (y otra vez a los 30) sin una vuelta, anota en que paso
+     * esta el hilo de emulacion (Common::vita_stage) y los PC de los ARM11.
+     */
+    std::atomic<unsigned int> heartbeat{0};
+    std::atomic<bool> watchdog_stop{false};
+    std::thread watchdog([&heartbeat, &watchdog_stop, &system] {
+        unsigned int last = ~0u;
+        unsigned int still = 0;
+        while (!watchdog_stop.load(std::memory_order_relaxed)) {
+            sceKernelDelayThread(1000 * 1000);
+            const unsigned int now = heartbeat.load(std::memory_order_relaxed);
+            if (now != last) {
+                last = now;
+                still = 0;
+                continue;
+            }
+            still++;
+            if (still == 6 || still == 30) {
+                const std::string text = fmt::format(
+                    "{} s sin avanzar, en '{}' (ciclo {}), pc0 {:#010x} pc1 {:#010x}", still,
+                    Common::vita_stage.load(std::memory_order_relaxed), now,
+                    system.GetCore(0).GetPC(), system.GetCore(1).GetPC());
+                WriteCrashLog("congelado", text.c_str());
+            }
+        }
+    });
 
     bool user_quit = false;
 
@@ -1464,7 +1496,9 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
                 WriteCrashLog("avance", mark);
             }
             loops++;
+            heartbeat.store(loops, std::memory_order_relaxed);
 
+            Common::vita_stage.store("emulando", std::memory_order_relaxed);
             const Core::System::ResultStatus result = system.RunLoop();
             if (result != Core::System::ResultStatus::Success &&
                 result != Core::System::ResultStatus::ShutdownRequested) {
@@ -1495,6 +1529,8 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
         DrawFatalError(font, "Error durante la emulacion",
                        "Excepcion de un tipo no estandar.");
     }
+    watchdog_stop.store(true, std::memory_order_relaxed);
+    watchdog.join();
 
     // Resumen de la cache de traduccion al cerrar la partida (salga como salga:
     // el usuario cerro, o algo de lo de arriba lo corto). Sirve para decidir si

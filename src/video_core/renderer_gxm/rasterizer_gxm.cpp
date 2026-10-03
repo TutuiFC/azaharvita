@@ -1906,7 +1906,10 @@ void RasterizerGXM::EndScene() {
                               SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
     sceGxmSetBackStencilFunc(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
                              SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
-    sceGxmEndScene(context, nullptr, nullptr);
+    {
+        const Common::ScopedVitaStage stage{"gxm cerrar escena"};
+        sceGxmEndScene(context, nullptr, nullptr);
+    }
     gpu_scenes.fetch_add(1, std::memory_order_relaxed);
     const bool defer = no_finish_wait.load(std::memory_order_relaxed) != 0;
     if (defer) {
@@ -1953,6 +1956,7 @@ void RasterizerGXM::WaitGpu() {
     // La espera a la GPU, medida aparte: ver Common::FrameStats::finish_us.
     // sceGxmFinish es idempotente: si la GPU ya ha terminado, vuelve ya.
     const unsigned long long finish_begin = Common::VitaMicros();
+    const Common::ScopedVitaStage stage{"gxm espera a la gpu"};
     sceGxmFinish(context);
     Common::FrameStats::Add(Common::FrameStats::finish_us, finish_begin);
 }
@@ -2334,7 +2338,7 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
     params.flags = 0;
     params.width = static_cast<u16>(width);
     params.height = static_cast<u16>(height);
-    params.scenesPerFrame = 1;
+    params.scenesPerFrame = 8;
     params.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
     params.multisampleLocations = 0;
     unsigned int driver_size = 0;
@@ -2375,6 +2379,7 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
     // su pantalla puede no estar escrita en el invitado.
     MaterializeCopy(**slot);
     EndScene();
+    const Common::ScopedVitaStage stage{"gxm copia: rehacer"};
     sceGxmFinish(context);
     gpu_pending = false;
     *slot = std::move(copy);
@@ -2402,6 +2407,7 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, const Surface& source, u32 firs
 
     // Lo dibujado en la superficie se manda antes que el blit que lo lee.
     EndScene();
+    const Common::ScopedVitaStage stage{"gxm copia: blit"};
     const int rc = sceGxmBeginScene(context, 0, copy.render_target, nullptr, nullptr, nullptr,
                                     &copy.color_surface, &copy.depth_surface);
     if (rc != 0) {
@@ -2896,6 +2902,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
          */
         FlushPending();
         // Un blit de copia de pantalla puede seguir leyendo alguna.
+        const Common::ScopedVitaStage stage{"gxm tope de superficies"};
         sceGxmFinish(context);
         gpu_pending = false;
         surfaces.clear();
@@ -3438,6 +3445,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         // superficie preparada ANTES de abrir: el borrado lo hace GXM al cargar
         // los tiles y solo mira la superficie en sceGxmBeginScene.
         ClearDepthIfNeeded(*surface);
+        const Common::ScopedVitaStage stage{"gxm abrir escena"};
         const int scene_rc =
             sceGxmBeginScene(context, 0, surface->render_target, nullptr, nullptr, nullptr,
                              &surface->color_surface, &surface->depth_surface);
