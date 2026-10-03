@@ -473,9 +473,10 @@ void RecoverFromInternalError() {
     }
     // Tope: si un shader de FRAGMENTOS rompiera el compilador el solo, cada
     // recarga lo reintentaria (ver PipelineCache::Get) y se romperia otra vez.
-    // Con la lista negra (arriba) el mismo codigo ya no vuelve, asi que el
-    // tope sube de 3 a 16: cada recarga cuesta una carga de modulo, no mas.
-    constexpr u32 kMaxRecoveries = 16;
+    // Con la lista negra (arriba) el mismo codigo ya no vuelve. 0.1.8.5: de 16
+    // a 8, porque desde entonces cada recarga deja sin devolver la memoria de
+    // la compilacion rota (ver abajo) y eso tiene que quedar acotado.
+    constexpr u32 kMaxRecoveries = 8;
     if (g_generation >= kMaxRecoveries) {
         g_compile_allocs.clear();
         g_live_bytes = 0;
