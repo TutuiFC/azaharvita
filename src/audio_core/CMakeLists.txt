@@ -50,6 +50,24 @@ endif()
 
 create_target_directory_groups(audio_core)
 
+# Vita (0.1.8.5): el DSP del 3DS se emula en el hilo de emulacion, en cada tick
+# de audio (cada ~5 ms emulados): mezcla de 24 fuentes, filtros, interpolacion
+# y decodificacion AAC. Todo iba a -Os como el resto del proyecto, y crash.txt
+# de 0.1.8.4 midio "dsp" hasta 9.4 ms por vblank en Zafiro Alfa. El estirado y
+# el remuestreo corren en el hilo de salida, pero cuestan CPU igual.
+set_source_files_properties(
+    hle/hle.cpp
+    hle/source.cpp
+    hle/mixers.cpp
+    hle/filter.cpp
+    hle/decoder.cpp
+    hle/aac_decoder.cpp
+    interpolate.cpp
+    time_stretch.cpp
+    dsp_interface.cpp
+    PROPERTIES COMPILE_OPTIONS "-O3"
+)
+
 target_link_libraries(audio_core PUBLIC citra_common citra_core)
 target_link_libraries(audio_core PRIVATE faad2 SoundTouch teakra)
 

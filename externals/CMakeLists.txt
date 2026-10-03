@@ -152,11 +152,16 @@ set(INTEGER_SAMPLES OFF CACHE BOOL "" FORCE)
 set(SOUNDSTRETCH    OFF CACHE BOOL "" FORCE)
 set(SOUNDTOUCH_DLL  OFF CACHE BOOL "" FORCE)
 add_subdirectory(soundtouch EXCLUDE_FROM_ALL)
+# Vita (0.1.8.5): el estirado del audio corre en cada bloque de salida.
+target_compile_options(SoundTouch PRIVATE -O3)
 
 # ---------------------------------------------------------------------------
 # faad2 (decodificador AAC para el DSP)
 # ---------------------------------------------------------------------------
 add_subdirectory(faad2 EXCLUDE_FROM_ALL)
+# Vita (0.1.8.5): la musica de muchos juegos es AAC y se decodifica en el hilo
+# de emulacion (ver src/audio_core/CMakeLists.txt). -O3 en vez del -Os global.
+target_compile_options(faad2 PRIVATE -O3)
 
 # libyuv se omite: upstream solo lo usa en Android.
 
