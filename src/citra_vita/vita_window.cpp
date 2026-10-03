@@ -170,42 +170,18 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
             const bool current =
                 SwRenderer::FrameSkip::half_resolution.load(std::memory_order_relaxed);
             SwRenderer::FrameSkip::half_resolution.store(!current, std::memory_order_relaxed);
+            Common::VitaNote("tecla", current ? "L+R: resolucion 1x" : "L+R: resolucion 0.5x");
         }
         return;
     }
     halfres_combo_held = false;
 
-    // SELECT + ARRIBA recorre los modos de ablacion, que saltan partes del
-    // bucle de pixeles para medir su coste con el FPS de la escena real. Es un
-    // modo de diagnostico que rompe la imagen a proposito.
-    const bool ablate = select && ((buttons & SCE_CTRL_UP) != 0);
-    if (ablate) {
-        if (!ablation_combo_held) {
-            ablation_combo_held = true;
-            u32 value = SwRenderer::Ablation::mode.load(std::memory_order_relaxed);
-            value = (value >= SwRenderer::Ablation::kMax) ? 0 : value + 1;
-            SwRenderer::Ablation::mode.store(value, std::memory_order_relaxed);
-        }
-        return;
-    }
-    ablation_combo_held = false;
-
-    // SELECT + ABAJO recorre la ablacion del camino de GPU: manda a software
-    // los lotes que usen una caracteristica concreta (luz, scissor, plantilla,
-    // texturas) o todos. Sirve para averiguar CUAL de las traducciones a GXM
-    // rompe la imagen sin compilar una version por hipotesis. Ver
-    // Gxm::RasterizerGXM::Ablation.
-    const bool gxm_ablate = select && ((buttons & SCE_CTRL_DOWN) != 0);
-    if (gxm_ablate) {
-        if (!gxm_ablation_combo_held) {
-            gxm_ablation_combo_held = true;
-            u32 value = Gxm::RasterizerGXM::Ablation::mode.load(std::memory_order_relaxed);
-            value = (value >= Gxm::RasterizerGXM::Ablation::kMax) ? 0 : value + 1;
-            Gxm::RasterizerGXM::Ablation::mode.store(value, std::memory_order_relaxed);
-        }
-        return;
-    }
-    gxm_ablation_combo_held = false;
+    /**
+     * SELECT + ARRIBA y SELECT + ABAJO ya no cambian la ablacion (0.1.8.7). Eran
+     * modos de diagnostico que rompen la imagen o mandan lotes a software a
+     * proposito, y en la partida de 0.1.8.6 se activo uno sin querer: el 3D de
+     * Zafiro Alfa cayo a 1 FPS con "gxm skip: ablacion" en crash.txt.
+     */
 
     // SELECT + DERECHA enciende y apaga el JIT del ARM11 (0.1.4.8), para
     // comparar en la misma escena con y sin el. Ver arm_dyncom_jit.h.
@@ -215,6 +191,8 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
             jit_combo_held = true;
             const u32 current = Core::ArmJit::mode.load(std::memory_order_relaxed);
             Core::ArmJit::mode.store(current != 0 ? 0 : 1, std::memory_order_relaxed);
+            Common::VitaNote("tecla", current != 0 ? "SELECT+DERECHA: JIT apagado"
+                                                   : "SELECT+DERECHA: JIT encendido");
         }
         return;
     }
@@ -230,6 +208,8 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
             if (system.IsPoweredOn()) {
                 audio_stretching = !audio_stretching;
                 system.DSP().EnableStretching(audio_stretching);
+                Common::VitaNote("tecla", audio_stretching ? "SELECT+IZQUIERDA: sonido estirado"
+                                                           : "SELECT+IZQUIERDA: sonido directo");
             }
         }
         return;
@@ -247,6 +227,8 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
         if (!overlay_combo_held) {
             overlay_combo_held = true;
             stats_overlay_visible = !stats_overlay_visible;
+            Common::VitaNote("tecla", stats_overlay_visible ? "SELECT+TRIANGULO: overlay ON"
+                                                            : "SELECT+TRIANGULO: overlay OFF");
         }
         return;
     }
@@ -273,6 +255,9 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
         value--;
     }
     SwRenderer::FrameSkip::interval.store(value, std::memory_order_relaxed);
+    Common::VitaNote("tecla", fmt::format("SELECT+{}: salto de fotogramas {}", up ? "R" : "L",
+                                          value)
+                                  .c_str());
 }
 
 void EmuWindow_Vita::UpdateTouch() {
@@ -1565,7 +1550,6 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     //   set = % del tiempo en preparar el triangulo
     //   esp = % esperando a los hilos (raster en paralelo)
     //   un  = % rasterizando en el propio hilo (triangulos pequenos)
-    // Y debajo, el modo de ablacion vigente (SELECT+ARRIBA lo cambia).
     const auto append_labeled_percent = [](char* out, std::size_t& n, const char* label,
                                            double value) {
         for (std::size_t i = 0; label[i] != '\0'; i++) {
@@ -1804,36 +1788,6 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         line_sh[n] = '\0';
     }
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 524, 0xFF60FFC0, 0.8f, line_sh);
-
-    const u32 ablation_mode = SwRenderer::Ablation::mode.load(std::memory_order_relaxed);
-    char line_abl[40] = "abl ";
-    std::size_t nab = 4;
-    nab += AppendUInt(line_abl + nab, ablation_mode);
-    line_abl[nab++] = ' ';
-    const char* ablation_name = SwRenderer::Ablation::Name(ablation_mode);
-    for (std::size_t i = 0; ablation_name[i] != '\0' && nab < sizeof(line_abl) - 1; i++) {
-        line_abl[nab++] = ablation_name[i];
-    }
-    line_abl[nab] = '\0';
-    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 434,
-                         ablation_mode == SwRenderer::Ablation::kNormal ? 0xFF80D0FF : 0xFF40C0FF,
-                         0.8f, line_abl);
-
-    // La del camino de GPU, justo debajo y con el mismo formato.
-    const u32 gxm_mode = Gxm::RasterizerGXM::Ablation::mode.load(std::memory_order_relaxed);
-    char line_gabl[40] = "gabl ";
-    std::size_t ngab = 5;
-    ngab += AppendUInt(line_gabl + ngab, gxm_mode);
-    line_gabl[ngab++] = ' ';
-    const char* gxm_name = Gxm::RasterizerGXM::Ablation::Name(gxm_mode);
-    for (std::size_t i = 0; gxm_name[i] != '\0' && ngab < sizeof(line_gabl) - 1; i++) {
-        line_gabl[ngab++] = gxm_name[i];
-    }
-    line_gabl[ngab] = '\0';
-    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 446,
-                         gxm_mode == Gxm::RasterizerGXM::Ablation::kNormal ? 0xFF80D0FF
-                                                                          : 0xFF40C0FF,
-                         0.8f, line_gabl);
 }
 
 } // namespace VitaFrontend

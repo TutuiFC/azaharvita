@@ -140,10 +140,6 @@ private:
     bool frameskip_combo_held = false;
     /// Igual para L+R, que enciende y apaga la media resolucion.
     bool halfres_combo_held = false;
-    /// Y para SELECT+ARRIBA, que recorre los modos de ablacion (diagnostico).
-    bool ablation_combo_held = false;
-    /// Igual que el anterior pero para la ablacion del camino de GPU.
-    bool gxm_ablation_combo_held = false;
     /// SELECT + DERECHA: JIT del ARM11 encendido/apagado.
     bool jit_combo_held = false;
     /// SELECT + IZQUIERDA: estirado de audio. Empieza encendido (main.cpp).
