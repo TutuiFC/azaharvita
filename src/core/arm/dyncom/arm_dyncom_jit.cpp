@@ -2188,17 +2188,104 @@ private:
         FlushCachedRegs();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
-        e.Mov32(R0, pc);
-        e.StrImm(R0, kCpu, RegOffset(15));
         int index = -1;
         DecodeARMInstruction(inst, &index); // una vez, al compilar (0.1.8.5)
+        const bool inline_path = !check_mode && VfpTransferInlinable(inst, index);
+        u32 to_done = 0;
+        if (inline_path) {
+            to_done = VfpTransferInline(inst, index);
+        }
+        e.Mov32(R0, pc);
+        e.StrImm(R0, kCpu, RegOffset(15));
         e.MovReg(R0, kCpu);
         e.Mov32(R1, inst);
         e.Mov32(R2, static_cast<u32>(index));
         e.Call(check_mode ? reinterpret_cast<const void*>(&CheckVfpTransfer)
                           : reinterpret_cast<const void*>(&HelperVfpTransfer));
+        if (inline_path) {
+            e.PatchBranch(to_done, e.Position());
+        }
         e.MsrFlags(kT0);
         ReloadCachedRegs();
+    }
+
+    /// El base no es el PC (ese lee Reg[15] + 8) y hay algo que copiar.
+    static bool VfpTransferInlinable(u32 inst, int index) {
+        const bool stack = index == kVfpVpush || index == kVfpVpop;
+        const u32 rn = stack ? 13 : Bits(inst, 16, 19);
+        const bool single = Bits(inst, 8, 8) == 0;
+        const u32 regs = single ? Bits(inst, 0, 7) : Bits(inst, 1, 7);
+        return rn != 15 && regs != 0;
+    }
+
+    /**
+     * VPUSH/VPOP/VSTM/VLDM EN LINEA (0.1.8.7). crash.txt de 0.1.8.6 en el 3D
+     * de Zafiro Alfa: "lento" 8 ms por vblank con ~6.500 llamadas, casi todas
+     * estas (los d8-d15 que guarda y recupera cada funcion con coma flotante):
+     * una llamada a C y un ReadMemory32/WriteMemory32 por palabra.
+     *
+     * Camino rapido con EXACTAMENTE las cuentas de VfpTransfer: la primera
+     * direccion y el base nuevo salen del mismo inmediato (imm32, que en
+     * FSTMX/FLDMX lleva una palabra de mas que no se copia), y las palabras van
+     * seguidas en ExtReg (s(d+i), o d(d+i) en ExtReg[2(d+i)] y [2(d+i)+1]).
+     * Solo si el tramo entero esta alineado a 4 y cae en UNA pagina con
+     * puntero; si no, la funcion de siempre, que va justo detras. La escritura
+     * del base, despues de los accesos, como alli.
+     *
+     * Entra con la cache volcada y los flags del juego en kT0. Devuelve el
+     * salto a parchear al final (despues de la llamada lenta).
+     */
+    u32 VfpTransferInline(u32 inst, int index) {
+        const bool push = index == kVfpVpush;
+        const bool pop = index == kVfpVpop;
+        const bool single = Bits(inst, 8, 8) == 0;
+        const u32 d = single ? ((Bits(inst, 12, 15) << 1) | Bits(inst, 22, 22))
+                             : (Bits(inst, 12, 15) | (Bits(inst, 22, 22) << 4));
+        const s32 imm32 = static_cast<s32>(Bits(inst, 0, 7) << 2);
+        const u32 regs = single ? Bits(inst, 0, 7) : Bits(inst, 1, 7);
+        const u32 words = single ? regs : regs * 2;
+        const u32 first_ext = single ? d : d * 2;
+        const u32 rn = (push || pop) ? 13 : Bits(inst, 16, 19);
+        const bool add = Bits(inst, 23, 23) == 1;
+        const bool load = pop || index == kVfpVldm;
+        const bool writeback = push || pop || Bits(inst, 21, 21) == 1;
+        const s32 first = (push || (!pop && !add)) ? -imm32 : 0;
+        const s32 delta = (push || (!pop && !add)) ? -imm32 : imm32;
+
+        std::vector<u32> slow_jumps;
+        e.LdrImm(kRn, kCpu, RegOffset(rn)); // base original
+        AddConst(kRs, kRn, first);          // primera direccion
+        e.Emit(0xE3100003u | (kRs << 16));  // TST kRs, #3
+        slow_jumps.push_back(e.BranchPlaceholder(kCondNe));
+        AddConst(kRm, kRs, 4 * static_cast<s32>(words) - 4); // ultima palabra
+        e.Emit(0xE0200000u | (kRm << 16) | (kRm << 12) | kRs); // EOR kRm, kRm, kRs
+        e.Emit(0xE1B00620u | (kRm << 12) | kRm);               // LSRS kRm, kRm, #12
+        slow_jumps.push_back(e.BranchPlaceholder(kCondNe));    // dos paginas
+        e.LsrImm(kRm, kRs, 12);
+        e.LdrRegLsl2(kT1, kPages, kRm);
+        e.CmpImm0(kT1);
+        slow_jumps.push_back(e.BranchPlaceholder(kCondEq)); // sin puntero
+        e.Ubfx(kRm, kRs, 0, 12);
+        e.AddReg(kT1, kT1, kRm); // kT1 = puntero a la primera palabra
+
+        for (u32 k = 0; k < words; k++) {
+            if (load) {
+                e.LdrImm(kRd, kT1, 4 * k);
+                e.StrImm(kRd, kCpu, ExtOffset(first_ext + k));
+            } else {
+                e.LdrImm(kRd, kCpu, ExtOffset(first_ext + k));
+                e.StrImm(kRd, kT1, 4 * k);
+            }
+        }
+        if (writeback) {
+            AddConst(kRm, kRn, delta);
+            e.StrImm(kRm, kCpu, RegOffset(rn));
+        }
+        const u32 to_done = e.BranchPlaceholder(kAlways);
+        for (const u32 jump : slow_jumps) {
+            e.PatchBranch(jump, e.Position());
+        }
+        return to_done;
     }
 
     /// LDM/STM: una llamada a la misma logica que el interprete. El PC del
