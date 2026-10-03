@@ -471,20 +471,26 @@ void RecoverFromInternalError() {
     if (g_module < 0) {
         return;
     }
-    // Tope: si un shader de FRAGMENTOS rompiera el compilador el solo, cada
-    // recarga lo reintentaria (ver PipelineCache::Get) y se romperia otra vez.
-    // Con la lista negra (arriba) el mismo codigo ya no vuelve. 0.1.8.5: de 16
-    // a 8, porque desde entonces cada recarga deja sin devolver la memoria de
-    // la compilacion rota (ver abajo) y eso tiene que quedar acotado.
-    constexpr u32 kMaxRecoveries = 8;
+    /**
+     * Dos topes (0.1.8.8). Con 0.1.8.7 se llego al unico que habia (8) en el 3D
+     * de Zafiro Alfa y el compilador se quedaba cargado y ROTO: tampoco
+     * compilaban los shaders de fragmentos y casi todo se rasterizaba por
+     * software ("vs compilador roto", ts 5436 contra tg 66). Ahora, a partir de
+     * kVsRecoveries recargas, se dejan de traducir shaders de vertices (son
+     * los que lo rompen), pero se sigue recargando para que los de fragmentos
+     * compilen. kMaxRecoveries acota la memoria que no se devuelve (ver abajo):
+     * de ahi en adelante si se queda roto.
+     */
+    constexpr u32 kVsRecoveries = 6;
+    constexpr u32 kMaxRecoveries = 16;
+    if (g_generation + 1 >= kVsRecoveries && !g_poisoned) {
+        g_poisoned = true;
+        Common::VitaNote("gxm shader", "demasiados errores internos: no se traducen mas "
+                                       "shaders de vertices en esta sesion");
+    }
     if (g_generation >= kMaxRecoveries) {
         g_compile_allocs.clear();
         g_live_bytes = 0;
-        if (!g_poisoned) {
-            g_poisoned = true;
-            Common::VitaNote("gxm shader", "demasiados errores internos: no se traducen mas "
-                                           "shaders de vertices en esta sesion");
-        }
         return;
     }
     int status = 0;
