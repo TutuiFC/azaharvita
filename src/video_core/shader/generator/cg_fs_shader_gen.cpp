@@ -93,9 +93,6 @@ bool IsSupported(const FSConfig& config, const char** out_reason) {
     default:
         return reject("tipo de textura 0 desconocido");
     }
-    if (config.texture.texture2_use_coord1) {
-        return reject("textura 2 con coord 1");
-    }
     return true;
 }
 
@@ -531,7 +528,11 @@ private:
             emit(0, uses_tex0, "tc0");
         }
         emit(1, uses_tex1, "tc1");
-        emit(2, uses_tex2, "tc2");
+        // La unidad 2 puede muestrear con la coordenada 1 (texture2_use_coord1),
+        // como en el generador de GLSL. Hasta 0.1.9.6 se rechazaba, y en la
+        // intro de Zafiro Alfa (el cielo) 128 lotes por fotograma se iban a
+        // software: 2,2 FPS.
+        emit(2, uses_tex2, config.texture.texture2_use_coord1 ? "tc1" : "tc2");
     }
 
     bool IsProjected() const {
