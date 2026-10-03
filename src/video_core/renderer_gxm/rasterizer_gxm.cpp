@@ -1528,6 +1528,9 @@ struct RasterizerGXM::HwShaderCache {
         /// "vs_in<registro>", o null si el programa no lee ese registro de un
         /// flujo (lo elimina el compilador o sale de otro sitio).
         std::array<const SceGxmProgramParameter*, 16> inputs{};
+        /// Compilandose en el hilo de compilacion (0.1.9.6): hasta que acabe,
+        /// el lote va por la CPU.
+        std::shared_ptr<CgJob> job;
     };
 
     /// Tope de programas traducidos. Un juego usa decenas; pasado esto se deja
@@ -1558,11 +1561,22 @@ struct RasterizerGXM::HwShaderCache {
                               bool write_lighting, bool write_w, const char** out_reason) {
         const auto it = programs.find(key);
         if (it != programs.end()) {
-            if (!it->second->usable) {
-                *out_reason = it->second->reason;
+            Program& found = *it->second;
+            if (found.job != nullptr) {
+                if (!found.job->done.load(std::memory_order_acquire)) {
+                    *out_reason = "vs compilando";
+                    return nullptr;
+                }
+                const SceShaccCgCompileOutput* output = found.job->output;
+                const u32 variant = found.job->used_variant;
+                found.job.reset();
+                Finish(found, output, variant);
+            }
+            if (!found.usable) {
+                *out_reason = found.reason;
                 return nullptr;
             }
-            return it->second.get();
+            return &found;
         }
         if (programs.size() >= kMaxPrograms) {
             *out_reason = "vs tope de programas";
@@ -1571,6 +1585,9 @@ struct RasterizerGXM::HwShaderCache {
         auto program = std::make_unique<Program>();
         Build(*program, setup, config, inputs, write_lighting, write_w);
         const Program* result = program->usable ? program.get() : nullptr;
+        if (program->job != nullptr) {
+            program->reason = "vs compilando";
+        }
         if (result == nullptr) {
             *out_reason = program->reason;
         }
@@ -1676,15 +1693,12 @@ private:
         static constexpr u32 kVariants[] = {kCgFloatAddress, kCgFloatAddress | kCgFlat, kCgFlat,
                                             0};
         const char* generator_reason = nullptr;
-        bool generated = false;
-        u32 used_variant = 0;
+        std::vector<std::string> sources;
+        std::vector<u32> variants;
         for (const u32 variant : kVariants) {
-            if (CgPoisoned()) {
-                break;
-            }
             g_cg_variant.store(variant, std::memory_order_relaxed);
-            const auto source = GenerateVertexShader(setup, config, extra, inputs,
-                                                     write_lighting, write_w, &generator_reason);
+            auto source = GenerateVertexShader(setup, config, extra, inputs, write_lighting,
+                                               write_w, &generator_reason);
             if (!source.has_value()) {
                 // Sin subrutinas en linea el analisis es el mismo en todas las
                 // variantes: si falla, fallaria igual en las demas. En linea
@@ -1694,41 +1708,56 @@ private:
                 }
                 continue;
             }
-            generated = true;
-            /**
-             * TOPE DE TAMANO (0.1.9.2). crash.txt de 0.1.9.0 y 0.1.9.1: al entrar
-             * a la escena del profesor Abedul, un shader de vertices de 26 KB de
-             * Cg tenia el juego congelado mas de 30 s dentro del compilador (con
-             * picos de 27 MB), y Pokemon Sol se paraba igual al arrancar. Uno
-             * asi no se compila en partida: va a la CPU. Si ya esta en la cache
-             * de la tarjeta se usa, porque leerlo es inmediato.
-             */
-            constexpr std::size_t kMaxCompileSource = 16u * 1024u;
-            if (source->size() > kMaxCompileSource &&
-                !CgCached(SCE_SHACCCG_PROFILE_VP, source->c_str())) {
-                static u32 big_notes = 0;
-                if (big_notes < 4) {
-                    big_notes++;
-                    NoteFmt("gxm vs", "{} bytes de Cg: no se compila en partida, a la CPU",
-                            source->size());
-                }
-                g_cg_variant.store(0, std::memory_order_relaxed);
-                program.reason = "vs demasiado grande";
-                return;
-            }
-            // CompileCg deja en crash.txt el primer mensaje del compilador.
-            program.output =
-                CompileCg(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", source->c_str());
-            if (program.output != nullptr) {
-                used_variant = variant;
-                break;
-            }
+            sources.push_back(std::move(*source));
+            variants.push_back(variant);
         }
         g_cg_variant.store(0, std::memory_order_relaxed);
+        if (sources.empty()) {
+            program.reason = generator_reason != nullptr ? generator_reason : "vs traducir";
+            return;
+        }
+        /**
+         * TOPE DE TAMANO (0.1.9.2). crash.txt de 0.1.9.0 y 0.1.9.1: un shader de
+         * vertices de 26 KB de Cg pasaba mas de 30 s en el compilador, con picos
+         * de 27 MB y hasta 20 MB retenidos despues. Aunque ya no congele (se
+         * compila aparte), uno asi deja al compilador sin memoria para el resto
+         * de la sesion: va a la CPU. Si ya esta en la cache de la tarjeta se
+         * usa, porque leerlo es inmediato.
+         */
+        constexpr std::size_t kMaxCompileSource = 16u * 1024u;
+        const bool cached = CgCached(SCE_SHACCCG_PROFILE_VP, sources.front().c_str());
+        if (sources.front().size() > kMaxCompileSource && !cached) {
+            static u32 big_notes = 0;
+            if (big_notes < 4) {
+                big_notes++;
+                NoteFmt("gxm vs", "{} bytes de Cg: no se compila en partida, a la CPU",
+                        sources.front().size());
+            }
+            program.reason = "vs demasiado grande";
+            return;
+        }
+        if (cached) {
+            // De la cache de la tarjeta: es leer un fichero, aqui mismo.
+            const SceShaccCgCompileOutput* output =
+                CompileCg(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", sources.front().c_str());
+            if (output != nullptr) {
+                Finish(program, output, variants.front());
+                return;
+            }
+        }
+        // Al hilo de compilacion (0.1.9.6); GetProgram recoge el resultado.
+        auto job = std::make_shared<CgJob>();
+        job->sources = std::move(sources);
+        job->variants = std::move(variants);
+        program.job = job;
+        CgSubmit(std::move(job));
+    }
+
+    /// Registra en el parcheador lo que salio del compilador (o de la cache).
+    void Finish(Program& program, const SceShaccCgCompileOutput* output, u32 used_variant) {
+        program.output = output;
         if (program.output == nullptr) {
-            program.reason = !generated ? (generator_reason != nullptr ? generator_reason
-                                                                       : "vs traducir")
-                                        : "vs compilar";
+            program.reason = "vs compilar";
             return;
         }
         {
@@ -4653,6 +4682,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         specialize_vs.load(std::memory_order_relaxed) != 0 &&
         std::strcmp(reason, "vs tope de programas") != 0 &&
         std::strcmp(reason, "vs compilador roto") != 0 &&
+        std::strcmp(reason, "vs compilando") != 0 &&
         std::strcmp(reason, "vs con geometria") != 0) {
         using namespace Pica::Shader::Generator::GXM;
         auto used = hw_shaders->used_bools.find(program_key);

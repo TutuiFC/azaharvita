@@ -4,9 +4,13 @@
 
 #include "video_core/renderer_gxm/gxm_cg.h"
 
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <malloc.h>
+#include <mutex>
+#include <pthread.h>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -39,7 +43,15 @@ SceShaccCgSourceFile g_source{};
 SceShaccCgCallbackList g_callbacks{};
 char g_status[64] = "sin iniciar";
 /// El compilador ha devuelto un "internal error" alguna vez. Ver CgPoisoned.
-bool g_poisoned = false;
+/// Atomico desde 0.1.9.6: lo escribe el hilo de compilacion.
+std::atomic<bool> g_poisoned{false};
+/**
+ * Todo lo del compilador (el modulo, su memoria, la cache, las listas) pasa
+ * por aqui (0.1.9.6): desde que hay un hilo de compilacion, CompileCg puede
+ * llamarse desde dos hilos. Recursivo porque CompileCg llama a EnsureCgReady
+ * y a ReleaseCgOutput.
+ */
+std::recursive_mutex g_cg_mutex;
 unsigned long long g_last_attempt_us = 0;
 
 /// Un intento por segundo como mucho cuando falla: sin esto, cada lote cuyo
@@ -72,7 +84,7 @@ SceShaccCgSourceFile* OpenSource(const char*, const SceShaccCgSourceLocation*,
  * cargado, su estado podria apuntar a esos bloques.
  */
 bool g_tracking = false;
-u32 g_generation = 0;
+std::atomic<u32> g_generation{0};
 
 /**
  * TODA LA MEMORIA VIVA DEL COMPILADOR (0.1.8.1).
@@ -534,6 +546,7 @@ u32 CgGeneration() {
 }
 
 bool EnsureCgReady() {
+    const std::lock_guard lock{g_cg_mutex};
     if (g_module >= 0) {
         return true;
     }
@@ -588,6 +601,7 @@ bool CgCached(SceShaccCgTargetProfile profile, const char* source) {
 
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
                                          const char* source) {
+    const std::lock_guard lock{g_cg_mutex};
     // Cache en la tarjeta (0.1.5.8): si este codigo fuente ya se compilo
     // alguna vez, el binario se lee de disco. Ver CacheHeader.
     const std::size_t source_size = std::strlen(source);
@@ -795,6 +809,7 @@ void ReleaseCgOutput(const SceShaccCgCompileOutput* output) {
     if (output == nullptr) {
         return;
     }
+    const std::lock_guard lock{g_cg_mutex};
     // Las que vinieron de la cache son un malloc nuestro (0.1.5.8).
     const auto it = g_cached_outputs.find(output);
     if (it != g_cached_outputs.end()) {
@@ -803,6 +818,84 @@ void ReleaseCgOutput(const SceShaccCgCompileOutput* output) {
         return;
     }
     sceShaccCgDestroyCompileOutput(output);
+}
+
+namespace {
+
+std::mutex g_jobs_mutex;
+std::condition_variable g_jobs_ready;
+std::deque<std::shared_ptr<CgJob>> g_jobs;
+bool g_worker_started = false;
+
+void* CgWorkerMain(void*) {
+    // En los nucleos 1 y 2, con los otros ayudantes: el 0 es el de la emulacion.
+    Common::VitaPinThreadToUserCore(1, "compilador de shaders");
+    while (true) {
+        std::shared_ptr<CgJob> job;
+        {
+            std::unique_lock lock{g_jobs_mutex};
+            g_jobs_ready.wait(lock, [] { return !g_jobs.empty(); });
+            job = std::move(g_jobs.front());
+            g_jobs.pop_front();
+        }
+        for (std::size_t i = 0; i < job->sources.size(); i++) {
+            if (CgPoisoned()) {
+                break;
+            }
+            const SceShaccCgCompileOutput* output =
+                CompileCg(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", job->sources[i].c_str());
+            if (output != nullptr) {
+                job->output = output;
+                job->used_variant = job->variants[i];
+                break;
+            }
+        }
+        job->done.store(true, std::memory_order_release);
+    }
+    return nullptr;
+}
+
+} // Anonymous namespace
+
+void CgSubmit(std::shared_ptr<CgJob> job) {
+    std::lock_guard lock{g_jobs_mutex};
+    if (!g_worker_started) {
+        g_worker_started = true;
+        /**
+         * Pila de 1 MB: el compilador corria hasta ahora en el hilo principal
+         * y no se sabe cuanta pila necesita con un shader grande. Mejor que
+         * sobre (sale del presupuesto de la aplicacion, que tiene ~80 MB libres
+         * fuera del heap).
+         */
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 1024 * 1024);
+        pthread_t thread;
+        if (pthread_create(&thread, &attr, &CgWorkerMain, nullptr) == 0) {
+            pthread_detach(thread);
+        } else {
+            g_worker_started = false;
+        }
+        pthread_attr_destroy(&attr);
+        if (!g_worker_started) {
+            // Sin hilo: se compila aqui mismo, como antes.
+            job->done.store(false, std::memory_order_relaxed);
+            for (std::size_t i = 0; i < job->sources.size(); i++) {
+                const SceShaccCgCompileOutput* output = CompileCg(
+                    SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", job->sources[i].c_str());
+                if (output != nullptr) {
+                    job->output = output;
+                    job->used_variant = job->variants[i];
+                    break;
+                }
+            }
+            job->done.store(true, std::memory_order_release);
+            return;
+        }
+        Common::VitaNote("gxm compila", "hilo de compilacion en segundo plano listo");
+    }
+    g_jobs.push_back(std::move(job));
+    g_jobs_ready.notify_one();
 }
 
 } // namespace Gxm

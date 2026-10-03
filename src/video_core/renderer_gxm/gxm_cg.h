@@ -4,6 +4,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+#include <string>
+#include <vector>
 #include <psp2/shacccg.h>
 #include "common/common_types.h"
 
@@ -61,5 +65,30 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
                                          const char* source);
 
 void ReleaseCgOutput(const SceShaccCgCompileOutput* output);
+
+/**
+ * COMPILACION EN SEGUNDO PLANO (0.1.9.6).
+ *
+ * Un shader de vertices de 11-16 KB de Cg tarda de varios segundos a mas de
+ * medio minuto en el compilador de la consola, y hasta ahora eso era el juego
+ * congelado (Zafiro Alfa al entrar al 3D, Pokemon Sol al presentarse Kukui).
+ * Ahora un hilo aparte compila y el lote sigue por la CPU mientras tanto; el
+ * resultado se recoge en el hilo de emulacion (registrar el programa en el
+ * parcheador no es seguro desde otro hilo). Las fuentes son las variantes a
+ * probar, en orden: la primera que compile gana. El compilador sigue siendo
+ * uno solo: CompileCg lo protege con un cerrojo, asi que un shader de
+ * fragmentos que haga falta en el hilo de emulacion espera, como mucho, a que
+ * acabe la compilacion en curso.
+ */
+struct CgJob {
+    std::vector<std::string> sources;
+    std::vector<u32> variants;
+    /// Lo escribe el hilo de compilacion ANTES de poner done.
+    const SceShaccCgCompileOutput* output = nullptr;
+    u32 used_variant = 0;
+    std::atomic<bool> done{false};
+};
+
+void CgSubmit(std::shared_ptr<CgJob> job);
 
 } // namespace Gxm
