@@ -1385,6 +1385,11 @@ public:
             Terminator(inst, pc, decoded, cond);
             return;
         }
+        // Sin cuerpo no hay nada que saltar (y PLD lleva el campo de
+        // condicion a 0xF, que no es una condicion).
+        if (decoded.kind == Kind::Nop) {
+            return;
+        }
         // Condicion: se salta el cuerpo entero con la condicion contraria,
         // evaluada UNA vez con los flags de entrada (si el cuerpo pone flags,
         // no pueden afectar a si el cuerpo se ejecuta).
