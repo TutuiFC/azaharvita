@@ -4240,6 +4240,17 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
  * (SELECT + ABAJO), que devuelve el lote a la ruta de 0.1.4.5.
  */
 bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
+    /**
+     * 'lote' cuenta la funcion ENTERA desde 0.1.9.5, preguntas y rechazos
+     * incluidos: en el titulo de Zafiro Alfa (2D, ~230 lotes por fotograma)
+     * "gx" eran 21 ms y "lote" solo 1,7, y no se veia donde iba el resto.
+     */
+    struct BatchTimer {
+        unsigned long long begin = Common::VitaMicros();
+        ~BatchTimer() {
+            Common::FrameStats::Add(Common::FrameStats::batch_us, begin);
+        }
+    } const batch_timer;
     using Pica::PipelineRegs;
     using Pica::Shader::Generator::GXM::VSInputs;
     using Pica::Shader::Generator::GXM::VSInputSource;
@@ -4648,7 +4659,6 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
 
     // ---- 2. El trabajo. A partir de aqui solo quedan fallos de GXM ----
 
-    const unsigned long long batch_begin = Common::VitaMicros();
     if (open_surface != nullptr && open_surface != surface) {
         EndScene();
     }
@@ -4805,7 +4815,6 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     gpu_triangles.fetch_add(triangles, std::memory_order_relaxed);
     gpu_batches.fetch_add(1, std::memory_order_relaxed);
     hw_vs_batches.fetch_add(1, std::memory_order_relaxed);
-    Common::FrameStats::Add(Common::FrameStats::batch_us, batch_begin);
     return true;
 }
 
