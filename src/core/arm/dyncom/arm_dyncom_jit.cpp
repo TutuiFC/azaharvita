@@ -48,8 +48,12 @@ constexpr u32 kCompileAfterVisits = 2;
 /// extension tiene que coincidir con la suya).
 constexpr u32 kMaxBlockInstructions = 256;
 /// Comprobaciones: las primeras kFullChecks ejecuciones de cada bloque, y
-/// despues una de cada kSampleEvery (potencia de dos).
-constexpr u32 kFullChecks = 4;
+/// despues una de cada kSampleEvery (potencia de dos). 0.1.9.5: de 4 a 1. Cada
+/// pantalla nueva compila cientos de bloques y comprobarlos cuatro veces eran
+/// 12-13 ms por fotograma ("comprobar" en crash.txt), con cero diferencias en
+/// todas las partidas desde 0.1.8.x; el muestreo sigue cazando lo que dependa
+/// de los datos.
+constexpr u32 kFullChecks = 1;
 /**
  * 0.1.7.8: de 512 a 4096. Una comprobacion cuesta del orden de 1.500 ciclos
  * (la variante, tres copias de ~400 bytes del estado, el bloque interpretado y
