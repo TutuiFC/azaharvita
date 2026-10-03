@@ -33,6 +33,8 @@ constexpr const char* kShacccgPaths[] = {
 };
 
 SceUID g_module = -1;
+/// Compilaciones hechas con el modulo cargado ahora (0.1.8.5, ver StoreBadSource).
+u32 g_compiles_since_load = 0;
 SceShaccCgSourceFile g_source{};
 SceShaccCgCallbackList g_callbacks{};
 char g_status[64] = "sin iniciar";
@@ -83,9 +85,8 @@ u32 g_generation = 0;
  * muere por dentro (volcado de 0.1.8.0: PC dentro de libshacccg).
  *
  * Ahora se apunta todo lo que pide mientras esta cargado, y se puede
- * DESCARGAR el modulo y devolverlo entero (ReclaimCompiler): las salidas que
- * se usan son copias nuestras (CopyOutput, 0.1.7.9), asi que nada de lo suyo
- * sigue en uso despues de una compilacion.
+ * DESCARGAR el modulo. Desde 0.1.8.5 solo se mide (picos y lo retenido, ver
+ * NoteCompileMemory): liberar lo apuntado tras descargar resulto peligroso.
  */
 std::unordered_set<void*> g_compile_allocs;
 std::size_t g_live_bytes = 0;
@@ -251,7 +252,7 @@ const SceShaccCgCompileOutput* LoadCached(const CacheHeader& want, const std::st
 /**
  * Copia en un bloque nuestro, con el mismo formato que LoadCached, de una
  * salida del compilador (0.1.7.9). Asi la salida de libshacccg se puede
- * destruir enseguida y soltar el compilador (ver ReleaseCompilerMemory) sin que
+ * destruir enseguida sin que
  * el programa registrado en el parcheador apunte a memoria suya.
  */
 const SceShaccCgCompileOutput* CopyOutput(const SceShaccCgCompileOutput& source) {
@@ -280,66 +281,44 @@ std::size_t FreeHeap() {
     return total > used ? total - used : 0;
 }
 
-/// Libre minimo para EMPEZAR una compilacion, y libre por debajo del cual,
-/// despues de compilar, se descarga el compilador para recuperar lo que
-/// retiene (0.1.8.1, ver g_compile_allocs).
-constexpr std::size_t kMinFreeToCompile = 40u * 1024u * 1024u;
-constexpr std::size_t kReclaimBelowFree = 96u * 1024u * 1024u;
 /**
- * Los shaders de VERTICES son otra cosa (0.1.8.3). Los que llegan aqui son los
- * de piel de Pokemon especializados por booleanos: enormes. crash.txt de
- * 0.1.8.0: uno compilo bien empezando con 93 MB libres (y se quedo 18 MB que
- * no devolvio); el siguiente empezo con 74 MB y el compilador murio por dentro.
- * Asi que cada compilacion de vertices empieza en las condiciones de la que
- * salio bien: compilador recien cargado (se descarga DESPUES de cada una, ver
- * ReleaseCompilerMemory) y al menos kMinFreeToCompileVs libres. Si no los hay,
- * ese programa no se compila ahora y el lote sombrea en la CPU.
+ * Libre minimo para EMPEZAR una compilacion (0.1.8.5). Medido en 0.1.8.4 con
+ * el shader de piel de Zafiro Alfa especializado: picos de 1,6 a 10,8 MB por
+ * compilacion, y el compilador retiene menos de 0,6 MB. Los umbrales de
+ * 0.1.8.3 (85 MB para los de vertices) dejaban sin compilar shaders que cabian
+ * de sobra en cuanto el heap pasaba de 178 MB en uso.
  */
-constexpr std::size_t kMinFreeToCompileVs = 85u * 1024u * 1024u;
-
-bool ReclaimCompiler(const char* why);
+constexpr std::size_t kMinFreeToCompile = 24u * 1024u * 1024u;
+constexpr std::size_t kMinFreeToCompileVs = 32u * 1024u * 1024u;
 
 /**
- * LA MEMORIA QUE SE QUEDA EL COMPILADOR (0.1.7.9).
+ * LO QUE GASTA CADA COMPILACION, A crash.txt (0.1.7.9). Las ocho primeras.
  *
- * crash.txt de 0.1.7.8, Zafiro Alfa: al entrar en el 3D, justo despues de
- * "especializado con booleanos ... a la GPU", la emulacion muere con
- * bad_alloc. Desde 0.1.7.4 cada combinacion de booleanos de un shader de
- * vertices es un programa nuevo que compilar, y la entrada al 3D pide muchos
- * de golpe. libshacccg guarda su estado de compilacion entre una llamada y la
- * siguiente, y ese estado solo se suelta con sceShaccCgReleaseCompiler, que
- * este proyecto no llamaba nunca. Se llama despues de CADA compilacion: la
- * siguiente lo vuelve a montar (cuesta algo de tiempo, que la cache de la
- * tarjeta ya ahorra la segunda vez).
- *
- * Las primeras compilaciones anotan el heap en uso antes, al acabar y despues
- * de soltar, para ver en crash.txt cuanto se queda el compilador.
+ * 0.1.8.5: SIN sceShaccCgReleaseCompiler ni descargar el compilador despues de
+ * compilar. Las dos cosas se metieron en 0.1.7.9 y 0.1.8.3 contra un supuesto
+ * agotamiento de memoria, y las dos estaban en la secuencia de los dos crashes
+ * siguientes: 0.1.8.0 murio DENTRO del compilador justo despues de un
+ * ReleaseCompiler, y 0.1.8.4 murio dentro de malloc, con el heap corrupto,
+ * tras cuatro descargas en las que se liberaba toda la memoria que el modulo
+ * habia pedido (si algo suyo la seguia usando, la corrompia). Y lo medido en
+ * 0.1.8.4 dice que no hacian falta: picos de 1,6-10,8 MB y menos de 0,6 MB
+ * retenidos. Se vuelve a como compilaba de 0.1.5.9 a 0.1.7.8.
  */
 u32 g_mem_notes = 0;
 
-void ReleaseCompilerMemory(const char* name, std::size_t before, std::size_t live_before,
-                           bool vertex) {
-    const std::size_t after_compile = HeapInUse();
-    sceShaccCgReleaseCompiler();
-    if (g_mem_notes < 8) {
-        g_mem_notes++;
-        const std::size_t after_release = HeapInUse();
-        const std::size_t peak = g_peak_bytes > live_before ? g_peak_bytes - live_before : 0;
-        Common::VitaNote("gxm mem",
-                         fmt::format("{}: heap en uso {} KB, al compilar {} KB, tras soltar "
-                                     "el compilador {} KB; pico de la compilacion {} KB, el "
-                                     "compilador retiene {} KB",
-                                     name, before / 1024, after_compile / 1024,
-                                     after_release / 1024, peak / 1024, g_live_bytes / 1024)
-                             .c_str());
+void NoteCompileMemory(const char* name, std::size_t before, std::size_t live_before) {
+    if (g_mem_notes >= 8) {
+        return;
     }
-    // 0.1.8.1: sceShaccCgReleaseCompiler no devuelve lo que retiene (medido).
-    // Si el heap va justo, se descarga el modulo y se devuelve todo.
-    if (vertex && g_live_bytes > 0) {
-        ReclaimCompiler("tras compilar vertices");
-    } else if (FreeHeap() < kReclaimBelowFree && g_live_bytes > 1024u * 1024u) {
-        ReclaimCompiler("tras compilar");
-    }
+    g_mem_notes++;
+    const std::size_t after = HeapInUse();
+    const std::size_t peak = g_peak_bytes > live_before ? g_peak_bytes - live_before : 0;
+    Common::VitaNote("gxm mem",
+                     fmt::format("{}: heap en uso {} KB, despues {} KB; pico de la compilacion "
+                                 "{} KB, el compilador retiene {} KB",
+                                 name, before / 1024, after / 1024, peak / 1024,
+                                 g_live_bytes / 1024)
+                         .c_str());
 }
 
 void StoreCached(CacheHeader header, const std::string& path,
@@ -419,7 +398,16 @@ void DumpFailedSource(const char* name, const char* source, const SceShaccCgComp
  * tarjeta y no se le vuelve a dar al compilador, ni en esta sesion ni en las
  * siguientes. El resto de shaders sigue compilando con normalidad.
  */
-constexpr char kBadListPath[] = "ux0:/data/azahar/shadercache/cg_roto.bin";
+/**
+ * 0.1.8.5: fichero NUEVO (cg_roto2.bin). En el viejo habia 24 codigos, y la nota
+ * de 0.1.5.8 de aqui arriba dice por que muchos podian ser inocentes: tras un
+ * error interno el compilador se queda roto y los siguientes fallan igual. Un
+ * shader de fragmentos apuntado aqui se salta para siempre y TODOS sus lotes
+ * se rasterizan por software (0.1.8.4: "gxm skip: compilar shader" y despues
+ * 465 ms por vblank en los vertices). Ahora solo se apunta lo que falla con el
+ * compilador recien cargado; lo demas solo se salta en esta sesion.
+ */
+constexpr char kBadListPath[] = "ux0:/data/azahar/shadercache/cg_roto2.bin";
 struct BadSource {
     u64 hash_city;
     u64 hash_fnv;
@@ -510,64 +498,26 @@ void RecoverFromInternalError() {
         g_poisoned = true;
         return;
     }
-    std::size_t freed = 0;
-    for (void* pointer : g_compile_allocs) {
-        std::free(pointer);
-        freed++;
-    }
+    /**
+     * 0.1.8.5: la memoria del modulo NO se libera, solo se olvida. Liberarla
+     * (0.1.5.9-0.1.8.4) da por hecho que tras la descarga nada la usa, y el
+     * crash de 0.1.8.4 (malloc con el heap corrupto despues de varias
+     * descargas) dice que no es seguro. Se pierde el pico de una compilacion
+     * fallida (unos MB), y esto solo pasa con errores internos.
+     */
+    const std::size_t lost = g_live_bytes;
     g_compile_allocs.clear();
     g_live_bytes = 0;
     g_module = -1;
     g_last_attempt_us = 0; // recargar ya en la siguiente compilacion
+    g_compiles_since_load = 0;
     g_generation++;
     std::strcpy(g_status, "recargando");
     Common::VitaNote("gxm shader",
-                     fmt::format("compilador descargado tras el error interno; {} bloques de "
-                                 "memoria devueltos; se recarga limpio",
-                                 freed)
+                     fmt::format("compilador descargado tras el error interno ({} KB sin "
+                                 "devolver); se recarga limpio",
+                                 lost / 1024)
                          .c_str());
-}
-
-/**
- * Descarga un compilador SANO para recuperar la memoria que retiene (0.1.8.1).
- * Lo mismo que RecoverFromInternalError, sin contar como error: no se marca
- * nada ni se acerca el tope de recargas por errores. La siguiente compilacion
- * lo vuelve a cargar (EnsureCgReady). Con un tope propio, por si algun dia
- * cada compilacion necesitara una recarga: cargar el modulo no es gratis.
- */
-u32 g_reclaims = 0;
-bool g_reclaim_broken = false;
-
-bool ReclaimCompiler(const char* why) {
-    constexpr u32 kMaxReclaims = 48;
-    if (g_module < 0 || g_reclaim_broken || g_reclaims >= kMaxReclaims) {
-        return false;
-    }
-    int status = 0;
-    const int rc = sceKernelStopUnloadModule(g_module, 0, nullptr, 0, nullptr, &status);
-    if (rc < 0) {
-        g_reclaim_broken = true;
-        Common::VitaNote("gxm mem", fmt::format("no se pudo descargar el compilador para "
-                                                "recuperar memoria ({:#x})",
-                                                static_cast<u32>(rc))
-                                        .c_str());
-        return false;
-    }
-    const std::size_t returned = g_live_bytes;
-    for (void* pointer : g_compile_allocs) {
-        std::free(pointer);
-    }
-    g_compile_allocs.clear();
-    g_live_bytes = 0;
-    g_module = -1;
-    g_last_attempt_us = 0;
-    g_reclaims++;
-    if (g_reclaims <= 6) {
-        Common::VitaNote("gxm mem", fmt::format("compilador descargado ({}): {} KB devueltos",
-                                                why, returned / 1024)
-                                        .c_str());
-    }
-    return true;
 }
 
 } // Anonymous namespace
@@ -601,6 +551,7 @@ bool EnsureCgReady() {
         return false;
     }
     sceShaccCgSetDefaultAllocator(&CgAlloc, &CgFree);
+    g_compiles_since_load = 0;
     sceShaccCgInitializeCallbackList(&g_callbacks, SCE_SHACCCG_TRIVIAL);
     g_callbacks.openFile = &OpenSource;
     std::strcpy(g_status, "listo");
@@ -656,9 +607,6 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
      */
     const bool vertex = profile == SCE_SHACCCG_PROFILE_VP;
     const std::size_t min_free = vertex ? kMinFreeToCompileVs : kMinFreeToCompile;
-    if (FreeHeap() < min_free && g_live_bytes > 0) {
-        ReclaimCompiler("antes de compilar");
-    }
     if (FreeHeap() < min_free) {
         static u32 skip_notes = 0;
         if (skip_notes < 4) {
@@ -689,6 +637,8 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     g_compile_over_budget = false;
     g_peak_bytes = g_live_bytes;
     const std::size_t live_before = g_live_bytes;
+    g_compiles_since_load++;
+    const bool fresh_compiler = g_compiles_since_load == 1;
     g_tracking = true;
     const SceShaccCgCompileOutput* output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     g_tracking = false;
@@ -763,7 +713,11 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         if (internal) {
             // Ese codigo no se vuelve a mandar (ni en otra sesion) y el
             // compilador se recarga limpio para el siguiente.
-            StoreBadSource(BadSource{key.hash_city, key.hash_fnv});
+            if (fresh_compiler) {
+                StoreBadSource(BadSource{key.hash_city, key.hash_fnv});
+            } else {
+                g_bad_sources.insert(BadSource{key.hash_city, key.hash_fnv});
+            }
             RecoverFromInternalError();
         } else if (g_compile_over_budget) {
             // Sin memoria a mitad de compilacion su estado puede quedar a
@@ -775,7 +729,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
             // Un error normal (de sintaxis) deja el compilador sano: solo se
             // suelta su memoria. Con el error interno no se le llama: el
             // modulo esta roto y RecoverFromInternalError ya lo ha descargado.
-            ReleaseCompilerMemory(name, heap_before, live_before, vertex);
+            NoteCompileMemory(name, heap_before, live_before);
         }
         return nullptr;
     }
@@ -791,7 +745,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         return output;
     }
     sceShaccCgDestroyCompileOutput(output);
-    ReleaseCompilerMemory(name, heap_before, live_before, vertex);
+    NoteCompileMemory(name, heap_before, live_before);
     return copy;
 }
 
