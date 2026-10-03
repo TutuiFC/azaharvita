@@ -670,6 +670,17 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     options.mainSourceFile = name;
     options.targetProfile = profile;
     options.entryFunctionName = "main";
+    /**
+     * Los de vertices, con poca optimizacion (0.1.9.6). Son los programas de
+     * la PICA traducidos: miles de lineas que el compilador tardaba de varios
+     * segundos a mas de medio minuto en optimizar, con picos de hasta 27 MB y
+     * hasta 20 MB retenidos despues. En la GPU de la Vita los vertices de un
+     * juego de 3DS no cuestan casi nada; lo caro era compilarlos. Los de
+     * fragmentos (se ejecutan por pixel) siguen con la optimizacion de serie.
+     */
+    if (profile == SCE_SHACCCG_PROFILE_VP) {
+        options.optimizationLevel = 1;
+    }
 
     const std::size_t heap_before = HeapInUse();
     g_compile_budget = FreeHeap() - kEmulatorReserve;
@@ -685,8 +696,9 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     static u32 start_notes = 0;
     if (start_notes < 24) {
         start_notes++;
-        Common::VitaNote("gxm compila", fmt::format("{}: {} bytes de codigo, heap libre {} KB",
-                                                    name, g_source.size, FreeHeap() / 1024)
+        Common::VitaNote("gxm compila", fmt::format("{}: {} bytes de codigo, heap libre {} KB, O{}",
+                                                    name, g_source.size, FreeHeap() / 1024,
+                                                    options.optimizationLevel)
                                             .c_str());
     }
     const SceShaccCgCompileOutput* output = nullptr;
