@@ -946,6 +946,8 @@ enum class Kind {
     VfpCdp,       ///< VFP aritmetica por vfp_*_cpdo (0.1.6.1)
     VfpMrs,       ///< VMRS de FPSCR (0.1.6.1)
     VfpTransfer,  ///< VPUSH, VPOP, VSTM, VLDM (0.1.6.1)
+    Clrex,        ///< CLREX (0.1.9.8)
+    BranchLinkExchangeImm, ///< BLX inmediato: llamada a Thumb (0.1.9.8)
 };
 
 struct Decoded {
@@ -1007,6 +1009,19 @@ Decoded Classify(u32 inst) {
      */
     if ((inst & 0xFD70F000u) == 0xF550F000u) {
         return Supported(Kind::Nop);
+    }
+    /**
+     * CLREX y BLX inmediato (0.1.9.8): los dos primeros de "jit otro" en
+     * crash.txt de 0.1.9.7 en los cinco juegos probados. CLREX esta en las
+     * rutinas de bloqueo del sistema (miles de despachos por intervalo) y BLX
+     * es la llamada de codigo ARM a una funcion Thumb; los dos mandaban el
+     * bloque entero al interprete. Mismas cuentas que CLREX_INST y BLX_INST.
+     */
+    if (inst == 0xF57FF01Fu) {
+        return Supported(Kind::Clrex);
+    }
+    if ((inst & 0xFE000000u) == 0xFA000000u) {
+        return Supported(Kind::BranchLinkExchangeImm, true);
     }
     if (cond == 0xF) {
         return Reject(kRejectOther); // espacio incondicional (BLX inmediato, PLD...)
@@ -1312,6 +1327,9 @@ void JitCp15Write(ARMul_State* cpu, u32 inst, u32 value) {
 void CheckAbortThunk() {
     g_check.aborted = true;
 }
+void JitClrex(ARMul_State* cpu) {
+    cpu->UnsetExclusiveMemoryAddress();
+}
 
 class Compiler {
 public:
@@ -1382,12 +1400,25 @@ public:
     void Instruction(u32 inst, u32 pc, const Decoded& decoded) {
         const u32 cond = inst >> 28;
         if (decoded.terminator) {
-            Terminator(inst, pc, decoded, cond);
+            // BLX inmediato no tiene condicion: su campo vale 0xF.
+            Terminator(inst, pc, decoded,
+                       decoded.kind == Kind::BranchLinkExchangeImm ? kAlways : cond);
             return;
         }
         // Sin cuerpo no hay nada que saltar (y PLD lleva el campo de
         // condicion a 0xF, que no es una condicion).
         if (decoded.kind == Kind::Nop) {
+            return;
+        }
+        // CLREX tambien lleva 0xF ahi: siempre se ejecuta.
+        if (decoded.kind == Kind::Clrex) {
+            FlushCachedRegs();
+            e.Mrs(kFlags);
+            e.MovReg(kT0, kFlags);
+            e.MovReg(R0, kCpu);
+            e.Call(reinterpret_cast<const void*>(&JitClrex));
+            e.MsrFlags(kT0);
+            ReloadCachedRegs();
             return;
         }
         // Condicion: se salta el cuerpo entero con la condicion contraria,
@@ -2564,6 +2595,21 @@ private:
             e.Mov32(kT0, target);
             StoreGuest(kT0, 15);
             EmitLinkDirect(target);
+            break;
+        }
+        case Kind::BranchLinkExchangeImm: {
+            // Como BLX_INST: LR = pc + 4 (desde ARM, sin bit 0), Thumb, y el
+            // destino con el bit H como media palabra.
+            const u32 offset24 = inst & 0x00FFFFFFu;
+            const s32 offset = static_cast<s32>(offset24 << 8) >> 6;
+            const u32 target = pc + 8 + static_cast<u32>(offset) + (Bits(inst, 24, 24) << 1);
+            e.Mov32(kT0, pc + 4);
+            StoreGuest(kT0, 14);
+            e.Mov32(kT1, 1);
+            e.StrImm(kT1, kCpu, g_offsets.t);
+            e.Mov32(kT0, target);
+            StoreGuest(kT0, 15);
+            EmitLinkIndirect();
             break;
         }
         case Kind::BranchExchange: {
