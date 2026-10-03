@@ -130,6 +130,21 @@ public:
      */
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
 
+    /**
+     * RELLENOS DE COLOR EN LA GPU (0.1.9.6). Casi todos los juegos borran su
+     * superficie de dibujo con un relleno de memoria en cada fotograma. Por
+     * software eso era escribir el relleno en la memoria del invitado y, al
+     * dibujar despues, ESPERAR a la GPU y recargar la superficie entera desde
+     * esa memoria (512 KB en tiles por fotograma en Zafiro Alfa). Si el relleno
+     * cubre justo el color de una superficie nuestra, solo se apunta: la
+     * siguiente escena empieza pintando un quad de ese color.
+     */
+    bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
+    /// Rellenos hechos asi (overlay y crash.txt).
+    static std::atomic<u32> gpu_fills;
+    /// Veces que un lote por software tuvo que bajar antes lo de la GPU.
+    static std::atomic<u32> software_syncs;
+
     /// Interruptor del menu ("Copia de pantalla en GPU"). Encendido.
     static std::atomic<u32> transfer_on_gpu;
     /// Copias hechas asi y copias que hubo que hacer de verdad despues (overlay).
@@ -332,7 +347,15 @@ private:
     /// hace falta. nullptr si no hay memoria.
     ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format);
     /// El quad de la superficie a la copia, en una escena suya.
-    bool BlitToCopy(ScreenCopy& copy, const Surface& source, u32 first_row, bool flip);
+    bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip);
+    /// Rellenos pendientes (ver AccelerateFill): el quad del color dentro de la
+    /// escena abierta, una escena solo para el, o a mano con la CPU.
+    void DrawClearQuad(Surface& surface);
+    void FlushClear(Surface& surface);
+    void ApplyClearOnCpu(Surface& surface);
+    /// Texeles de 1x1 con el color de cada relleno, en anillo.
+    Allocation clear_texels;
+    u32 clear_texel_next = 0;
     /// La direccion es una de las pantallas que el juego ha configurado.
     bool IsDisplayFramebuffer(PAddr addr);
     /// Las ultimas direcciones vistas en la configuracion de las pantallas:
@@ -353,6 +376,8 @@ private:
 
     /// Sube el lote y lo dibuja. Devuelve false si no se ha podido.
     bool DrawBatchOnGpu();
+    /// Antes de un lote por software en el framebuffer actual (ver el .cpp).
+    void PrepareSoftwareBatch();
 
     /// Estado de dibujado comun a los dos caminos de GPU. Ver el .cpp.
     template <typename Entry>

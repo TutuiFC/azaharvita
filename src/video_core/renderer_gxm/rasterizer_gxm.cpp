@@ -54,6 +54,8 @@ std::atomic<u32> RasterizerGXM::specialize_vs{1};
 std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
+std::atomic<u32> RasterizerGXM::gpu_fills{0};
+std::atomic<u32> RasterizerGXM::software_syncs{0};
 RasterizerGXM* RasterizerGXM::s_instance = nullptr;
 
 const char* RasterizerGXM::Ablation::Name(u32 value) {
@@ -615,6 +617,11 @@ struct RasterizerGXM::Surface {
     /// Su contenido ya se lo ha llevado una copia de pantalla en la GPU y no
     /// ha cambiado desde (0.1.8.7): FlushForPresent no la vuelca.
     bool copied = false;
+    /// Un relleno de color del invitado que todavia no se ha pintado: lo hace
+    /// la siguiente escena (0.1.9.6, ver AccelerateFill). clear_texel son los
+    /// cuatro bytes del pixel tal como van en color_buffer.
+    bool clear_pending = false;
+    u32 clear_texel = 0;
     /// El invitado ha cambiado este framebuffer por otro camino (un relleno de
     /// color, una transferencia): hay que volver a leerlo antes de dibujar.
     bool needs_reload = false;
@@ -2141,6 +2148,9 @@ void RasterizerGXM::WriteBack(Surface& surface) {
     if (!surface.dirty) {
         return;
     }
+    if (surface.clear_pending) {
+        ApplyClearOnCpu(surface);
+    }
     // Lee color_buffer: la GPU pudo no haber terminado si 4.5 difirio la espera.
     WaitGpu();
     surface.dirty = false;
@@ -2155,6 +2165,7 @@ void RasterizerGXM::WriteBack(Surface& surface) {
 
 void RasterizerGXM::Reload(Surface& surface) {
     surface.copied = false;
+    surface.clear_pending = false;
     // Lo que lee del invitado tiene que estar escrito: una copia de pantalla
     // en la GPU que pise el tramo, primero a la memoria.
     MaterializeCopies(surface.guest_address, surface.guest_stride * surface.height);
@@ -2562,8 +2573,11 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
     return slot->get();
 }
 
-bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, const Surface& source, u32 first_row,
+bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
                                bool flip) {
+    if (source.clear_pending) {
+        FlushClear(source);
+    }
     SceGxmTextureFormat tex_format{};
     if (!PresentTextureFormat(source.gxm_color_format, tex_format)) {
         return false;
@@ -2738,6 +2752,172 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     NoteOnce(noted, "gxm copia", "pantalla {:#010x} {}x{} desde {:#010x}, copiada en la GPU", dst,
              width, height, src);
     return true;
+}
+
+bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
+    if (!available) {
+        return false;
+    }
+    const PAddr start = config.GetStartAddress();
+    const PAddr end = config.GetEndAddress();
+    Surface* target = nullptr;
+    for (auto& surface : surfaces) {
+        if (surface->guest_address == start &&
+            start + surface->guest_stride * surface->height == end) {
+            target = surface.get();
+            break;
+        }
+    }
+    if (target == nullptr) {
+        return false;
+    }
+    /**
+     * El patron, como lo escribe SwBlitter::MemoryFill, en los bytes de
+     * nuestro color_buffer: en RGBA8 la superficie guarda los mismos cuatro
+     * bytes que el invitado; en RGB8 los tres del invitado y el alfa a 0xFF
+     * (como CopyTiledGuest). Otros tamanos de patron o de superficie, por
+     * software.
+     */
+    u32 texel = 0;
+    if (target->bpp == 4 && config.fill_32bit && !config.fill_24bit) {
+        texel = config.value_32bit;
+    } else if (target->bpp == 3 && config.fill_24bit) {
+        texel = static_cast<u32>(config.value_24bit_r.Value()) |
+                (static_cast<u32>(config.value_24bit_g.Value()) << 8) |
+                (static_cast<u32>(config.value_24bit_b.Value()) << 16) | 0xFF000000u;
+    } else {
+        static bool noted = false;
+        NoteOnce(noted, "gxm relleno", "por software: {}x{} bpp {} con patron de {} bits",
+                 target->width, target->height, target->bpp,
+                 config.fill_32bit ? 32 : (config.fill_24bit ? 24 : 16));
+        return false;
+    }
+    if (!EnsureBlitProgram()) {
+        return false;
+    }
+    if (!clear_texels.Valid()) {
+        clear_texels = Allocate(Pool::Host, 256 * 16);
+        if (!clear_texels.Valid()) {
+            return false;
+        }
+    }
+    if (!GuestSpanMapped(memory, start, end - start)) {
+        return false;
+    }
+    if (open_surface == target) {
+        EndScene();
+    }
+    /**
+     * La memoria del invitado se rellena igual que por software (una escritura
+     * seguida en RAM normal, sin esperar a nadie), asi que la superficie queda
+     * al dia y sin nada que volcar; lo unico que falta es pintar el color en
+     * nuestro color_buffer, y eso lo hace la GPU en la siguiente escena.
+     */
+    u8* const guest = memory.GetPhysicalPointer(start);
+    const u32 bytes = end - start;
+    if (target->bpp == 4) {
+        for (u32 offset = 0; offset + 4 <= bytes; offset += 4) {
+            std::memcpy(guest + offset, &texel, 4);
+        }
+    } else {
+        for (u32 offset = 0; offset + 3 <= bytes; offset += 3) {
+            std::memcpy(guest + offset, &texel, 3);
+        }
+    }
+    target->clear_pending = true;
+    target->clear_texel = texel;
+    target->needs_reload = false;
+    target->dirty = false;
+    target->copied = false;
+    // Lo demas que pudiera tener esa memoria, como en el relleno por software.
+    DropCopies(start, end - start);
+    if (textures != nullptr) {
+        textures->InvalidateRange(start, end - start);
+    }
+    software.InvalidateRegion(start, end - start);
+    gpu_fills.fetch_add(1, std::memory_order_relaxed);
+    static bool noted = false;
+    NoteOnce(noted, "gxm relleno", "superficie {:#010x} {}x{} rellenada en la GPU", start,
+             target->width, target->height);
+    return true;
+}
+
+/**
+ * El quad del relleno, dentro de la escena ya abierta en 'surface' y antes que
+ * cualquier lote: el blit con una textura de 1x1 del color, sin mezcla y sin
+ * tocar profundidad ni plantilla. El texel sale de un anillo de 256: cuando se
+ * reutiliza, la GPU ya ha terminado ese fotograma hace mucho (FlushForPresent
+ * espera a la primera escena de cada fotograma).
+ */
+void RasterizerGXM::DrawClearQuad(Surface& surface) {
+    surface.clear_pending = false;
+    SceGxmTextureFormat tex_format{};
+    if (!PresentTextureFormat(surface.gxm_color_format, tex_format)) {
+        return;
+    }
+    u8* texel = static_cast<u8*>(clear_texels.Data()) + (clear_texel_next % 256) * 16;
+    clear_texel_next++;
+    std::memcpy(texel, &surface.clear_texel, sizeof(u32));
+    SceGxmTexture texture{};
+    if (sceGxmTextureInitLinear(&texture, texel, tex_format, 1, 1, 1) < 0) {
+        return;
+    }
+    sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+    sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+    const float half_width = static_cast<float>(surface.width) * 0.5f;
+    const float half_height = static_cast<float>(surface.height) * 0.5f;
+    sceGxmSetViewport(context, half_width, half_width, half_height, -half_height, 0.5f, 0.5f);
+    sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_NONE, 0, 0, 0, 0);
+    sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+    sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+    sceGxmSetCullMode(context, SCE_GXM_CULL_NONE);
+    sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    sceGxmSetBackDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    sceGxmSetFrontStencilFunc(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+                              SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
+    sceGxmSetBackStencilFunc(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+                             SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
+    sceGxmSetVertexProgram(context, blit->vertex_program);
+    sceGxmSetFragmentProgram(context, blit->fragment_program);
+    const u8* quad = static_cast<const u8*>(blit->quad.Data());
+    sceGxmSetVertexStream(context, 0, quad);
+    sceGxmSetFragmentTexture(context, blit->texture_unit, &texture);
+    sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
+               quad + 8 * kBlitVertexStride, 4);
+}
+
+/// Una escena solo para pintar el relleno (cuando algo va a leer la
+/// superficie en la GPU sin que nadie haya dibujado en ella).
+void RasterizerGXM::FlushClear(Surface& surface) {
+    EndScene();
+    ClearDepthIfNeeded(surface);
+    if (sceGxmBeginScene(context, 0, surface.render_target, nullptr, nullptr, nullptr,
+                         &surface.color_surface, &surface.depth_surface) != 0) {
+        ApplyClearOnCpu(surface);
+        return;
+    }
+    surface.scene_open = true;
+    open_surface = &surface;
+    DrawClearQuad(surface);
+    EndScene();
+}
+
+/// El relleno a mano, para quien vaya a leer color_buffer con la CPU.
+void RasterizerGXM::ApplyClearOnCpu(Surface& surface) {
+    surface.clear_pending = false;
+    if (open_surface == &surface) {
+        EndScene();
+    }
+    WaitGpu();
+    u8* const base = static_cast<u8*>(surface.color_buffer.Data());
+    const u32 stride = surface.color_stride * surface.rt_bpp;
+    alignas(16) u32 row[1024];
+    std::fill_n(row, std::min<u32>(surface.width, 1024), surface.clear_texel);
+    for (u32 y = 0; y < surface.height; y++) {
+        std::memcpy(base + static_cast<std::size_t>(y) * stride, row, surface.width * 4);
+    }
 }
 
 bool RasterizerGXM::UpdateLightingLut() {
@@ -3384,6 +3564,9 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
             batch_on_gpu = false;
             NoteSkip(3, "framebuffer");
         }
+        if (!batch_on_gpu && available) {
+            PrepareSoftwareBatch();
+        }
     }
 
     if (!batch_on_gpu) {
@@ -3394,6 +3577,39 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
     batch.push_back(v0);
     batch.push_back(v1);
     batch.push_back(v2);
+}
+
+/**
+ * UN LOTE POR SOFTWARE EN UN FRAMEBUFFER QUE TAMBIEN DIBUJA LA GPU (0.1.9.6).
+ *
+ * El rasterizador de software pinta en la memoria del invitado. Hasta ahora
+ * nadie se lo decia a la superficie de la GPU: el software pintaba encima de
+ * una memoria atrasada (sin lo que ya habia dibujado la GPU) y despues la GPU
+ * seguia con SU copia y la copiaba a la pantalla. Lo dibujado por software
+ * desaparecia: el profesor de Zafiro Alfa, con sus lotes a software, no se
+ * veia. Ahora, antes del lote, lo de la GPU baja a la memoria, y la superficie
+ * queda para recargarse antes del siguiente lote de GPU o de copiarla.
+ */
+void RasterizerGXM::PrepareSoftwareBatch() {
+    const PAddr address =
+        pica.regs.internal.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
+    for (auto& surface : surfaces) {
+        if (surface->guest_address != address) {
+            continue;
+        }
+        // Un relleno pendiente sin nada dibujado encima ya esta en la memoria
+        // del invitado (ver AccelerateFill): solo hace falta bajar lo dibujado.
+        if (surface->dirty) {
+            if (open_surface == surface.get()) {
+                EndScene();
+            }
+            WriteBack(*surface);
+            software_syncs.fetch_add(1, std::memory_order_relaxed);
+        }
+        surface->needs_reload = true;
+        surface->dirty = false;
+        surface->copied = false;
+    }
 }
 
 bool RasterizerGXM::DrawBatchOnGpu() {
@@ -3663,6 +3879,9 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         }
         surface->scene_open = true;
         open_surface = surface;
+        if (surface->clear_pending) {
+            DrawClearQuad(*surface);
+        }
     }
 
     // Viewport: la misma transformacion que hace el rasterizador de software
@@ -4023,6 +4242,7 @@ void RasterizerGXM::DrawTriangles() {
         // referencia. La escena se cierra antes para que el software lea la
         // memoria ya volcada.
         FlushPending();
+        PrepareSoftwareBatch();
         for (std::size_t i = 0; i + 2 < batch.size(); i += 3) {
             software.AddTriangle(batch[i], batch[i + 1], batch[i + 2]);
             software_triangles.fetch_add(1, std::memory_order_relaxed);
@@ -4117,6 +4337,7 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
         if (hits_color) {
             surface->dirty = false;
             surface->needs_reload = true;
+            surface->clear_pending = false;
         }
         if (hits_depth) {
             surface->depth_needs_clear = true;
