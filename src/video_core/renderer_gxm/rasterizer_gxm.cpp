@@ -29,6 +29,7 @@
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_presenter.h"
 #include "video_core/renderer_gxm/gxm_texture_cache.h"
+#include "video_core/renderer_software/sw_rasterizer.h"
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
 #include "video_core/shader/generator/shader_gen.h"
@@ -2714,6 +2715,14 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         return false;
     };
 
+    /**
+     * Fotograma saltado (0.1.9.6): no se ha dibujado nada, la superficie solo
+     * tiene el borrado. La copia a la pantalla no se hace, por ningun camino:
+     * la pantalla se queda con el ultimo fotograma dibujado.
+     */
+    if (!SwRenderer::FrameSkip::ShouldRender() && available && IsDisplayFramebuffer(dst)) {
+        return true;
+    }
     if (transfer_on_gpu.load(std::memory_order_relaxed) == 0) {
         return reject("apagada");
     }
@@ -2733,6 +2742,7 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     if (!IsDisplayFramebuffer(dst)) {
         return reject("no es pantalla");
     }
+
     /**
      * El origen puede empezar DENTRO de la superficie (0.1.8.9). Zafiro Alfa
      * dibuja en 256x512 y copia las 400 filas de abajo: el origen esta 112
@@ -3533,6 +3543,9 @@ bool RasterizerGXM::AblatedByMode() const {
 
 void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                                 const Pica::OutputVertex& v2) {
+    if (!SwRenderer::FrameSkip::ShouldRender()) {
+        return;
+    }
     if (!batch_decided) {
         batch_decided = true;
         batch_on_gpu = false;
@@ -4514,6 +4527,15 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             Common::FrameStats::Add(Common::FrameStats::batch_us, begin);
         }
     } const batch_timer;
+    /**
+     * SALTO DE FOTOGRAMAS EN LA GPU (0.1.9.6). Hasta ahora SELECT+L/R solo se
+     * saltaba la PRESENTACION: la GPU emulada dibujaba todos los fotogramas
+     * igual, y por eso no se ganaba nada. En un fotograma saltado el lote se
+     * da por dibujado sin hacer nada: ni vertices en la CPU ni GPU.
+     */
+    if (!SwRenderer::FrameSkip::ShouldRender()) {
+        return true;
+    }
     /**
      * Y POR FASES (0.1.9.6), uno de cada 8 lotes: en que se va el coste fijo
      * de cada lote (en el 2D de Zafiro Alfa, ~70 us por lote y 230 lotes por

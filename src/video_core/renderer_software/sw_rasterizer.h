@@ -281,8 +281,10 @@ inline void Reset() {
  * conserva la ultima imagen completa en vez de parpadear con medio dibujo.
  */
 namespace FrameSkip {
-/// Fotogramas emulados por cada uno rasterizado. 1 = dibujar todos.
-inline std::atomic<u32> interval{3};
+/// Fotogramas emulados por cada uno rasterizado. 1 = dibujar todos. Desde
+/// 0.1.9.6 vale tambien para la GPU, y arranca en 1: el salto se pide con
+/// SELECT+R, no se impone (antes arrancaba en 3 y solo saltaba la presentacion).
+inline std::atomic<u32> interval{1};
 inline std::atomic<u32> counter{0};
 inline std::atomic<bool> render_current{true};
 
