@@ -81,6 +81,9 @@ void ReleaseCgOutput(const SceShaccCgCompileOutput* output);
  * acabe la compilacion en curso.
  */
 struct CgJob {
+    /// Vertices o fragmentos (0.1.9.8: los de fragmentos tambien van aqui).
+    SceShaccCgTargetProfile profile = SCE_SHACCCG_PROFILE_VP;
+    const char* name = "azahar_gxm_vs.cg";
     std::vector<std::string> sources;
     std::vector<u32> variants;
     /// Lo escribe el hilo de compilacion ANTES de poner done.
@@ -89,13 +92,8 @@ struct CgJob {
     std::atomic<bool> done{false};
 };
 
-void CgSubmit(std::shared_ptr<CgJob> job);
-
-/// El hilo de compilacion esta con un shader: quien no pueda esperar (un
-/// shader de fragmentos en mitad de un fotograma) lo deja para el lote
-/// siguiente.
-bool CgBusy();
-/// Avisa de que un shader de fragmentos espera al compilador (ver CgBusy).
-void CgFsWaiting();
+/// 'urgent' pone el trabajo delante de la cola (los de fragmentos: sin ellos
+/// el lote no se dibuja).
+void CgSubmit(std::shared_ptr<CgJob> job, bool urgent = false);
 
 } // namespace Gxm

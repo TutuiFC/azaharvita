@@ -1258,7 +1258,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                     fmt::format("tri/fot {:.0f} | tg {} ts {} lot {} vsg {} no {} ({}) vsh {} "
                                 "esc {} vol {} | gx tri {:.0f}% rell {:.0f}% tran {:.0f}% | "
                                 "par {:.0f} ins {:.0f} rap {:.0f}% | copia gpu {} de verdad {} | relleno gpu {} "
-                                "sinc soft {}",
+                                "sinc soft {} | saltados por compilar {}",
                                 stats_triangles_per_frame, stats_tri_gpu, stats_tri_sw,
                                 stats_gpu_batches, stats_hw_vs_batches, stats_hw_vs_rejects,
                                 stats_hw_vs_reason != nullptr ? stats_hw_vs_reason : "-",
@@ -1272,6 +1272,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 Gxm::RasterizerGXM::gpu_fills.exchange(
                                     0, std::memory_order_relaxed),
                                 Gxm::RasterizerGXM::software_syncs.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::skipped_batches.exchange(
                                     0, std::memory_order_relaxed))
                         .c_str());
                 Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());

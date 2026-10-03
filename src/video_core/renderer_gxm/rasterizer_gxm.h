@@ -152,6 +152,8 @@ public:
     [[nodiscard]] static std::string TakeBatchProfile();
     /// Veces que un lote por software tuvo que bajar antes lo de la GPU.
     static std::atomic<u32> software_syncs;
+    /// Lotes no dibujados porque su shader de fragmentos se compilaba (0.1.9.8).
+    static std::atomic<u32> skipped_batches;
 
     /// Interruptor del menu ("Copia de pantalla en GPU"). Encendido.
     static std::atomic<u32> transfer_on_gpu;
@@ -353,7 +355,7 @@ private:
     bool EnsureBlitProgram();
     /// La copia de esa pantalla, con su render target, creada o rehecha si
     /// hace falta. nullptr si no hay memoria.
-    ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format);
+    ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format, u32 bpp);
     /// El quad de la superficie a la copia, en una escena suya.
     bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip);
     /// Rellenos pendientes (ver AccelerateFill): el quad del color dentro de la
@@ -504,6 +506,8 @@ private:
     /// Decision de soporte para el lote en curso: se toma al primer triangulo.
     bool batch_decided = false;
     bool batch_on_gpu = false;
+    /// El lote en curso se salta: su shader de fragmentos se compila (0.1.9.8).
+    bool batch_skip = false;
     /**
      * Motivos de rechazo ya anotados, uno por hueco y una sola vez cada uno. En
      * orden: 0 libre (era el scissor, que ya no rechaza), 1 wbuffer, 2 shader,

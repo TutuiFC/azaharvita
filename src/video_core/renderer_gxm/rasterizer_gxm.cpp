@@ -57,6 +57,7 @@ std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
 std::atomic<u32> RasterizerGXM::gpu_fills{0};
 std::atomic<u32> RasterizerGXM::software_syncs{0};
+std::atomic<u32> RasterizerGXM::skipped_batches{0};
 RasterizerGXM* RasterizerGXM::s_instance = nullptr;
 
 const char* RasterizerGXM::Ablation::Name(u32 value) {
@@ -686,8 +687,10 @@ struct RasterizerGXM::ScreenCopy {
     u32 height = 0;
     /// El formato de la superficie de origen, que es el de la copia (32 bits).
     u32 gxm_color_format = 0;
-    /// Stride del buffer, en pixeles.
+    /// Stride del buffer, en pixeles, y bytes por pixel (4, o 2 en los de 16
+    /// bits desde 0.1.9.8).
     u32 stride = 0;
+    u32 bpp = 4;
     Pica::PixelFormat input_format = Pica::PixelFormat::RGBA8;
     Pica::PixelFormat output_format = Pica::PixelFormat::RGBA8;
     /// Tiene la ultima copia a esa pantalla...
@@ -1055,6 +1058,10 @@ struct RasterizerGXM::PipelineCache {
         const SceShaccCgCompileOutput* output = nullptr;
         SceGxmShaderPatcherId id{};
         bool registered = false;
+        /// Compilandose en el hilo de compilacion (0.1.9.8), y la mezcla con
+        /// la que se creara el programa cuando acabe.
+        std::shared_ptr<CgJob> job;
+        SceGxmBlendInfo blend{};
     };
 
     /**
@@ -1257,6 +1264,19 @@ struct RasterizerGXM::PipelineCache {
         PipelineKey key{config, blend_bits};
 
         const auto it = entries.find(key);
+        if (it != entries.end() && it->second->job != nullptr) {
+            Entry& pending = *it->second;
+            if (!pending.job->done.load(std::memory_order_acquire)) {
+                return fail("fs compilando");
+            }
+            const SceShaccCgCompileOutput* output = pending.job->output;
+            pending.job.reset();
+            const char* reason = nullptr;
+            if (!Finish(&pending, output, &reason)) {
+                pending.usable = false;
+                pending.reason = reason != nullptr ? reason : "shader";
+            }
+        }
         if (it != entries.end()) {
             /**
              * 0.1.5.9: un "no compila" de cuando el compilador estaba roto no es
@@ -1276,13 +1296,12 @@ struct RasterizerGXM::PipelineCache {
         entry->cg_generation = CgGeneration();
         const char* reason = nullptr;
         if (!Build(entry.get(), config, blend, &reason)) {
-            // Ocupado no es un fallo del shader: no se apunta, y el siguiente
-            // lote con esta configuracion lo vuelve a intentar.
-            if (reason != nullptr && std::strcmp(reason, "compilador ocupado") == 0) {
-                return fail(reason);
-            }
             entry->usable = false;
             entry->reason = reason != nullptr ? reason : "shader";
+        }
+        if (entry->job != nullptr) {
+            entries.emplace(key, std::move(entry));
+            return fail("fs compilando");
         }
         const bool usable = entry->usable;
         const char* stored_reason = entry->reason;
@@ -1335,16 +1354,41 @@ struct RasterizerGXM::PipelineCache {
 
         entry->lit = needs_lighting;
         entry->proj = needs_w;
+        entry->blend = blend;
         /**
-         * Si el hilo de compilacion esta con un shader de vertices (que puede
-         * tardar mucho), este no espera: el lote va por software y se vuelve a
-         * intentar en el siguiente (0.1.9.6). Leer de la cache no le espera.
+         * EN SEGUNDO PLANO (0.1.9.8). Compilar uno de estos en el hilo de
+         * emulacion eran 1-2 s de juego parado por cada material nuevo (Kirby
+         * Triple Deluxe: decenas seguidos), y si el hilo de compilacion estaba
+         * con uno de vertices, ademas esperar a que acabara. Ahora va delante
+         * de la cola del hilo de compilacion y, mientras tanto, los lotes con
+         * esta configuracion no se dibujan (Get: "fs compilando"). De la cache
+         * de la tarjeta se lee aqui mismo.
          */
-        if (CgBusy() && !CgCached(SCE_SHACCCG_PROFILE_FP, source->c_str())) {
-            CgFsWaiting();
-            return fail("compilador ocupado");
+        if (!CgCached(SCE_SHACCCG_PROFILE_FP, source->c_str())) {
+            auto job = std::make_shared<CgJob>();
+            job->profile = SCE_SHACCCG_PROFILE_FP;
+            job->name = "azahar_gxm_f.cg";
+            job->sources.push_back(std::move(*source));
+            job->variants.push_back(0);
+            entry->job = job;
+            CgSubmit(std::move(job), true);
+            return true;
         }
-        entry->output = CompileCg(SCE_SHACCCG_PROFILE_FP, "azahar_gxm_f.cg", source->c_str());
+        return Finish(entry,
+                      CompileCg(SCE_SHACCCG_PROFILE_FP, "azahar_gxm_f.cg", source->c_str()),
+                      out_reason);
+    }
+
+    /// Registra el programa compilado y crea el de fragmentos con su mezcla.
+    bool Finish(Entry* entry, const SceShaccCgCompileOutput* output, const char** out_reason) {
+        const auto fail = [out_reason](const char* reason) {
+            if (out_reason != nullptr) {
+                *out_reason = reason;
+            }
+            return false;
+        };
+        const SceGxmBlendInfo& blend = entry->blend;
+        entry->output = output;
         if (entry->output == nullptr) {
             // CompileCg deja en crash.txt el nombre del fichero Y el primer
             // mensaje del compilador, que es lo unico con lo que se puede
@@ -2279,7 +2323,7 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
         out.data = static_cast<const u8*>(copy->color_buffer.Data());
         out.width = copy->width;
         out.height = copy->height;
-        out.stride_bytes = copy->stride * 4;
+        out.stride_bytes = copy->stride * copy->bpp;
         out.gxm_texture_format = static_cast<u32>(tex_format);
         return out;
     }
@@ -2375,14 +2419,14 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
     WaitGpu();
     u8* const dst = memory.GetPhysicalPointer(copy.dst);
     const u8* const src = static_cast<const u8*>(copy.color_buffer.Data());
-    const u32 src_stride = copy.stride * 4;
+    const u32 src_stride = copy.stride * copy.bpp;
     const u32 out_bpp = Pica::BytesPerPixel(copy.output_format);
     const bool rgba_to_rgb = copy.input_format == Pica::PixelFormat::RGBA8 &&
                              copy.output_format == Pica::PixelFormat::RGB8;
     alignas(16) u8 row[1024 * 4];
     for (u32 y = 0; y < copy.height; y++) {
         // CDRAM se lee sin cache: la fila de una vez y despues de memoria normal.
-        std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride, copy.width * 4);
+        std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride, copy.width * copy.bpp);
         u8* out = dst + static_cast<std::size_t>(y) * copy.width * out_bpp;
         if (rgba_to_rgb) {
             for (u32 x = 0; x < copy.width; x++) {
@@ -2390,8 +2434,8 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
                 out[x * 3 + 1] = row[x * 4 + 2];
                 out[x * 3 + 2] = row[x * 4 + 3];
             }
-        } else if (out_bpp == 4) {
-            std::memcpy(out, row, copy.width * 4);
+        } else if (out_bpp == copy.bpp) {
+            std::memcpy(out, row, copy.width * out_bpp);
         } else {
             // RGB8: la superficie lleva 4 bytes por pixel y los 3 primeros son
             // los del invitado (ver CurrentSurface).
@@ -2532,7 +2576,7 @@ bool RasterizerGXM::EnsureBlitProgram() {
 }
 
 RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u32 height,
-                                                       u32 gxm_color_format) {
+                                                       u32 gxm_color_format, u32 bpp) {
     std::unique_ptr<ScreenCopy>* slot = nullptr;
     for (auto& copy : screen_copies) {
         if (copy->dst == dst) {
@@ -2554,7 +2598,9 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
     copy->height = height;
     copy->gxm_color_format = gxm_color_format;
     copy->stride = (width + 7) & ~7u;
-    copy->color_buffer = Allocate(Pool::Cdram, copy->stride * height * 4, SCE_GXM_MEMORY_ATTRIB_RW);
+    copy->bpp = bpp;
+    copy->color_buffer =
+        Allocate(Pool::Cdram, copy->stride * height * bpp, SCE_GXM_MEMORY_ATTRIB_RW);
     if (!copy->color_buffer.Valid()) {
         NoteOnce(noted, "gxm copia", "sin memoria para {}x{}", width, height);
         return nullptr;
@@ -2742,10 +2788,10 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         config.scaling != Pica::DisplayTransferConfig::NoScale) {
         return reject("modo");
     }
-    // Superficies de 32 bits: RGBA8 a RGBA8 o RGB8, y RGB8 a RGB8.
-    if ((in_format != Pica::PixelFormat::RGBA8 && in_format != Pica::PixelFormat::RGB8) ||
-        (in_format != out_format &&
-         !(in_format == Pica::PixelFormat::RGBA8 && out_format == Pica::PixelFormat::RGB8))) {
+    // El mismo formato, o RGBA8 a RGB8. Los de 16 bits desde 0.1.9.8
+    // (New Super Mario Bros. 2 dibuja en RGB565).
+    if (in_format != out_format &&
+        !(in_format == Pica::PixelFormat::RGBA8 && out_format == Pica::PixelFormat::RGB8)) {
         return reject("formato");
     }
     if (!IsDisplayFramebuffer(dst)) {
@@ -2783,14 +2829,27 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         return reject("superficie por recargar");
     }
     if (source->width != config.input_width || source->bpp != Pica::BytesPerPixel(in_format) ||
-        source->rt_bpp != 4 || width == 0 || height == 0 || width > source->width ||
+        width == 0 || height == 0 || width > source->width ||
         first_row + height > source->height || width > 1024) {
         return reject("medidas");
+    }
+    // Con el mismo tamano de pixel, el formato de verdad de la superficie
+    // tiene que ser el de la copia (en 16 bits hay tres).
+    const auto source_format = static_cast<SceGxmColorFormat>(source->gxm_color_format);
+    const bool same_format =
+        (in_format == Pica::PixelFormat::RGBA8 && source_format == SCE_GXM_COLOR_FORMAT_U8U8U8U8_RGBA) ||
+        (in_format == Pica::PixelFormat::RGB8 && source_format == SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB) ||
+        (in_format == Pica::PixelFormat::RGB565 && source_format == SCE_GXM_COLOR_FORMAT_U5U6U5_RGB) ||
+        (in_format == Pica::PixelFormat::RGB5A1 &&
+         source_format == SCE_GXM_COLOR_FORMAT_U5U5U5U1_RGBA) ||
+        (in_format == Pica::PixelFormat::RGBA4 && source_format == SCE_GXM_COLOR_FORMAT_U4U4U4U4_RGBA);
+    if (!same_format) {
+        return reject("formato de la superficie");
     }
     if (!EnsureBlitProgram()) {
         return reject("sin blit");
     }
-    ScreenCopy* copy = GetScreenCopy(dst, width, height, source->gxm_color_format);
+    ScreenCopy* copy = GetScreenCopy(dst, width, height, source->gxm_color_format, source->rt_bpp);
     if (copy == nullptr) {
         return reject("sin copia");
     }
@@ -2873,6 +2932,9 @@ bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
         texel = static_cast<u32>(config.value_24bit_r.Value()) |
                 (static_cast<u32>(config.value_24bit_g.Value()) << 8) |
                 (static_cast<u32>(config.value_24bit_b.Value()) << 16) | 0xFF000000u;
+    } else if (target->bpp == 2 && !config.fill_24bit && !config.fill_32bit) {
+        // 16 bits (0.1.9.8): mismos dos bytes en el invitado y en la superficie.
+        texel = config.value_16bit;
     } else {
         static bool noted = false;
         NoteOnce(noted, "gxm relleno", "por software: {}x{} bpp {} con patron de {} bits",
@@ -2903,14 +2965,8 @@ bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
      */
     u8* const guest = memory.GetPhysicalPointer(start);
     const u32 bytes = end - start;
-    if (target->bpp == 4) {
-        for (u32 offset = 0; offset + 4 <= bytes; offset += 4) {
-            std::memcpy(guest + offset, &texel, 4);
-        }
-    } else {
-        for (u32 offset = 0; offset + 3 <= bytes; offset += 3) {
-            std::memcpy(guest + offset, &texel, 3);
-        }
+    for (u32 offset = 0; offset + target->bpp <= bytes; offset += target->bpp) {
+        std::memcpy(guest + offset, &texel, target->bpp);
     }
     if (whole) {
         // Todo el color es el relleno: lo de antes ya no cuenta.
@@ -3016,13 +3072,16 @@ void RasterizerGXM::ApplyClearOnCpu(Surface& surface) {
     WaitGpu();
     u8* const base = static_cast<u8*>(surface.color_buffer.Data());
     const u32 stride = surface.color_stride * surface.rt_bpp;
-    alignas(16) u32 row[1024];
+    alignas(16) u8 row[1024 * 4];
+    const u32 width = std::min<u32>(surface.width, 1024);
     for (u32 i = 0; i < count; i++) {
         const Surface::PendingClear& clear = surface.clears[i];
-        std::fill_n(row, std::min<u32>(surface.width, 1024), clear.texel);
+        for (u32 x = 0; x < width; x++) {
+            std::memcpy(row + x * surface.rt_bpp, &clear.texel, surface.rt_bpp);
+        }
         for (u32 y = clear.first_row; y < clear.first_row + clear.rows && y < surface.height;
              y++) {
-            std::memcpy(base + static_cast<std::size_t>(y) * stride, row, surface.width * 4);
+            std::memcpy(base + static_cast<std::size_t>(y) * stride, row, width * surface.rt_bpp);
         }
     }
 }
@@ -3598,7 +3657,7 @@ bool RasterizerGXM::AblatedByMode() const {
 
 void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                                 const Pica::OutputVertex& v2) {
-    if (!SwRenderer::FrameSkip::ShouldRender()) {
+    if (!SwRenderer::FrameSkip::ShouldRender() || batch_skip) {
         return;
     }
     if (!batch_decided) {
@@ -3649,6 +3708,17 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
             const char* reason = nullptr;
             batch_on_gpu =
                 !wbuffering && pipelines->Get(pica.regs.internal, &reason) != nullptr;
+            /**
+             * Su shader de fragmentos se esta compilando en segundo plano
+             * (0.1.9.8): el lote no se dibuja, ni por software. Es un momento,
+             * y por software costaria mas que el propio lote (volcar y recargar
+             * la superficie).
+             */
+            if (!batch_on_gpu && reason != nullptr && std::strcmp(reason, "fs compilando") == 0) {
+                batch_skip = true;
+                skipped_batches.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
 
             /**
              * La ablacion, al final y por encima de todo lo demas: manda a
@@ -4337,6 +4407,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
 }
 
 void RasterizerGXM::DrawTriangles() {
+    batch_skip = false;
     if (!batch_on_gpu) {
         batch_decided = false;
         batch.clear();
@@ -4644,7 +4715,14 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     if (regs.rasterizer.depthmap_enable == RasterizerRegs::DepthBuffering::WBuffering) {
         return HwVsReject("wbuffer");
     }
-    const PipelineCache::Entry* pipeline = pipelines->Get(regs);
+    const char* fs_reason = nullptr;
+    const PipelineCache::Entry* pipeline = pipelines->Get(regs, &fs_reason);
+    // Su shader de fragmentos se esta compilando: el lote se salta (0.1.9.8).
+    if (pipeline == nullptr && fs_reason != nullptr &&
+        std::strcmp(fs_reason, "fs compilando") == 0) {
+        skipped_batches.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
     if (pipeline == nullptr || AblatedByMode()) {
         // El motivo lo anota la ruta de la CPU al llegar a AddTriangle.
         return HwVsReject("fragmentos");

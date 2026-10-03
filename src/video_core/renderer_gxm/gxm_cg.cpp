@@ -205,11 +205,10 @@ std::set<const SceShaccCgCompileOutput*> g_cached_outputs;
 /// Protege g_cached_outputs (0.1.9.6): leer de la cache de la tarjeta no
 /// necesita el compilador, asi que no espera a la compilacion en curso.
 std::mutex g_outputs_mutex;
-/// El hilo de compilacion esta compilando (ver CgBusy).
-std::atomic<bool> g_worker_busy{false};
-/// Un shader de fragmentos no se pudo compilar por estar ocupado: el hilo de
-/// compilacion le deja hueco antes de su siguiente compilacion (CgFsWaiting).
-std::atomic<bool> g_fs_waiting{false};
+/// El hilo de compilacion: su etapa no se apunta para el vigilante, que mira
+/// solo el hilo de emulacion (0.1.9.8).
+pthread_t g_worker_thread{};
+bool g_worker_running = false;
 bool g_cache_dir_ready = false;
 u32 g_cache_notes = 0;
 
@@ -706,7 +705,9 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
                                             .c_str());
     }
     const SceShaccCgCompileOutput* output = nullptr;
-    {
+    if (g_worker_running && pthread_equal(pthread_self(), g_worker_thread)) {
+        output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
+    } else {
         const Common::ScopedVitaStage stage{"compilando shader"};
         output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     }
@@ -869,31 +870,20 @@ void* CgWorkerMain(void*) {
             job = std::move(g_jobs.front());
             g_jobs.pop_front();
         }
-        g_worker_busy.store(true, std::memory_order_relaxed);
         for (std::size_t i = 0; i < job->sources.size(); i++) {
-            if (CgPoisoned()) {
+            // Los de vertices dejan de pedirse con el compilador roto; los de
+            // fragmentos no (ver RecoverFromInternalError).
+            if (job->profile == SCE_SHACCCG_PROFILE_VP && CgPoisoned()) {
                 break;
             }
-            /**
-             * Los de fragmentos, primero: sin ellos el lote se dibuja por
-             * software, y uno de vertices solo cuesta que el lote siga en la
-             * CPU un rato mas. Con el hilo libre 100 ms, el de emulacion lo
-             * compila en el siguiente lote que lo pida.
-             */
-            if (g_fs_waiting.exchange(false, std::memory_order_relaxed)) {
-                g_worker_busy.store(false, std::memory_order_relaxed);
-                sceKernelDelayThread(100 * 1000);
-                g_worker_busy.store(true, std::memory_order_relaxed);
-            }
             const SceShaccCgCompileOutput* output =
-                CompileCg(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", job->sources[i].c_str());
+                CompileCg(job->profile, job->name, job->sources[i].c_str());
             if (output != nullptr) {
                 job->output = output;
                 job->used_variant = job->variants[i];
                 break;
             }
         }
-        g_worker_busy.store(false, std::memory_order_relaxed);
         job->done.store(true, std::memory_order_release);
     }
     return nullptr;
@@ -901,15 +891,7 @@ void* CgWorkerMain(void*) {
 
 } // Anonymous namespace
 
-bool CgBusy() {
-    return g_worker_busy.load(std::memory_order_relaxed);
-}
-
-void CgFsWaiting() {
-    g_fs_waiting.store(true, std::memory_order_relaxed);
-}
-
-void CgSubmit(std::shared_ptr<CgJob> job) {
+void CgSubmit(std::shared_ptr<CgJob> job, bool urgent) {
     std::lock_guard lock{g_jobs_mutex};
     if (!g_worker_started) {
         g_worker_started = true;
@@ -922,9 +904,9 @@ void CgSubmit(std::shared_ptr<CgJob> job) {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 1024 * 1024);
-        pthread_t thread;
-        if (pthread_create(&thread, &attr, &CgWorkerMain, nullptr) == 0) {
-            pthread_detach(thread);
+        if (pthread_create(&g_worker_thread, &attr, &CgWorkerMain, nullptr) == 0) {
+            g_worker_running = true;
+            pthread_detach(g_worker_thread);
         } else {
             g_worker_started = false;
         }
@@ -933,8 +915,8 @@ void CgSubmit(std::shared_ptr<CgJob> job) {
             // Sin hilo: se compila aqui mismo, como antes.
             job->done.store(false, std::memory_order_relaxed);
             for (std::size_t i = 0; i < job->sources.size(); i++) {
-                const SceShaccCgCompileOutput* output = CompileCg(
-                    SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", job->sources[i].c_str());
+                const SceShaccCgCompileOutput* output =
+                    CompileCg(job->profile, job->name, job->sources[i].c_str());
                 if (output != nullptr) {
                     job->output = output;
                     job->used_variant = job->variants[i];
@@ -946,7 +928,11 @@ void CgSubmit(std::shared_ptr<CgJob> job) {
         }
         Common::VitaNote("gxm compila", "hilo de compilacion en segundo plano listo");
     }
-    g_jobs.push_back(std::move(job));
+    if (urgent) {
+        g_jobs.push_front(std::move(job));
+    } else {
+        g_jobs.push_back(std::move(job));
+    }
     g_jobs_ready.notify_one();
 }
 
