@@ -6,6 +6,7 @@
 
 #include <array>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <psp2/gxm.h>
@@ -80,7 +81,7 @@ public:
      * llamadas al sistema que no son baratas -- pero el tope real lo pone el
      * presupuesto de abajo, no este numero.
      */
-    static constexpr u32 kMaxEntries = 48;
+    static constexpr u32 kMaxEntries = 192;
 
     /**
      * Tope de memoria de GPU para las texturas decodificadas, en bytes.
@@ -90,7 +91,16 @@ public:
      * sitio de sobra por si una fase posterior quiere mas. Al llegar al tope se
      * expulsa la entrada menos usada recientemente hasta que quepa la nueva.
      */
-    static constexpr u32 kMemoryBudget = 32u * 1024u * 1024u;
+    static constexpr u32 kMemoryBudget = 64u * 1024u * 1024u;
+    /**
+     * 0.1.9.9: 48 entradas y 32 MB se quedaban cortas en un 3D normal. Kirby
+     * Triple Deluxe usa mas de 48 texturas por fotograma: se echaban unas a
+     * otras y se volvian a decodificar TODAS en cada fotograma (crash.txt de
+     * 0.1.9.8: "tx" 171 ms por fotograma). Y cada bloque de CDRAM se redondea a
+     * 256 KB, asi que una textura de 64x64 se comia 256 KB del presupuesto: las
+     * de hasta kSmallTexture van a memoria normal, que se redondea a 4 KB.
+     */
+    static constexpr u32 kSmallTexture = 64u * 1024u;
 
     TextureCache(); // en el .cpp: unique_ptr<Etc1BlockCache> necesita el tipo completo
     ~TextureCache();
@@ -167,6 +177,9 @@ private:
     Entry& MakeRoom(u32 needed);
 
     std::array<Entry, kMaxEntries> entries;
+    /// Clave -> entrada (0.1.9.9): con 192, recorrerlas en cada consulta (tres
+    /// por lote, cientos de lotes) ya costaria.
+    std::unordered_map<u64, u32> index;
     /// Memoria a la espera de que la GPU acabe con ella (ver ReleaseRetired).
     std::vector<Allocation> retired;
     /// Lo retirado, con la valla de la ultima escena que pudo leerlo.

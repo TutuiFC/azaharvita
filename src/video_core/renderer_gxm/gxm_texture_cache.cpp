@@ -65,6 +65,9 @@ bool MapWrap(TexturingRegs::TextureConfig::WrapMode wrap, SceGxmTextureAddrMode*
 constexpr u32 kCdramGrain = 256u * 1024u;
 
 constexpr u32 EstimateBlockBytes(u32 needed) {
+    if (needed <= TextureCache::kSmallTexture) {
+        return (needed + 4095u) / 4096u * 4096u;
+    }
     return (needed + kCdramGrain - 1) / kCdramGrain * kCdramGrain;
 }
 
@@ -141,6 +144,7 @@ void TextureCache::Retire(Entry& entry) {
         return;
     }
     bytes_used -= entry.buffer.Size();
+    index.erase(entry.key);
     entry.valid = false;
     entry.key = 0;
     entry.address = 0;
@@ -355,10 +359,8 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
                     (static_cast<u64>(min_linear) << 60) | (static_cast<u64>(mag_linear) << 61);
 
     clock++;
-    for (auto& entry : entries) {
-        if (!entry.valid || entry.key != key) {
-            continue;
-        }
+    if (const auto found = index.find(key); found != index.end()) {
+        Entry& entry = entries[found->second];
         if (entry.stale) {
             // Sospechosa (ver InvalidateRange): se revalida por contenido. La
             // direccion y el tramo son los de la clave, asi que son los mismos
@@ -375,11 +377,12 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
                 // Ha cambiado de verdad: se retira y se decodifica abajo.
                 Common::FrameStats::texture_changed.fetch_add(1, std::memory_order_relaxed);
                 Retire(entry);
-                break;
             }
         }
-        entry.last_use = clock;
-        return &entry.texture;
+        if (entry.valid) {
+            entry.last_use = clock;
+            return &entry.texture;
+        }
     }
 
     const Pica::Texture::TextureInfo info =
@@ -412,10 +415,12 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     Entry& entry = MakeRoom(needed);
 
     // CDRAM primero: la CPU la escribe una vez y la GPU la lee en cada
-    // dibujado, que es justo el caso que pide memoria dedicada.
-    Allocation buffer = Allocate(Pool::Cdram, needed);
+    // dibujado, que es justo el caso que pide memoria dedicada. Las pequenas,
+    // a memoria normal (ver kSmallTexture).
+    const Pool first = needed <= kSmallTexture ? Pool::Host : Pool::Cdram;
+    Allocation buffer = Allocate(first, needed);
     if (!buffer.Valid()) {
-        buffer = Allocate(Pool::Host, needed);
+        buffer = Allocate(first == Pool::Host ? Pool::Cdram : Pool::Host, needed);
     }
     if (!buffer.Valid()) {
         LOG_ERROR(Render, "GXM: sin memoria para decodificar una textura de {}x{}", width, height);
@@ -519,6 +524,7 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     entry.stale = false;
     bytes_used += buffer.Size();
     entry.buffer = std::move(buffer);
+    index[key] = static_cast<u32>(&entry - entries.data());
     return &entry.texture;
 }
 
