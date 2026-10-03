@@ -2816,7 +2816,9 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
 }
 
 bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
-    if (!available) {
+    // Mismo interruptor que la copia de pantalla: los dos son pintar en la
+    // GPU lo que antes hacia la CPU en la memoria del invitado.
+    if (!available || transfer_on_gpu.load(std::memory_order_relaxed) == 0) {
         return false;
     }
     const PAddr start = config.GetStartAddress();

@@ -559,7 +559,7 @@ void DrawSettings(vita2d_pgf* font, int row) {
                                          "Pantallas",
                                          "Omitir imagenes repetidas",
                                          "Vertices especializados a GPU",
-                                         "Copia de pantalla en GPU"};
+                                         "Copia y borrado en GPU"};
     char volume_text[16];
     std::snprintf(volume_text, sizeof(volume_text), "%d %%", g_user.volume_percent);
     const char* values[kSettingsRows] = {
@@ -641,9 +641,9 @@ void DrawSettings(vita2d_pgf* font, int row) {
         {"ON: los shaders con saltos se compilan una vez por combinacion de opciones.",
          "Ganancia: la mayor en 3D (Zafiro Alfa: de ~2.5 FPS con OFF a varias veces mas).",
          "Contra: la 1a vez que sale cada uno, la escena se para unos segundos. Si crashea, apagar."},
-        {"ON: la imagen del juego pasa a la pantalla sin bajar a la CPU y volver a subir.",
-         "Ganancia: en juegos 3D, la CPU no espera a la GPU ni copia la imagen (varios ms).",
-         "Contra: si ves imagenes viejas, parpadeos o la pantalla congelada, apagar."},
+        {"ON: copia de pantalla y borrados en la GPU, sin bajar a la CPU y volver a subir.",
+         "Ganancia: el 2D de Zafiro Alfa paso de 11 a 22 FPS; en 3D, varios ms por fotograma.",
+         "Contra: si ves imagenes viejas, colores raros o parpadeos, apagar."},
     };
     vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
     vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);
