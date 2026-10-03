@@ -332,7 +332,7 @@ private:
     /// hace falta. nullptr si no hay memoria.
     ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format);
     /// El quad de la superficie a la copia, en una escena suya.
-    bool BlitToCopy(ScreenCopy& copy, const Surface& source, bool flip);
+    bool BlitToCopy(ScreenCopy& copy, const Surface& source, u32 first_row, bool flip);
     /// La direccion es una de las pantallas que el juego ha configurado.
     bool IsDisplayFramebuffer(PAddr addr);
     /// Las ultimas direcciones vistas en la configuracion de las pantallas:

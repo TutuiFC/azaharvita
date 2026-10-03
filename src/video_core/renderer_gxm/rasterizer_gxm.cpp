@@ -1582,10 +1582,33 @@ struct RasterizerGXM::HwShaderCache {
             patcher, program.id, attributes, attribute_count, streams, stream_count,
             &vertex_program);
         if (rc != 0) {
-            static bool noted = false;
-            NoteOnce(noted, "gxm vs", "crear programa de vertices err {:#x} ({} atributos, {} "
-                                      "flujos)",
-                     static_cast<u32>(rc), attribute_count, stream_count);
+            static u32 noted_count = 0;
+            bool noted = noted_count >= 4;
+            noted_count++;
+            if (!noted) {
+                // Cada atributo: registro, componentes (las nuestras / las del
+                // parametro compilado), formato, flujo y desplazamiento.
+                std::string detail;
+                for (u32 i = 0; i < attribute_count; i++) {
+                    const SceGxmVertexAttribute& a = attributes[i];
+                    u32 declared = 0;
+                    for (const auto* input : program.inputs) {
+                        if (input != nullptr &&
+                            sceGxmProgramParameterGetResourceIndex(input) == a.regIndex) {
+                            declared = sceGxmProgramParameterGetComponentCount(input);
+                        }
+                    }
+                    detail += fmt::format(" r{}:{}/{} f{} s{}+{}", a.regIndex, a.componentCount,
+                                          declared, static_cast<u32>(a.format), a.streamIndex,
+                                          a.offset);
+                }
+                for (u32 i = 0; i < stream_count; i++) {
+                    detail += fmt::format(" paso{}", streams[i].stride);
+                }
+                Common::VitaNote("gxm vs", fmt::format("crear programa de vertices err {:#x}:{}",
+                                                       static_cast<u32>(rc), detail)
+                                               .c_str());
+            }
             vertex_program = nullptr;
         }
         // Tambien el fallo: nullptr en el mapa es "no se puede", sin reintentar.
@@ -2358,15 +2381,18 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
     return slot->get();
 }
 
-bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, const Surface& source, bool flip) {
+bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, const Surface& source, u32 first_row,
+                               bool flip) {
     SceGxmTextureFormat tex_format{};
     if (!PresentTextureFormat(source.gxm_color_format, tex_format)) {
         return false;
     }
     SceGxmTexture& texture = copy.source_texture;
-    if (sceGxmTextureInitLinearStrided(&texture, source.color_buffer.Data(), tex_format,
-                                       copy.width, copy.height,
-                                       source.color_stride * source.rt_bpp) < 0) {
+    const u32 source_stride = source.color_stride * source.rt_bpp;
+    const u8* first = static_cast<const u8*>(source.color_buffer.Data()) +
+                      static_cast<std::size_t>(first_row) * source_stride;
+    if (sceGxmTextureInitLinearStrided(&texture, first, tex_format, copy.width, copy.height,
+                                       source_stride) < 0) {
         return false;
     }
     sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
@@ -2469,11 +2495,28 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     if (!IsDisplayFramebuffer(dst)) {
         return reject("no es pantalla");
     }
+    /**
+     * El origen puede empezar DENTRO de la superficie (0.1.8.9). Zafiro Alfa
+     * dibuja en 256x512 y copia las 400 filas de abajo: el origen esta 112
+     * filas despues del principio ("sin superficie" en 0.1.8.7). La memoria
+     * del invitado va en filas de mosaicos de 8 y nuestra fila y es la fila y
+     * del invitado (CopyTiledGuest no voltea), asi que basta con que el salto
+     * sea de filas de mosaicos enteras.
+     */
+    u32 first_row = 0;
     for (auto& surface : surfaces) {
-        if (surface->guest_address == src) {
-            source = surface.get();
-            break;
+        const u32 row_bytes = surface->width * surface->bpp;
+        if (src < surface->guest_address || row_bytes == 0 ||
+            src >= surface->guest_address + row_bytes * surface->height) {
+            continue;
         }
+        const u32 offset = src - surface->guest_address;
+        if (offset % (row_bytes * 8) != 0) {
+            continue;
+        }
+        source = surface.get();
+        first_row = offset / row_bytes;
+        break;
     }
     if (source == nullptr) {
         return reject("sin superficie");
@@ -2484,7 +2527,7 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     }
     if (source->width != config.input_width || source->bpp != Pica::BytesPerPixel(in_format) ||
         source->rt_bpp != 4 || width == 0 || height == 0 || width > source->width ||
-        height > source->height || width > 1024) {
+        first_row + height > source->height || width > 1024) {
         return reject("medidas");
     }
     if (!EnsureBlitProgram()) {
@@ -2498,7 +2541,7 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     // Lo que hubiera en esa pantalla deja de valer, como en la copia por
     // software (la copia anterior a ella incluida).
     InvalidateRegion(dst, dst_size);
-    if (!BlitToCopy(*copy, *source, config.flip_vertically != 0)) {
+    if (!BlitToCopy(*copy, *source, first_row, config.flip_vertically != 0)) {
         return reject("escena");
     }
     copy->dst_size = dst_size;
@@ -4273,7 +4316,15 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             out.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
             break;
         }
-        out.componentCount = static_cast<u8>(inputs[reg].components);
+        /**
+         * No mas componentes de las que tiene el parametro COMPILADO (0.1.8.9).
+         * El compilador quita las que el shader no lee (un float4 del que solo
+         * se usa .xy queda en 2), y pasarle a GXM mas de las que hay es el
+         * 0x805b0023 de los shaders de piel de Zafiro Alfa: 213 lotes por
+         * fotograma sombreados en la CPU.
+         */
+        out.componentCount = static_cast<u8>(std::min<u32>(
+            inputs[reg].components, sceGxmProgramParameterGetComponentCount(program->inputs[reg])));
         out.regIndex =
             static_cast<u16>(sceGxmProgramParameterGetResourceIndex(program->inputs[reg]));
         layout_key = Common::HashCombine(
