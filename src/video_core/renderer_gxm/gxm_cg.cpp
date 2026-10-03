@@ -201,6 +201,11 @@ static_assert(sizeof(CacheHeader) == 40, "cabecera de la cache de shaders");
 
 /// Salidas que vienen de la cache: se liberan con free, no con shacccg.
 std::set<const SceShaccCgCompileOutput*> g_cached_outputs;
+/// Protege g_cached_outputs (0.1.9.6): leer de la cache de la tarjeta no
+/// necesita el compilador, asi que no espera a la compilacion en curso.
+std::mutex g_outputs_mutex;
+/// El hilo de compilacion esta compilando (ver CgBusy).
+std::atomic<bool> g_worker_busy{false};
 bool g_cache_dir_ready = false;
 u32 g_cache_notes = 0;
 
@@ -257,7 +262,10 @@ const SceShaccCgCompileOutput* LoadCached(const CacheHeader& want, const std::st
     output->programSize = have.program_size;
     output->diagnosticCount = 0;
     output->diagnostics = nullptr;
-    g_cached_outputs.insert(output);
+    {
+        const std::lock_guard lock{g_outputs_mutex};
+        g_cached_outputs.insert(output);
+    }
     return output;
 }
 
@@ -279,7 +287,10 @@ const SceShaccCgCompileOutput* CopyOutput(const SceShaccCgCompileOutput& source)
     output->programSize = source.programSize;
     output->diagnosticCount = 0;
     output->diagnostics = nullptr;
-    g_cached_outputs.insert(output);
+    {
+        const std::lock_guard lock{g_outputs_mutex};
+        g_cached_outputs.insert(output);
+    }
     return output;
 }
 
@@ -601,9 +612,9 @@ bool CgCached(SceShaccCgTargetProfile profile, const char* source) {
 
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
                                          const char* source) {
-    const std::lock_guard lock{g_cg_mutex};
     // Cache en la tarjeta (0.1.5.8): si este codigo fuente ya se compilo
-    // alguna vez, el binario se lee de disco. Ver CacheHeader.
+    // alguna vez, el binario se lee de disco. Ver CacheHeader. Sin el cerrojo
+    // del compilador (0.1.9.6): no hay que esperar a que acabe otra compilacion.
     const std::size_t source_size = std::strlen(source);
     CacheHeader key{};
     key.magic = kCacheMagic;
@@ -621,6 +632,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
             return cached;
         }
     }
+    const std::lock_guard lock{g_cg_mutex};
     LoadBadSources();
     if (g_bad_sources.count(BadSource{key.hash_city, key.hash_fnv}) != 0) {
         return nullptr; // ya rompio el compilador una vez: ni se intenta
@@ -809,14 +821,17 @@ void ReleaseCgOutput(const SceShaccCgCompileOutput* output) {
     if (output == nullptr) {
         return;
     }
-    const std::lock_guard lock{g_cg_mutex};
     // Las que vinieron de la cache son un malloc nuestro (0.1.5.8).
-    const auto it = g_cached_outputs.find(output);
-    if (it != g_cached_outputs.end()) {
-        g_cached_outputs.erase(it);
-        std::free(const_cast<SceShaccCgCompileOutput*>(output));
-        return;
+    {
+        const std::lock_guard lock{g_outputs_mutex};
+        const auto it = g_cached_outputs.find(output);
+        if (it != g_cached_outputs.end()) {
+            g_cached_outputs.erase(it);
+            std::free(const_cast<SceShaccCgCompileOutput*>(output));
+            return;
+        }
     }
+    const std::lock_guard lock{g_cg_mutex};
     sceShaccCgDestroyCompileOutput(output);
 }
 
@@ -838,6 +853,7 @@ void* CgWorkerMain(void*) {
             job = std::move(g_jobs.front());
             g_jobs.pop_front();
         }
+        g_worker_busy.store(true, std::memory_order_relaxed);
         for (std::size_t i = 0; i < job->sources.size(); i++) {
             if (CgPoisoned()) {
                 break;
@@ -850,12 +866,17 @@ void* CgWorkerMain(void*) {
                 break;
             }
         }
+        g_worker_busy.store(false, std::memory_order_relaxed);
         job->done.store(true, std::memory_order_release);
     }
     return nullptr;
 }
 
 } // Anonymous namespace
+
+bool CgBusy() {
+    return g_worker_busy.load(std::memory_order_relaxed);
+}
 
 void CgSubmit(std::shared_ptr<CgJob> job) {
     std::lock_guard lock{g_jobs_mutex};

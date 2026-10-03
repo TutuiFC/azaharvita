@@ -1268,6 +1268,11 @@ struct RasterizerGXM::PipelineCache {
         entry->cg_generation = CgGeneration();
         const char* reason = nullptr;
         if (!Build(entry.get(), config, blend, &reason)) {
+            // Ocupado no es un fallo del shader: no se apunta, y el siguiente
+            // lote con esta configuracion lo vuelve a intentar.
+            if (reason != nullptr && std::strcmp(reason, "compilador ocupado") == 0) {
+                return fail(reason);
+            }
             entry->usable = false;
             entry->reason = reason != nullptr ? reason : "shader";
         }
@@ -1322,6 +1327,14 @@ struct RasterizerGXM::PipelineCache {
 
         entry->lit = needs_lighting;
         entry->proj = needs_w;
+        /**
+         * Si el hilo de compilacion esta con un shader de vertices (que puede
+         * tardar mucho), este no espera: el lote va por software y se vuelve a
+         * intentar en el siguiente (0.1.9.6). Leer de la cache no le espera.
+         */
+        if (CgBusy() && !CgCached(SCE_SHACCCG_PROFILE_FP, source->c_str())) {
+            return fail("compilador ocupado");
+        }
         entry->output = CompileCg(SCE_SHACCCG_PROFILE_FP, "azahar_gxm_f.cg", source->c_str());
         if (entry->output == nullptr) {
             // CompileCg deja en crash.txt el nombre del fichero Y el primer
@@ -1719,12 +1732,12 @@ private:
         /**
          * TOPE DE TAMANO (0.1.9.2). crash.txt de 0.1.9.0 y 0.1.9.1: un shader de
          * vertices de 26 KB de Cg pasaba mas de 30 s en el compilador, con picos
-         * de 27 MB y hasta 20 MB retenidos despues. Aunque ya no congele (se
-         * compila aparte), uno asi deja al compilador sin memoria para el resto
-         * de la sesion: va a la CPU. Si ya esta en la cache de la tarjeta se
-         * usa, porque leerlo es inmediato.
+         * de 27 MB y hasta 20 MB retenidos despues. Desde 0.1.9.6 se compila
+         * aparte (sin congelar) y queda en la cache de la tarjeta, asi que el
+         * tope sube de 16 a 32 KB: el coste se paga una vez y la siguiente
+         * partida lo lee al momento. Mas grande que eso, a la CPU.
          */
-        constexpr std::size_t kMaxCompileSource = 16u * 1024u;
+        constexpr std::size_t kMaxCompileSource = 32u * 1024u;
         const bool cached = CgCached(SCE_SHACCCG_PROFILE_VP, sources.front().c_str());
         if (sources.front().size() > kMaxCompileSource && !cached) {
             static u32 big_notes = 0;
@@ -4501,6 +4514,22 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             Common::FrameStats::Add(Common::FrameStats::batch_us, begin);
         }
     } const batch_timer;
+    /**
+     * Y POR FASES (0.1.9.6), uno de cada 8 lotes: en que se va el coste fijo
+     * de cada lote (en el 2D de Zafiro Alfa, ~70 us por lote y 230 lotes por
+     * fotograma). Solo cuentan los lotes que llegan a dibujarse.
+     */
+    static u32 profile_tick = 0;
+    const bool profile = (++profile_tick & 7u) == 0;
+    std::array<unsigned long long, kBatchPhases> phase_us{};
+    unsigned long long phase_mark = profile ? Common::VitaMicros() : 0;
+    const auto phase = [&](u32 index) {
+        if (profile) {
+            const unsigned long long now = Common::VitaMicros();
+            phase_us[index] += now - phase_mark;
+            phase_mark = now;
+        }
+    };
     using Pica::PipelineRegs;
     using Pica::Shader::Generator::GXM::VSInputs;
     using Pica::Shader::Generator::GXM::VSInputSource;
@@ -4542,6 +4571,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         // El motivo lo anota la ruta de la CPU al llegar a AddTriangle.
         return HwVsReject("fragmentos");
     }
+    phase(0);
 
     const u32 num_vertices = pipeline_regs.num_vertices;
     if (num_vertices == 0) {
@@ -4735,6 +4765,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         NoteSkip(5, reason != nullptr ? reason : "vs");
         return HwVsReject(reason != nullptr ? reason : "vs");
     }
+    phase(1);
 
     /**
      * Flujos y atributos de GXM. Un flujo por cargador que aporte algun
@@ -4874,6 +4905,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         NoteSkip(5, "vs enlazar atributos");
         return HwVsReject("vs enlazar atributos");
     }
+    phase(2);
     // El MISMO programa de fragmentos que la ruta de la CPU: el shader de
     // vertices traducido escribe exactamente los varyings de la variante fija
     // contra la que se enlazo (FormatFor(lit, proj)).
@@ -4999,9 +5031,11 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         draw_indices = out;
     }
 
+    phase(3);
     if (!SetupDrawState(surface, pipeline, vertex_program, fragment_program)) {
         return HwVsReject("estado");
     }
+    phase(4);
     for (u32 stream = 0; stream < stream_count; stream++) {
         sceGxmSetVertexStream(context, stream, stream_data[stream]);
     }
@@ -5066,7 +5100,32 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     gpu_triangles.fetch_add(triangles, std::memory_order_relaxed);
     gpu_batches.fetch_add(1, std::memory_order_relaxed);
     hw_vs_batches.fetch_add(1, std::memory_order_relaxed);
+    phase(5);
+    if (profile) {
+        for (u32 i = 0; i < kBatchPhases; i++) {
+            batch_phase_us[i] += phase_us[i];
+        }
+        batch_phase_samples++;
+    }
     return true;
+}
+
+std::array<unsigned long long, RasterizerGXM::kBatchPhases> RasterizerGXM::batch_phase_us{};
+u32 RasterizerGXM::batch_phase_samples = 0;
+
+std::string RasterizerGXM::TakeBatchProfile() {
+    const u32 samples = batch_phase_samples;
+    const auto avg = [samples](unsigned long long total) {
+        return samples == 0 ? 0.0 : static_cast<double>(total) / samples;
+    };
+    std::string text = fmt::format(
+        "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
+        "uniforms {:.1f} ({} muestras)",
+        avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
+        avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(batch_phase_us[5]), samples);
+    batch_phase_us.fill(0);
+    batch_phase_samples = 0;
+    return text;
 }
 
 } // namespace Gxm

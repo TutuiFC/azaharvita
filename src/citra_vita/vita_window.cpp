@@ -1235,6 +1235,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 Gxm::RasterizerGXM::software_syncs.exchange(
                                     0, std::memory_order_relaxed))
                         .c_str());
+                Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
                 Common::VitaNote(
                     "jit",
                     fmt::format("{} {:.0f}% Mi {:.2f} arm {:.1f} | bloques {} rechazados {} "

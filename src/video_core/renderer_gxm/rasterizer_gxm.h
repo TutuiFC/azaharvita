@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <string>
 #include <vector>
 #include <psp2/gxm.h>
 #include "common/common_types.h"
@@ -142,6 +143,13 @@ public:
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
     /// Rellenos hechos asi (overlay y crash.txt).
     static std::atomic<u32> gpu_fills;
+
+    /// Coste de AccelerateDrawBatch por fases, muestreado (0.1.9.6). La linea
+    /// para crash.txt, y se pone a cero.
+    static constexpr u32 kBatchPhases = 6;
+    static std::array<unsigned long long, kBatchPhases> batch_phase_us;
+    static u32 batch_phase_samples;
+    [[nodiscard]] static std::string TakeBatchProfile();
     /// Veces que un lote por software tuvo que bajar antes lo de la GPU.
     static std::atomic<u32> software_syncs;
 

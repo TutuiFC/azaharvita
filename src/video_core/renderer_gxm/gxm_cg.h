@@ -91,4 +91,9 @@ struct CgJob {
 
 void CgSubmit(std::shared_ptr<CgJob> job);
 
+/// El hilo de compilacion esta con un shader: quien no pueda esperar (un
+/// shader de fragmentos en mitad de un fotograma) lo deja para el lote
+/// siguiente.
+bool CgBusy();
+
 } // namespace Gxm
