@@ -172,8 +172,7 @@ void ConfigureSettings() {
     Settings::values.use_shader_jit = false;
     // Shader de vertices en la GPU (0.1.4.6): PicaCore le pregunta a
     // RasterizerGXM::AccelerateDrawBatch antes de ejecutar el interprete. Lo que
-    // no se pueda acelerar sigue por la CPU lote a lote, y la ablacion "vs en
-    // cpu" (SELECT + ABAJO) lo apaga entero para comparar en la consola.
+    // no se pueda acelerar sigue por la CPU lote a lote.
     Settings::values.use_hw_shader = true;
     Settings::values.use_disk_shader_cache = false;
     Settings::values.async_shader_compilation = false;
@@ -489,10 +488,10 @@ void LoadUserSettings() {
     read_bool("copia_gpu=", g_user.gpu_screen_copy);
 }
 
-void SaveUserSettings() {
-    char buffer[512];
-    const int length = std::snprintf(
-        buffer, sizeof(buffer),
+/// El contenido de ajustes.txt, una clave por linea.
+int FormatUserSettings(char* buffer, std::size_t size) {
+    return std::snprintf(
+        buffer, size,
         "volumen=%d\nidioma=%d\nresolucion_media=%d\njit_cache_reg=%d\n"
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
@@ -503,6 +502,24 @@ void SaveUserSettings() {
         g_user.vs_escapes ? 1 : 0, g_user.full_vertex_dedup ? 1 : 0, g_user.sound ? 1 : 0,
         g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0,
         g_user.gpu_screen_copy ? 1 : 0);
+}
+
+/// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
+/// esto no se sabe si una partida lenta llevaba algo apagado en ajustes.txt.
+void NoteUserSettings() {
+    char buffer[512];
+    const int length = FormatUserSettings(buffer, sizeof(buffer));
+    for (int i = 0; i < length && i < static_cast<int>(sizeof(buffer)) - 1; i++) {
+        if (buffer[i] == '\n') {
+            buffer[i] = ' ';
+        }
+    }
+    WriteCrashLog("ajustes", buffer);
+}
+
+void SaveUserSettings() {
+    char buffer[512];
+    const int length = FormatUserSettings(buffer, sizeof(buffer));
     const SceUID fd = sceIoOpen(kSettingsFile, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd < 0) {
         WriteCrashLog("ajustes", "no se pudo guardar ajustes.txt");
@@ -737,6 +754,7 @@ void RunSettingsMenu(vita2d_pgf* font) {
     }
     ApplyUserSettings();
     SaveUserSettings();
+    NoteUserSettings();
 }
 
 /// Dibuja una pantalla de texto simple centrada (menu y mensajes).
@@ -1603,6 +1621,7 @@ void Run(vita2d_pgf* font) {
     // Encima, lo que el usuario eligio en la ventana de ajustes la ultima vez.
     LoadUserSettings();
     ApplyUserSettings();
+    NoteUserSettings();
 
     DrawStep(font, "4/7 configurando mandos");
     VitaFrontend::Input::Init();
