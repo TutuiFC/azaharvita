@@ -20,6 +20,8 @@ namespace Common {
 
 namespace {
 constexpr char kCrashLog[] = "ux0:/data/azahar/crash.txt";
+/// El crash.txt del juego en curso (0.1.9.7), o vacio. Ver SetVitaGameLog.
+char g_game_log[160] = {};
 
 /// "fichero.cpp:1234" del ultimo fallo fatal. Estatico a proposito: no reserva
 /// memoria, que cuando esto se llena puede que no quede.
@@ -92,11 +94,31 @@ void VitaNote(const char* title, const char* detail) {
     sceIoMkdir("ux0:/data", 0777);
     sceIoMkdir("ux0:/data/azahar", 0777);
     const SceUID fd = sceIoOpen(kCrashLog, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-    if (fd < 0) {
+    if (fd >= 0) {
+        sceIoWrite(fd, line, n);
+        sceIoClose(fd);
+    }
+    if (g_game_log[0] != '\0') {
+        const SceUID game_fd =
+            sceIoOpen(g_game_log, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (game_fd >= 0) {
+            sceIoWrite(game_fd, line, n);
+            sceIoClose(game_fd);
+        }
+    }
+}
+
+void SetVitaGameLog(const char* path) {
+    if (path == nullptr) {
+        g_game_log[0] = '\0';
         return;
     }
-    sceIoWrite(fd, line, n);
-    sceIoClose(fd);
+    std::strncpy(g_game_log, path, sizeof(g_game_log) - 1);
+    g_game_log[sizeof(g_game_log) - 1] = '\0';
+}
+
+const char* VitaGameLog() {
+    return g_game_log;
 }
 
 const char* LastFatalMessage() {

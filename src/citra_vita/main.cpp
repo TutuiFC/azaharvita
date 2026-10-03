@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -886,17 +887,54 @@ constexpr char kCrashLog[] = "ux0:/data/azahar/crash.txt";
 void WriteCrashLog(const char* title, const char* detail) {
     sceIoMkdir("ux0:/data", 0777);
     sceIoMkdir("ux0:/data/azahar", 0777);
-    const SceUID fd = sceIoOpen(kCrashLog, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-    if (fd < 0) {
-        return;
+    const char* game_log = Common::VitaGameLog();
+    for (const char* file : {static_cast<const char*>(kCrashLog), game_log}) {
+        if (file[0] == '\0') {
+            continue;
+        }
+        const SceUID fd = sceIoOpen(file, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd < 0) {
+            continue;
+        }
+        sceIoWrite(fd, title, std::strlen(title));
+        sceIoWrite(fd, ": ", 2);
+        if (detail != nullptr) {
+            sceIoWrite(fd, detail, std::strlen(detail));
+        }
+        sceIoWrite(fd, "\n", 1);
+        sceIoClose(fd);
     }
-    sceIoWrite(fd, title, std::strlen(title));
-    sceIoWrite(fd, ": ", 2);
-    if (detail != nullptr) {
-        sceIoWrite(fd, detail, std::strlen(detail));
+}
+
+/**
+ * El crash.txt de este juego (0.1.9.7): ux0:/data/azahar/crash_<nombre del
+ * fichero de la ROM>.txt, con lo que no sea letra o numero cambiado por '_'.
+ * Empieza de cero en cada partida con la version y los ajustes; el de la
+ * partida anterior de ese juego queda como crash_<nombre>_anterior.txt.
+ */
+void StartGameLog(const std::string& rom_path) {
+    std::string name = rom_path.substr(rom_path.find_last_of("/:") + 1);
+    const std::size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos) {
+        name.resize(dot);
     }
-    sceIoWrite(fd, "\n", 1);
-    sceIoClose(fd);
+    for (char& c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c))) {
+            c = '_';
+        }
+    }
+    if (name.size() > 60) {
+        name.resize(60);
+    }
+    const std::string base = "ux0:/data/azahar/crash_" + name;
+    const std::string path = base + ".txt";
+    const std::string previous = base + "_anterior.txt";
+    Common::SetVitaGameLog(nullptr);
+    sceIoRemove(previous.c_str());
+    sceIoRename(path.c_str(), previous.c_str());
+    Common::SetVitaGameLog(path.c_str());
+    WriteCrashLog("version", kVersion);
+    NoteUserSettings();
 }
 
 /// Extrae tipo y mensaje de la excepcion que esta provocando el terminate.
@@ -1325,6 +1363,7 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
 
     // Las rutas que use el emulador quedan anotadas: si algo peta recorriendo
     // directorios, saber cual estaba mirando es media respuesta.
+    StartGameLog(path);
     WriteCrashLog("carga", path.c_str());
     WriteCrashLog("ruta user", FileUtil::GetUserPath(FileUtil::UserPath::UserDir).c_str());
     WriteCrashLog("ruta sdmc", FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir).c_str());

@@ -224,6 +224,15 @@ inline void Reset() {
 void VitaNote(const char* title, const char* detail);
 
 /**
+ * UN crash.txt POR JUEGO (0.1.9.7). Desde que se carga un juego, cada nota va
+ * tambien a este fichero (ux0:/data/azahar/crash_<juego>.txt), ademas de a
+ * crash.txt: asi el de cada juego queda guardado aunque despues se abra otro.
+ * nullptr lo quita.
+ */
+void SetVitaGameLog(const char* path);
+const char* VitaGameLog();
+
+/**
  * Donde esta ahora el hilo de emulacion, para el vigilante de main.cpp
  * (0.1.9.0): si el emulador se queda congelado sin crashear, crash.txt dice en
  * que paso (esperando a la GPU, abriendo una escena, compilando un shader...).
