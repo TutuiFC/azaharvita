@@ -647,6 +647,15 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     g_compiles_since_load++;
     const bool fresh_compiler = g_compiles_since_load == 1;
     g_tracking = true;
+    // Que se compila y de que tamano, a crash.txt (0.1.9.1): en 0.1.9.0 el
+    // juego se quedaba congelado dentro de una compilacion sin saber cual.
+    static u32 start_notes = 0;
+    if (start_notes < 24) {
+        start_notes++;
+        Common::VitaNote("gxm compila", fmt::format("{}: {} bytes de codigo, heap libre {} KB",
+                                                    name, g_source.size, FreeHeap() / 1024)
+                                            .c_str());
+    }
     const SceShaccCgCompileOutput* output = nullptr;
     {
         const Common::ScopedVitaStage stage{"compilando shader"};
@@ -757,6 +766,21 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     }
     sceShaccCgDestroyCompileOutput(output);
     NoteCompileMemory(name, heap_before, live_before);
+    /**
+     * TOPE DE LO QUE RETIENE EL COMPILADOR (0.1.9.1). Desde 0.1.8.5 no se le
+     * pide que suelte nada (ver NoteCompileMemory), y con los shaders de piel
+     * de Zafiro Alfa retenia 8 MB mas por compilacion: 8, 16, 24... y bad_alloc.
+     * Pasado el tope no se traducen mas shaders de vertices (son los grandes);
+     * los de fragmentos, que son los que hacen falta para dibujar, si.
+     */
+    constexpr std::size_t kMaxRetained = 12u * 1024u * 1024u;
+    if (g_live_bytes > kMaxRetained && !g_poisoned) {
+        g_poisoned = true;
+        Common::VitaNote("gxm mem", fmt::format("el compilador retiene {} KB: no se traducen mas "
+                                                "shaders de vertices en esta sesion",
+                                                g_live_bytes / 1024)
+                                        .c_str());
+    }
     return copy;
 }
 

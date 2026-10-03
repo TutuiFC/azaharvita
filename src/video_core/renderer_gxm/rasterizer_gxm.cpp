@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <fmt/format.h>
 #include <psp2/kernel/modulemgr.h>
@@ -1605,6 +1606,21 @@ struct RasterizerGXM::HwShaderCache {
                 for (u32 i = 0; i < stream_count; i++) {
                     detail += fmt::format(" paso{}", streams[i].stride);
                 }
+                // Y los atributos que declara el programa compilado: nombre,
+                // registro, componentes y tipo.
+                detail += " | prog";
+                const u32 params = sceGxmProgramGetParameterCount(program.gxp);
+                for (u32 i = 0; i < params; i++) {
+                    const SceGxmProgramParameter* param = sceGxmProgramGetParameter(program.gxp, i);
+                    if (sceGxmProgramParameterGetCategory(param) !=
+                        SCE_GXM_PARAMETER_CATEGORY_ATTRIBUTE) {
+                        continue;
+                    }
+                    detail += fmt::format(" {}:r{}:{}t{}", sceGxmProgramParameterGetName(param),
+                                          sceGxmProgramParameterGetResourceIndex(param),
+                                          sceGxmProgramParameterGetComponentCount(param),
+                                          static_cast<u32>(sceGxmProgramParameterGetType(param)));
+                }
                 Common::VitaNote("gxm vs", fmt::format("crear programa de vertices err {:#x}:{}",
                                                        static_cast<u32>(rc), detail)
                                                .c_str());
@@ -1738,6 +1754,14 @@ public:
      */
     static constexpr u32 kMaxSpecializedPerProgram = 16;
     std::unordered_map<u64, u32> specialized_count;
+
+    /**
+     * Claves genericas cuyo programa GXM no deja enlazar con ninguna
+     * disposicion de atributos (0.1.9.1). Sus especializados no se compilan:
+     * en Zafiro Alfa cada uno tardaba hasta 30 s con el juego congelado,
+     * dejaba 8 MB retenidos en el compilador y despues no se podia usar.
+     */
+    std::unordered_set<u64> unlinkable;
 
     [[nodiscard]] bool Has(u64 key) const {
         return programs.find(key) != programs.end();
@@ -4192,6 +4216,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     // GenerateVertexShader): entra en la clave.
     program_key = Common::HashCombine(program_key, (pipeline->lit ? 2u : 0u) |
                                                        (pipeline->proj ? 1u : 0u));
+    if (hw_shaders->unlinkable.count(program_key) != 0) {
+        return HwVsReject("vs enlazar atributos");
+    }
     const char* reason = nullptr;
     const HwShaderCache::Program* program =
         hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs, pipeline->lit,
@@ -4388,6 +4415,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
     }
     if (vertex_program == nullptr) {
+        hw_shaders->unlinkable.insert(program_key);
         NoteSkip(5, "vs enlazar atributos");
         return HwVsReject("vs enlazar atributos");
     }
