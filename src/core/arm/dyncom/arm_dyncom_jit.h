@@ -75,6 +75,7 @@
 #ifdef __PSVITA__
 
 #include <array>
+#include <string>
 #include <atomic>
 #include "common/common_types.h"
 
@@ -160,6 +161,10 @@ enum RejectReason : u32 {
 };
 
 const char* RejectName(u32 reason);
+
+/// Las instrucciones que mas despachos mandan al interprete como "otro", para
+/// crash.txt (0.1.9.6). Las pone a cero.
+std::string TakeRejectWords();
 
 /// Estadisticas desde la ultima llamada (las pone a cero). Las acumula el hilo
 /// de emulacion y se publican al final de cada rodaja; esto lo lee el overlay.

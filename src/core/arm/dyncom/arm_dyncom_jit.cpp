@@ -9,6 +9,7 @@
 
 #include "core/arm/dyncom/arm_dyncom_jit.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -753,6 +754,7 @@ struct Block {
     u32 visits = 0;
     BlockState state = BlockState::New;
     u32 reject = kRejectNone; ///< por que se rechazo (RejectReason)
+    u32 reject_word = 0;      ///< la instruccion que no se supo compilar (0.1.9.6)
     BlockFn code = nullptr;
     BlockFn check_code = nullptr;
     /// Donde entra un enlace (despues del prologo). Se publica en link.entry
@@ -997,6 +999,15 @@ bool DataProcessingBranchesOnPc(u32 opcode) {
 
 Decoded Classify(u32 inst) {
     const u32 cond = inst >> 28;
+    /**
+     * PLD (0.1.9.6): una pista de precarga, y el interprete no hace nada con
+     * ella (PLD_INST solo avanza el PC). Esta en los bucles de memcpy y memset,
+     * y rechazarla mandaba esos bucles enteros al interprete. Mismo patron que
+     * la entrada "pld" de arm_dyncom_dec.cpp: inmediato y por registro.
+     */
+    if ((inst & 0xFD70F000u) == 0xF550F000u) {
+        return Supported(Kind::Nop);
+    }
     if (cond == 0xF) {
         return Reject(kRejectOther); // espacio incondicional (BLX inmediato, PLD...)
     }
@@ -2669,6 +2680,7 @@ bool Analyze(ARMul_State* cpu, Block& block) {
         if (decoded.kind == Kind::Unsupported) {
             block.words.clear();
             block.reject = decoded.reject;
+            block.reject_word = inst;
             return false;
         }
         block.words.push_back(inst);
@@ -2991,6 +3003,8 @@ void StartCheck(ARMul_State* cpu, Block& block, u8* const* pages) {
 
 } // Anonymous namespace
 
+void CountRejectWord(u32 word);
+
 namespace {
 
 /**
@@ -3016,6 +3030,9 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
         return block;
     case BlockState::Rejected:
         g_local.rejects[block->reject]++;
+        if (block->reject == kRejectOther) {
+            CountRejectWord(block->reject_word);
+        }
         return nullptr;
     case BlockState::Blacklisted:
         g_local.rejects[kRejectOther]++;
@@ -3306,6 +3323,45 @@ void AbandonPendingCheck(u32 slice_instructions) {
         slices_since_flush = 0;
         FlushLocalStats();
     }
+}
+
+namespace {
+/**
+ * Las instrucciones que mas bloques mandan al interprete como "otro" (0.1.9.6),
+ * contadas por despacho: sin esto "rech otro 7%" no dice que falta por
+ * traducir. 16 huecos; cuando se llenan, las nuevas no entran.
+ */
+struct RejectWord {
+    u32 word = 0;
+    u32 count = 0;
+};
+std::array<RejectWord, 16> g_reject_words{};
+} // Anonymous namespace
+
+void CountRejectWord(u32 word) {
+    for (auto& entry : g_reject_words) {
+        if (entry.count == 0) {
+            entry.word = word;
+            entry.count = 1;
+            return;
+        }
+        if (entry.word == word) {
+            entry.count++;
+            return;
+        }
+    }
+}
+
+std::string TakeRejectWords() {
+    auto sorted = g_reject_words;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const RejectWord& a, const RejectWord& b) { return a.count > b.count; });
+    std::string text;
+    for (std::size_t i = 0; i < 6 && sorted[i].count != 0; i++) {
+        text += fmt::format(" {:08x}x{}", sorted[i].word, sorted[i].count);
+    }
+    g_reject_words = {};
+    return text.empty() ? std::string(" -") : text;
 }
 
 const char* RejectName(u32 reason) {
