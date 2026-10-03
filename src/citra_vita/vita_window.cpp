@@ -1231,13 +1231,17 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                     "gpu",
                     fmt::format("tri/fot {:.0f} | tg {} ts {} lot {} vsg {} no {} ({}) vsh {} "
                                 "esc {} vol {} | gx tri {:.0f}% rell {:.0f}% tran {:.0f}% | "
-                                "par {:.0f} ins {:.0f} rap {:.0f}%",
+                                "par {:.0f} ins {:.0f} rap {:.0f}% | copia gpu {} de verdad {}",
                                 stats_triangles_per_frame, stats_tri_gpu, stats_tri_sw,
                                 stats_gpu_batches, stats_hw_vs_batches, stats_hw_vs_rejects,
                                 stats_hw_vs_reason != nullptr ? stats_hw_vs_reason : "-",
                                 stats_vertices_shaded, stats_gpu_scenes, stats_gpu_writebacks,
                                 stats_gx_cmdlist, stats_gx_fill, stats_gx_transfer,
-                                stats_shade_occupancy, stats_instrs_per_vertex, stats_fast_percent)
+                                stats_shade_occupancy, stats_instrs_per_vertex, stats_fast_percent,
+                                Gxm::RasterizerGXM::gpu_transfers.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::transfer_materialized.exchange(
+                                    0, std::memory_order_relaxed))
                         .c_str());
                 Common::VitaNote(
                     "jit",

@@ -363,6 +363,8 @@ struct UserSettings {
     /// vertices y sin compilar si no hay 85 MB libres (ver gxm_cg.cpp). Clave
     /// nueva: el ajustes.txt de 0.1.8.2 trae vs_especializar=0.
     bool vs_specialize = true;
+    /// 0.1.8.6: copia de pantalla en la GPU (RasterizerGXM::transfer_on_gpu).
+    bool gpu_screen_copy = true;
 };
 UserSettings g_user;
 
@@ -428,6 +430,8 @@ void ApplyUserSettings() {
     VitaFrontend::g_skip_repeated_frames.store(g_user.skip_repeated, std::memory_order_relaxed);
     Gxm::RasterizerGXM::specialize_vs.store(g_user.vs_specialize ? 1u : 0u,
                                             std::memory_order_relaxed);
+    Gxm::RasterizerGXM::transfer_on_gpu.store(g_user.gpu_screen_copy ? 1u : 0u,
+                                              std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -482,6 +486,7 @@ void LoadUserSettings() {
     }
     read_bool("omitir_repetidas=", g_user.skip_repeated);
     read_bool("vs_especializar2=", g_user.vs_specialize);
+    read_bool("copia_gpu=", g_user.gpu_screen_copy);
 }
 
 void SaveUserSettings() {
@@ -491,12 +496,13 @@ void SaveUserSettings() {
         "volumen=%d\nidioma=%d\nresolucion_media=%d\njit_cache_reg=%d\n"
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
-        "omitir_repetidas=%d\nvs_especializar2=%d\n",
+        "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
         g_user.vs_escapes ? 1 : 0, g_user.full_vertex_dedup ? 1 : 0, g_user.sound ? 1 : 0,
-        g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0);
+        g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0,
+        g_user.gpu_screen_copy ? 1 : 0);
     const SceUID fd = sceIoOpen(kSettingsFile, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd < 0) {
         WriteCrashLog("ajustes", "no se pudo guardar ajustes.txt");
@@ -506,11 +512,11 @@ void SaveUserSettings() {
     sceIoClose(fd);
 }
 
-constexpr int kSettingsRows = 14;
+constexpr int kSettingsRows = 15;
 
 void DrawSettings(vita2d_pgf* font, int row) {
     constexpr int kFirstY = 100;
-    constexpr int kRowStep = 23;
+    constexpr int kRowStep = 20;
     constexpr int kValueX = 330;
 
     vita2d_start_drawing();
@@ -533,7 +539,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
                                          "Sonido",
                                          "Pantallas",
                                          "Omitir imagenes repetidas",
-                                         "Vertices especializados a GPU"};
+                                         "Vertices especializados a GPU",
+                                         "Copia de pantalla en GPU"};
     char volume_text[16];
     std::snprintf(volume_text, sizeof(volume_text), "%d %%", g_user.volume_percent);
     const char* values[kSettingsRows] = {
@@ -550,7 +557,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
         g_user.sound ? "ON" : "OFF",
         kLayoutNames[std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1)],
         g_user.skip_repeated ? "ON" : "OFF",
-        g_user.vs_specialize ? "ON" : "OFF"};
+        g_user.vs_specialize ? "ON" : "OFF",
+        g_user.gpu_screen_copy ? "ON" : "OFF"};
 
     for (int i = 0; i < kSettingsRows; i++) {
         const int y = kFirstY + i * kRowStep;
@@ -614,6 +622,9 @@ void DrawSettings(vita2d_pgf* font, int row) {
         {"ON: los shaders con saltos se compilan una vez por combinacion de opciones.",
          "Ganancia: la mayor en 3D (Zafiro Alfa: de ~2.5 FPS con OFF a varias veces mas).",
          "Contra: la 1a vez que sale cada uno, la escena se para unos segundos. Si crashea, apagar."},
+        {"ON: la imagen del juego pasa a la pantalla sin bajar a la CPU y volver a subir.",
+         "Ganancia: en juegos 3D, la CPU no espera a la GPU ni copia la imagen (varios ms).",
+         "Contra: si ves imagenes viejas, parpadeos o la pantalla congelada, apagar."},
     };
     vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
     vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);
@@ -644,6 +655,8 @@ void RunSettingsMenu(vita2d_pgf* font) {
     g_user.full_vertex_dedup = Pica::g_full_vertex_dedup.load(std::memory_order_relaxed);
     g_user.vs_specialize =
         Gxm::RasterizerGXM::specialize_vs.load(std::memory_order_relaxed) != 0;
+    g_user.gpu_screen_copy =
+        Gxm::RasterizerGXM::transfer_on_gpu.load(std::memory_order_relaxed) != 0;
 
     int row = 0;
     // Todo lo que ya este pulsado al entrar (el START que la abrio) cuenta como
@@ -711,8 +724,11 @@ void RunSettingsMenu(vita2d_pgf* font) {
             case 12:
                 g_user.skip_repeated = !g_user.skip_repeated;
                 break;
-            default:
+            case 13:
                 g_user.vs_specialize = !g_user.vs_specialize;
+                break;
+            default:
+                g_user.gpu_screen_copy = !g_user.gpu_screen_copy;
                 break;
             }
             ApplyUserSettings();
