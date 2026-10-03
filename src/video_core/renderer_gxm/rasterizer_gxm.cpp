@@ -19,6 +19,7 @@
 #include "common/vita_diag.h"
 #include "core/memory.h"
 #include "video_core/pica/pica_core.h"
+#include "video_core/pica/regs_external.h"
 #include "video_core/pica/regs_framebuffer.h"
 #include "video_core/pica/regs_lighting.h"
 #include "video_core/pica/regs_rasterizer.h"
@@ -48,6 +49,9 @@ std::atomic<u32> RasterizerGXM::Ablation::mode{0};
 std::atomic<u32> RasterizerGXM::no_finish_wait{1};
 std::atomic<u32> RasterizerGXM::present_direct{1};
 std::atomic<u32> RasterizerGXM::specialize_vs{1};
+std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
+std::atomic<u32> RasterizerGXM::gpu_transfers{0};
+std::atomic<u32> RasterizerGXM::transfer_materialized{0};
 RasterizerGXM* RasterizerGXM::s_instance = nullptr;
 
 const char* RasterizerGXM::Ablation::Name(u32 value) {
@@ -606,6 +610,9 @@ struct RasterizerGXM::Surface {
     u32 gxm_color_format = 0;
     /// Hay dibujado nuestro que el invitado todavia no ha visto.
     bool dirty = false;
+    /// Sube cada vez que cambia color_buffer (escena nueva o recarga): una
+    /// copia de pantalla en la GPU vale mientras no cambie (0.1.8.6).
+    u32 content_serial = 0;
     /// El invitado ha cambiado este framebuffer por otro camino (un relleno de
     /// color, una transferencia): hay que volver a leerlo antes de dibujar.
     bool needs_reload = false;
@@ -642,6 +649,24 @@ struct RasterizerGXM::Surface {
     SceGxmDepthStencilSurface depth_surface{};
     Allocation color_buffer;
     Allocation depth_buffer;
+};
+
+/// Una copia de pantalla hecha en la GPU (0.1.8.6, ver AccelerateDisplayTransfer).
+struct RasterizerGXM::Forward {
+    bool valid = false;
+    /// Destino en la memoria del invitado y lo que ocupa.
+    PAddr dst = 0;
+    u32 dst_size = 0;
+    /// Origen: la superficie, y su content_serial cuando se hizo la copia.
+    Surface* surface = nullptr;
+    u32 serial = 0;
+    /// Medidas y formato de la salida (lineal).
+    u32 width = 0;
+    u32 height = 0;
+    Pica::PixelFormat input_format = Pica::PixelFormat::RGBA8;
+    Pica::PixelFormat output_format = Pica::PixelFormat::RGBA8;
+    /// El presentador ya la ha mostrado al menos una vez.
+    bool presented = false;
 };
 
 /// Comprueba que el tramo [address, address + size) de la memoria del invitado
@@ -1856,6 +1881,7 @@ void RasterizerGXM::WriteBack(Surface& surface) {
 }
 
 void RasterizerGXM::Reload(Surface& surface) {
+    SurfaceWillChange(surface);
     // Lee y escribe color_buffer: misma razon que WriteBack.
     WaitGpu();
     surface.needs_reload = false;
@@ -1867,6 +1893,31 @@ void RasterizerGXM::Reload(Surface& surface) {
                    surface.height, surface.color_stride * surface.rt_bpp, surface.bpp, false);
 }
 
+namespace {
+/// El formato de textura de una superficie de color, para presentarla.
+bool PresentTextureFormat(u32 color_format, SceGxmTextureFormat& out) {
+    switch (color_format) {
+    case SCE_GXM_COLOR_FORMAT_U8U8U8U8_RGBA:
+        out = SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_RGBA;
+        return true;
+    case SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB:
+        out = SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ARGB;
+        return true;
+    case SCE_GXM_COLOR_FORMAT_U5U5U5U1_RGBA:
+        out = SCE_GXM_TEXTURE_FORMAT_U5U5U5U1_RGBA;
+        return true;
+    case SCE_GXM_COLOR_FORMAT_U5U6U5_RGB:
+        out = SCE_GXM_TEXTURE_FORMAT_U5U6U5_RGB;
+        return true;
+    case SCE_GXM_COLOR_FORMAT_U4U4U4U4_RGBA:
+        out = SCE_GXM_TEXTURE_FORMAT_U4U4U4U4_RGBA;
+        return true;
+    default:
+        return false;
+    }
+}
+} // Anonymous namespace
+
 RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address) {
     DirectPresent out;
     if (s_instance == nullptr || present_direct.load(std::memory_order_relaxed) == 0 ||
@@ -1877,6 +1928,24 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
     // La textura va a muestrear color_buffer: si 4.5 dejo la espera pendiente,
     // hay que pagarla aqui o el chip podria seguir escribiendo debajo.
     self.WaitGpu();
+    // Una pantalla que es una copia hecha en la GPU (0.1.8.6): la superficie de
+    // origen, recortada a las medidas de la salida, con su paso y su formato.
+    for (auto& forward : self.forwards) {
+        if (forward.dst != guest_address || !self.ForwardValid(forward)) {
+            continue;
+        }
+        forward.presented = true;
+        SceGxmTextureFormat tex_format{};
+        if (!PresentTextureFormat(forward.surface->gxm_color_format, tex_format)) {
+            break;
+        }
+        out.data = static_cast<const u8*>(forward.surface->color_buffer.Data());
+        out.width = forward.width;
+        out.height = forward.height;
+        out.stride_bytes = forward.surface->color_stride * forward.surface->rt_bpp;
+        out.gxm_texture_format = static_cast<u32>(tex_format);
+        return out;
+    }
     for (const auto& surface : self.surfaces) {
         if (surface->guest_address != guest_address) {
             continue;
@@ -1917,6 +1986,215 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
         return out;
     }
     return out;
+}
+
+bool RasterizerGXM::ForwardValid(const Forward& forward) const {
+    if (!forward.valid || forward.surface == nullptr) {
+        return false;
+    }
+    bool alive = false;
+    for (const auto& surface : surfaces) {
+        if (surface.get() == forward.surface) {
+            alive = true;
+            break;
+        }
+    }
+    return alive && forward.surface->content_serial == forward.serial &&
+           forward.surface->color_buffer.Valid();
+}
+
+bool RasterizerGXM::DisplayedOverlaps(PAddr addr, u32 size) const {
+    for (u32 i = 0; i < 2; i++) {
+        const auto& framebuffer = pica.regs.framebuffer_config[i];
+        const PAddr shown =
+            framebuffer.active_fb == 0 ? framebuffer.address_left1 : framebuffer.address_left2;
+        const u32 shown_size = framebuffer.stride * framebuffer.height;
+        if (shown_size != 0 && addr < shown + shown_size && shown < addr + size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RasterizerGXM::DropForwards(PAddr addr, u32 size) {
+    for (auto& forward : forwards) {
+        if (forward.valid && addr < forward.dst + forward.dst_size &&
+            forward.dst < addr + size) {
+            forward.valid = false;
+        }
+    }
+}
+
+/**
+ * La copia de verdad, DESDE NUESTRO BUFFER DE COLOR y no desde la memoria del
+ * invitado: si el juego ya ha borrado la superficie de origen con un relleno
+ * para dibujar el fotograma siguiente, su memoria tiene ese borrado, y lo que
+ * vale para la pantalla es lo que la GPU dibujo y sigue en color_buffer (la
+ * recarga, que lo pisa, llama aqui antes). La salida es lineal, asi que es
+ * fila a fila: los mismos bytes que el invitado (CopyTiledGuest los mueve tal
+ * cual), y de RGBA8 a RGB8 los bytes 1, 2 y 3, como UntileRGBA8ToRGB8.
+ */
+void RasterizerGXM::Materialize(std::size_t index) {
+    const Forward forward = forwards[index];
+    forwards[index].valid = false;
+    if (!ForwardValid(forward) || forward.width > 1024) {
+        return;
+    }
+    Surface& surface = *forward.surface;
+    if (open_surface == &surface) {
+        EndScene();
+    }
+    WaitGpu();
+    InvalidateRegion(forward.dst, forward.dst_size);
+    if (!GuestSpanMapped(memory, forward.dst, forward.dst_size)) {
+        return;
+    }
+    u8* const dst = memory.GetPhysicalPointer(forward.dst);
+    const u8* const src = static_cast<const u8*>(surface.color_buffer.Data());
+    const u32 src_stride = surface.color_stride * surface.rt_bpp;
+    const u32 in_bpp = surface.rt_bpp;
+    const u32 out_bpp = Pica::BytesPerPixel(forward.output_format);
+    const bool rgba_to_rgb = forward.input_format == Pica::PixelFormat::RGBA8 &&
+                             forward.output_format == Pica::PixelFormat::RGB8;
+    alignas(16) u8 row[1024 * 4];
+    for (u32 y = 0; y < forward.height; y++) {
+        // CDRAM se lee sin cache: la fila de una vez y despues de memoria normal.
+        std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride, forward.width * in_bpp);
+        u8* out = dst + static_cast<std::size_t>(y) * forward.width * out_bpp;
+        if (rgba_to_rgb) {
+            for (u32 x = 0; x < forward.width; x++) {
+                out[x * 3 + 0] = row[x * 4 + 1];
+                out[x * 3 + 1] = row[x * 4 + 2];
+                out[x * 3 + 2] = row[x * 4 + 3];
+            }
+        } else if (in_bpp == out_bpp) {
+            std::memcpy(out, row, forward.width * out_bpp);
+        } else {
+            // RGB8: la superficie lleva 4 bytes por pixel y los 3 primeros son
+            // los del invitado (ver CurrentSurface).
+            for (u32 x = 0; x < forward.width; x++) {
+                std::memcpy(out + x * out_bpp, row + x * in_bpp, out_bpp);
+            }
+        }
+    }
+    transfer_materialized.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RasterizerGXM::MaterializeAll() {
+    for (std::size_t i = 0; i < forwards.size(); i++) {
+        if (forwards[i].valid) {
+            Materialize(i);
+        }
+    }
+}
+
+void RasterizerGXM::SurfaceWillChange(Surface& surface) {
+    for (std::size_t i = 0; i < forwards.size(); i++) {
+        Forward& forward = forwards[i];
+        if (!forward.valid || forward.surface != &surface) {
+            continue;
+        }
+        /**
+         * Se hace la copia de verdad si esa pantalla todavia se va a ver: si
+         * aun no se ha presentado nunca (muchos juegos copian la pantalla de
+         * arriba y reutilizan la misma superficie para la de abajo antes del
+         * vblank) o si es la que se esta mostrando ahora. Si ya se presento y
+         * ya no esta a la vista, el juego escribira otra encima antes de
+         * volver a mostrarla: basta con olvidarla, y ahi esta la ganancia.
+         */
+        if (forward.serial == surface.content_serial &&
+            (!forward.presented || DisplayedOverlaps(forward.dst, forward.dst_size))) {
+            Materialize(i);
+        } else {
+            forward.valid = false;
+        }
+    }
+    surface.content_serial++;
+}
+
+bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+    if (transfer_on_gpu.load(std::memory_order_relaxed) == 0 ||
+        present_direct.load(std::memory_order_relaxed) == 0 || !available) {
+        return false;
+    }
+    if (config.input_linear || config.dont_swizzle || config.flip_vertically ||
+        config.scaling != Pica::DisplayTransferConfig::NoScale) {
+        return false;
+    }
+    const Pica::PixelFormat in_format = config.input_format;
+    const Pica::PixelFormat out_format = config.output_format;
+    if (in_format > Pica::PixelFormat::RGBA4 || out_format > Pica::PixelFormat::RGBA4) {
+        return false;
+    }
+    if (in_format != out_format &&
+        !(in_format == Pica::PixelFormat::RGBA8 && out_format == Pica::PixelFormat::RGB8)) {
+        return false;
+    }
+    const PAddr src = config.GetPhysicalInputAddress();
+    const PAddr dst = config.GetPhysicalOutputAddress();
+    Surface* source = nullptr;
+    for (auto& surface : surfaces) {
+        if (surface->guest_address == src) {
+            source = surface.get();
+            break;
+        }
+    }
+    // Sin superficie, o con la memoria del invitado por delante de la nuestra
+    // (needs_reload): por software, que lee la memoria del invitado.
+    if (source == nullptr || source->needs_reload || !source->color_buffer.Valid() ||
+        source->width != config.input_width || source->bpp != Pica::BytesPerPixel(in_format)) {
+        return false;
+    }
+    const u32 width = config.output_width;
+    const u32 height = config.output_height;
+    SceGxmTextureFormat tex_format{};
+    if (width == 0 || height == 0 || width > source->width || height > source->height ||
+        !PresentTextureFormat(source->gxm_color_format, tex_format)) {
+        return false;
+    }
+    const u32 dst_size = width * height * Pica::BytesPerPixel(out_format);
+
+    // La GPU empieza ya con lo dibujado (sin esperar): para cuando se presente,
+    // lo normal es que ya haya terminado.
+    if (open_surface == source) {
+        EndScene();
+    }
+    // Lo que hubiera en el destino deja de valer, como en la copia por software.
+    InvalidateRegion(dst, dst_size);
+
+    std::size_t slot = forwards.size();
+    for (std::size_t i = 0; i < forwards.size(); i++) {
+        if (forwards[i].dst == dst || !forwards[i].valid) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == forwards.size()) {
+        if (forwards.size() < 4) {
+            forwards.emplace_back();
+        } else {
+            // Las cuatro ocupadas: la mas vieja se hace de verdad y se reutiliza.
+            Materialize(0);
+            std::rotate(forwards.begin(), forwards.begin() + 1, forwards.end());
+            slot = forwards.size() - 1;
+        }
+    }
+    Forward& forward = forwards[slot];
+    forward.valid = true;
+    forward.dst = dst;
+    forward.dst_size = dst_size;
+    forward.surface = source;
+    forward.serial = source->content_serial;
+    forward.width = width;
+    forward.height = height;
+    forward.input_format = in_format;
+    forward.output_format = out_format;
+    forward.presented = false;
+    gpu_transfers.fetch_add(1, std::memory_order_relaxed);
+    static bool noted = false;
+    NoteOnce(noted, "gxm copia", "pantalla {:#010x} {}x{} desde la superficie {:#010x} en la GPU",
+             dst, width, height, src);
+    return true;
 }
 
 bool RasterizerGXM::UpdateLightingLut() {
@@ -2107,9 +2385,26 @@ void RasterizerGXM::ClearDepthIfNeeded(Surface& surface) {
 }
 
 void RasterizerGXM::FlushPending() {
+    MaterializeAll();
     EndScene();
     for (auto& surface : surfaces) {
         WriteBack(*surface);
+    }
+}
+
+void RasterizerGXM::FlushForPresent() {
+    EndScene();
+    for (auto& surface : surfaces) {
+        bool presented_from_gpu = false;
+        for (const auto& forward : forwards) {
+            if (forward.surface == surface.get() && ForwardValid(forward)) {
+                presented_from_gpu = true;
+                break;
+            }
+        }
+        if (!presented_from_gpu) {
+            WriteBack(*surface);
+        }
     }
 }
 
@@ -2247,6 +2542,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
          */
         FlushPending();
         surfaces.clear();
+        forwards.clear();
         NoteOnce(fb_noted[7], "gxm fb", "tope de {} superficies", kMaxSurfaces);
     }
 
@@ -2779,6 +3075,9 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                                    const SceGxmVertexProgram* vertex_program,
                                    const SceGxmFragmentProgram* fragment_program) {
     if (!surface->scene_open) {
+        // Una escena nueva va a cambiar el color: las copias de pantalla que
+        // salen de esta superficie se resuelven antes (0.1.8.6).
+        SurfaceWillChange(*surface);
         // Si la profundidad o la plantilla estan por rehacer, se deja la
         // superficie preparada ANTES de abrir: el borrado lo hace GXM al cargar
         // los tiles y solo mira la superficie en sceGxmBeginScene.
@@ -3173,6 +3472,13 @@ void RasterizerGXM::FlushAll() {
 }
 
 void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
+    // Alguien va a leer una pantalla copiada en la GPU: copia de verdad.
+    for (std::size_t i = 0; i < forwards.size(); i++) {
+        if (forwards[i].valid && addr < forwards[i].dst + forwards[i].dst_size &&
+            forwards[i].dst < addr + size) {
+            Materialize(i);
+        }
+    }
     /**
      * Volcar SOLO lo que pisa el tramo, y cerrar la escena SOLO si hay algo que
      * pisar.
@@ -3218,6 +3524,8 @@ void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
+    // El invitado escribe encima de una pantalla copiada en la GPU: se olvida.
+    DropForwards(addr, size);
     /**
      * Invalidar NO es volcar: es lo contrario, y confundirlo se comia el
      * trabajo del juego.
@@ -3258,6 +3566,12 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    for (std::size_t i = 0; i < forwards.size(); i++) {
+        if (forwards[i].valid && addr < forwards[i].dst + forwards[i].dst_size &&
+            forwards[i].dst < addr + size) {
+            Materialize(i);
+        }
+    }
     // Las dos cosas y en este orden: el invitado se lleva lo que hemos dibujado
     // y despues lo que el haga ahi es lo que manda.
     for (auto& surface : surfaces) {

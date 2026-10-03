@@ -107,6 +107,37 @@ public:
      */
     bool AccelerateDrawBatch(bool is_indexed) override;
 
+    /**
+     * COPIA DE PANTALLA EN LA GPU (0.1.8.6). Cada fotograma el juego dibuja en
+     * un framebuffer en tiles y lo copia (DisplayTransfer) al de pantalla. Por
+     * el camino de software eso era: esperar a la GPU, volcar la superficie a la
+     * memoria del invitado, deshacer los tiles, convertir de formato y, al
+     * presentar, volver a subirlo todo a la GPU (crash.txt de 0.1.8.4: "tran"
+     * ~26 ms por vblank con "fin" 16, mas "sub" 5,5). Aqui, si el origen es una
+     * superficie nuestra y la copia es directa (sin escalar ni voltear, mismo
+     * formato o RGBA8 -> RGB8), no se copia nada: se apunta que esa pantalla ES
+     * la superficie recortada, y el presentador dibuja desde ella. La escena se
+     * cierra sin esperar, asi que la GPU dibuja mientras la CPU sigue.
+     *
+     * La memoria del invitado de la pantalla NO se escribe. Si algo la necesita
+     * (se lee, o el juego va a dibujar otra vez en la superficie mientras esa
+     * pantalla esta a la vista), se hace la copia de verdad en ese momento.
+     */
+    bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
+
+    /// Interruptor del menu ("Copia de pantalla en GPU"). Encendido.
+    static std::atomic<u32> transfer_on_gpu;
+    /// Copias hechas asi y copias que hubo que hacer de verdad despues (overlay).
+    static std::atomic<u32> gpu_transfers;
+    static std::atomic<u32> transfer_materialized;
+
+    /**
+     * Lo que hace SwapBuffers antes de presentar: como FlushPending, pero las
+     * superficies que son origen de una copia de pantalla en la GPU no se
+     * vuelcan (el presentador las lee directamente).
+     */
+    void FlushForPresent();
+
     void FlushAll() override;
     void FlushRegion(PAddr addr, u32 size) override;
     void InvalidateRegion(PAddr addr, u32 size) override;
@@ -280,6 +311,23 @@ public:
 private:
     struct Surface;
     struct PipelineCache;
+
+    /// Una copia de pantalla hecha en la GPU (ver AccelerateDisplayTransfer).
+    struct Forward;
+    std::vector<Forward> forwards;
+    /// La copia sigue valiendo: la superficie existe y no ha cambiado desde.
+    bool ForwardValid(const Forward& forward) const;
+    /// La superficie va a cambiar (dibujo nuevo o recarga): las copias que
+    /// salen de ella se hacen de verdad si su pantalla esta a la vista, y si no
+    /// se olvidan.
+    void SurfaceWillChange(Surface& surface);
+    /// Hace la copia de verdad (volcado y transferencia por software).
+    void Materialize(std::size_t index);
+    void MaterializeAll();
+    /// Olvida las copias cuyo destino pisa el tramo.
+    void DropForwards(PAddr addr, u32 size);
+    /// El tramo pisa un framebuffer que se esta mostrando ahora.
+    bool DisplayedOverlaps(PAddr addr, u32 size) const;
 
     /// Pesquisa un pipeline (y compila el shader si es la primera vez).
     /// Devuelve nullptr si la configuracion no esta soportada.
