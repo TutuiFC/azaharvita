@@ -1944,6 +1944,10 @@ bool RasterizerGXM::EnsureInitialized() {
     }
     context = vita2d_get_context();
     patcher = CreateShaderPatcher() ? own_patcher : vita2d_get_shader_patcher();
+    // Una palabra de la region de notificaciones de GXM, lejos del principio
+    // (vita2d y el sistema no la usan). La GPU solo puede escribir ahi.
+    fence_address = sceGxmGetNotificationRegion() + 400;
+    *fence_address = 0;
     if (context == nullptr || patcher == nullptr) {
         status = "sin contexto gxm";
         Common::VitaNote("gxm init", "sin contexto");
@@ -2002,18 +2006,12 @@ void RasterizerGXM::NoteSkip(u32 index, const char* reason) {
 }
 
 void RasterizerGXM::EndScene() {
-    // Sin escena abierta la GPU ya no lee el buffer de vertices: el contador
-    // vuelve a cero aunque no haya nada que cerrar (ver DrawBatchOnGpu). Lo
-    // mismo con la marca de las tablas de luz.
-    vertex_used = 0;
-    lighting_lut_in_scene = false;
-    lighting_lut_retired_in_scene = 0;
     if (open_surface == nullptr) {
-        // Sin escena abierta la GPU ya termino con todo lo apuntado, asi que la
-        // memoria de texturas que se retiro mientras tanto se puede soltar.
+        // Lo retirado sin escena abierta lo pudo leer, como mucho, la ultima
+        // escena enviada.
         if (textures != nullptr && textures->HasRetired()) {
-            WaitGpu();
-            textures->ReleaseRetired();
+            textures->SealRetired(fence_sent);
+            textures->ReleaseUpTo(*fence_address);
         }
         return;
     }
@@ -2061,8 +2059,23 @@ void RasterizerGXM::EndScene() {
                              SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
     {
         const Common::ScopedVitaStage stage{"gxm cerrar escena"};
-        sceGxmEndScene(context, nullptr, nullptr);
+        fence_sent++;
+        SceGxmNotification done{};
+        done.address = fence_address;
+        done.value = fence_sent;
+        sceGxmEndScene(context, nullptr, &done);
     }
+    if (frame_first_fence == 0) {
+        frame_first_fence = fence_sent;
+    }
+    // Las versiones de las tablas de luz que ha atado esta escena: la actual
+    // si la ha usado, y las retiradas a mitad de escena.
+    for (u32 back = lighting_lut_in_scene ? 0 : 1; back <= lighting_lut_retired_in_scene;
+         back++) {
+        lut_fence[(lighting_lut_version + kLutVersions - back) % kLutVersions] = fence_sent;
+    }
+    lighting_lut_in_scene = false;
+    lighting_lut_retired_in_scene = 0;
     gpu_scenes.fetch_add(1, std::memory_order_relaxed);
     const bool defer = no_finish_wait.load(std::memory_order_relaxed) != 0;
     if (defer) {
@@ -2089,16 +2102,26 @@ void RasterizerGXM::EndScene() {
     open_surface->scene_open = false;
     open_surface = nullptr;
     /**
-     * Y la memoria de las texturas retiradas.
-     *
-     * Free de memoria que la GPU podria seguir leyendo solo es seguro con la
-     * espera pagada: por eso WaitGpu() SOLO si hay algo que soltar. Si no lo
-     * hay (el caso corriente), el interruptor 4.5 ahorra la espera entera.
+     * Y la memoria de las texturas retiradas: se suelta cuando haya pasado la
+     * valla de la escena que pudo leerla (0.1.9.4), sin esperar a nadie.
      */
     if (textures != nullptr && textures->HasRetired()) {
-        WaitGpu();
-        textures->ReleaseRetired();
+        textures->SealRetired(fence_sent);
+        textures->ReleaseUpTo(*fence_address);
     }
+}
+
+bool RasterizerGXM::FenceDone(u32 fence) const {
+    return static_cast<s32>(*fence_address - fence) >= 0;
+}
+
+void RasterizerGXM::WaitFence(u32 fence) {
+    if (FenceDone(fence)) {
+        return;
+    }
+    // Las escenas acaban en orden: esperar a todo cubre esta.
+    gpu_pending = true;
+    WaitGpu();
 }
 
 void RasterizerGXM::WaitGpu() {
@@ -2819,6 +2842,8 @@ bool RasterizerGXM::UpdateLightingLut() {
         if (lighting_lut_retired_in_scene + 1 < kLutVersions) {
             lighting_lut_retired_in_scene++;
             lighting_lut_version = (lighting_lut_version + 1) % kLutVersions;
+            // Una escena ya enviada puede seguir leyendo esa version.
+            WaitFence(lut_fence[lighting_lut_version]);
             for (u32 index = 0; index < kLutCount; index++) {
                 write_row(lighting_lut_version, index);
             }
@@ -2831,6 +2856,23 @@ bool RasterizerGXM::UpdateLightingLut() {
         EndScene();
     }
 
+    /**
+     * La escena abierta no la lee, pero una ya enviada puede que si (0.1.9.4):
+     * si su valla no ha pasado, se estrena la siguiente version (si esa esta
+     * libre) en vez de esperar.
+     */
+    if (!FenceDone(lut_fence[lighting_lut_version])) {
+        const u32 next = (lighting_lut_version + 1) % kLutVersions;
+        if (FenceDone(lut_fence[next])) {
+            lighting_lut_version = next;
+            for (u32 index = 0; index < kLutCount; index++) {
+                write_row(lighting_lut_version, index);
+            }
+            pica.lighting.lut_dirty = 0;
+            return true;
+        }
+        WaitFence(lut_fence[lighting_lut_version]);
+    }
     // Nadie lee la version actual: basta con reescribir las tablas cambiadas.
     // Esta al dia en todo lo demas, porque cada version se escribe entera al
     // estrenarla y desde entonces solo se le aplican cambios.
@@ -2914,6 +2956,20 @@ void RasterizerGXM::FlushPending() {
 
 void RasterizerGXM::FlushForPresent() {
     EndScene();
+    /**
+     * El presentador y vita2d reescriben sus vertices y la textura de la
+     * pantalla en cada fotograma, y antes nadie tenia que esperar por ellos:
+     * la espera entera al empezar cada escena ya lo cubria. Basta con que haya
+     * acabado la primera escena de ESTE fotograma, que la GPU hace despues de
+     * la presentacion del anterior (0.1.9.4).
+     */
+    if (frame_first_fence != 0) {
+        WaitFence(frame_first_fence);
+    } else if (context != nullptr) {
+        gpu_pending = true;
+        WaitGpu();
+    }
+    frame_first_fence = 0;
     for (auto& surface : surfaces) {
         if (!surface->copied) {
             WriteBack(*surface);
@@ -3353,16 +3409,11 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         EndScene();
     }
     /**
-     * ARREGLO 0.1.5.6 (punto 4.5, "gxm_sin_espera"): pagar aqui la espera
-     * que EndScene dejo pendiente, ANTES de escribir nada que lea la GPU.
-     * EndScene pone vertex_used a 0, asi que este lote escribe sus vertices
-     * al principio del MISMO buffer (y puede actualizar texturas o tablas de
-     * luz en su sitio) mientras el chip podria seguir leyendo la escena
-     * anterior: geometria rota o un cuelgue de la GPU. La espera sigue
-     * solapandose con todo lo que la CPU hace entre dos lotes (el ARM
-     * emulado, decodificar comandos), que es donde estaba la ganancia.
+     * Aqui se esperaba a la GPU entera antes de cada escena nueva (0.1.5.6),
+     * porque EndScene devolvia el buffer de vertices a cero. Desde 0.1.9.4 el
+     * buffer es un anillo y las tablas de luz y las texturas esperan a su
+     * propia valla: la CPU sigue mientras la GPU dibuja lo anterior.
      */
-    WaitGpu();
     const u32 vertex_count = static_cast<u32>(batch.size());
     if (vertex_count == 0) {
         return true;
@@ -3387,9 +3438,8 @@ bool RasterizerGXM::DrawBatchOnGpu() {
      * Las tablas de la iluminacion, ANTES de repartir el buffer de vertices.
      *
      * Reescribirlas puede exigir cerrar la escena (la GPU podria estar leyendo
-     * las de antes), y cerrar la escena devuelve a cero el reparto del buffer
-     * de vertices. Hacerlo despues de haber escrito los vertices de este lote
-     * seria soltarselos debajo.
+     * las de antes), y el lote tiene que dibujarse en la escena que se abra
+     * despues, con sus vertices ya escritos.
      */
     if (pipeline->lighting_lut != nullptr && !UpdateLightingLut()) {
         return false;
@@ -3401,9 +3451,9 @@ bool RasterizerGXM::DrawBatchOnGpu() {
      * mas tarde, al procesar la escena. Escribir el lote siguiente encima del
      * anterior -- que es lo que hacia antes, siempre desde el principio del
      * buffer -- le cambia los vertices a un dibujado que todavia no ha ocurrido.
-     * Por eso cada lote se queda su tramo y el contador solo vuelve a cero
-     * cuando la escena se cierra (EndScene), que es cuando la GPU ya ha
-     * terminado de leer.
+     * Por eso cada lote se queda su tramo. Desde 0.1.9.4 el contador tampoco
+     * vuelve a cero al cerrar la escena: es un anillo, y solo al llegar al
+     * final se espera a la GPU entera antes de volver al principio.
      */
     const u32 needed = vertex_count * stride;
     /**
@@ -3443,6 +3493,7 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         scene_close_full.fetch_add(1, std::memory_order_relaxed);
         EndScene();
         WaitGpu();
+        vertex_used = 0;
         if (needed > vertex_buffer.Size()) {
             Allocation buffer = Allocate(Pool::Host, needed);
             if (!buffer.Valid()) {
@@ -4133,8 +4184,7 @@ static bool HwVsReject(const char* why) {
 }
 
 u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
-    // El mismo buffer que usa DrawBatchOnGpu, con la misma regla: se reparte
-    // dentro de la escena y solo vuelve a cero al cerrarla (ver alli). Aqui se
+    // El mismo anillo que usa DrawBatchOnGpu, con la misma regla (ver alli). Aqui se
     // alinea a 16 porque los flujos de vertices y los indices lo prefieren y
     // DrawBatchOnGpu deja el contador en multiplos de 4.
     constexpr u32 kVertexBufferBytes = 4u * 1024u * 1024u;
@@ -4602,17 +4652,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     if (open_surface != nullptr && open_surface != surface) {
         EndScene();
     }
-    /**
-     * ARREGLO 0.1.5.6 (punto 4.5, "gxm_sin_espera"): pagar aqui la espera
-     * que EndScene dejo pendiente, ANTES de escribir nada que lea la GPU.
-     * EndScene pone vertex_used a 0, asi que este lote escribe sus vertices
-     * al principio del MISMO buffer (y puede actualizar texturas o tablas de
-     * luz en su sitio) mientras el chip podria seguir leyendo la escena
-     * anterior: geometria rota o un cuelgue de la GPU. La espera sigue
-     * solapandose con todo lo que la CPU hace entre dos lotes (el ARM
-     * emulado, decodificar comandos), que es donde estaba la ganancia.
-     */
-    WaitGpu();
+    // Sin espera a la GPU desde 0.1.9.4: ver DrawBatchOnGpu.
     if (pipeline->lighting_lut != nullptr && !UpdateLightingLut()) {
         return HwVsReject("tablas luz");
     }

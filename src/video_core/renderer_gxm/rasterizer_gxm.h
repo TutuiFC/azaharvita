@@ -452,6 +452,20 @@ private:
     /// Hay un sceGxmEndScene sin su sceGxmFinish (4.5). Ver WaitGpu.
     bool gpu_pending = false;
 
+    /**
+     * VALLAS DE LA GPU (0.1.9.4). Cada escena del rasterizador, al cerrarse,
+     * pide a la GPU que escriba su numero en la region de notificaciones de
+     * GXM cuando acabe sus fragmentos. Las escenas acaban en orden, asi que el
+     * valor escrito es la ultima terminada: con eso cada recurso espera solo a
+     * la escena que lo leyo, y no a toda la GPU como sceGxmFinish.
+     */
+    volatile unsigned int* fence_address = nullptr;
+    u32 fence_sent = 0;
+    /// La primera valla del fotograma en curso (ver FlushForPresent).
+    u32 frame_first_fence = 0;
+    [[nodiscard]] bool FenceDone(u32 fence) const;
+    void WaitFence(u32 fence);
+
     /// Vertices del lote en curso, en el formato de la CPU del invitado.
     std::vector<Pica::OutputVertex> batch;
     /// Decision de soporte para el lote en curso: se toma al primer triangulo.
@@ -504,6 +518,8 @@ private:
      * vez de cerrar la escena. Ver UpdateLightingLut.
      */
     static constexpr u32 kLutVersions = 8;
+    /// La valla de la ultima escena que leyo cada version (0.1.9.4).
+    std::array<u32, kLutVersions> lut_fence{};
     Allocation lighting_lut_buffer;
     std::array<SceGxmTexture, kLutVersions> lighting_lut_textures{};
     /// La version que se ata a los dibujados a partir de ahora.
@@ -526,8 +542,9 @@ private:
     /// buffer de indices secuenciales.
     Allocation vertex_buffer;
     Allocation index_buffer;
-    /// Bytes ya repartidos del buffer de vertices en la escena en curso. Vuelve
-    /// a cero al cerrarla: hasta entonces la GPU sigue leyendo lo de antes.
+    /// Bytes ya repartidos del buffer de vertices. Desde 0.1.9.4 es un anillo:
+    /// no vuelve a cero al cerrar la escena, solo al llegar al final, y ahi se
+    /// espera a la GPU entera (una vez cada 4 MB de vertices).
     u32 vertex_used = 0;
     u32 index_capacity = 0;
 };

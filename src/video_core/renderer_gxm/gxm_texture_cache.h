@@ -6,6 +6,7 @@
 
 #include <array>
 #include <memory>
+#include <utility>
 #include <vector>
 #include <psp2/gxm.h>
 #include "common/common_types.h"
@@ -126,8 +127,16 @@ public:
     /// Hay memoria retirada esperando a que la GPU termine (4.5): con eso el
     /// llamador sabe si tiene que pagar sceGxmFinish antes de liberar.
     [[nodiscard]] bool HasRetired() const {
-        return !retired.empty();
+        return !retired.empty() || !sealed.empty();
     }
+
+    /**
+     * Con vallas (0.1.9.4): lo retirado hasta ahora lo puede leer, como mucho,
+     * la escena de la valla 'fence'; se suelta cuando esa valla haya pasado
+     * (ReleaseUpTo con la ultima valla que ha completado la GPU).
+     */
+    void SealRetired(u32 fence);
+    void ReleaseUpTo(u32 completed_fence);
 
 private:
     struct Entry {
@@ -160,6 +169,8 @@ private:
     std::array<Entry, kMaxEntries> entries;
     /// Memoria a la espera de que la GPU acabe con ella (ver ReleaseRetired).
     std::vector<Allocation> retired;
+    /// Lo retirado, con la valla de la ultima escena que pudo leerlo.
+    std::vector<std::pair<u32, Allocation>> sealed;
     /// Reloj logico: sube en cada consulta y es lo que ordena el LRU.
     u64 clock = 0;
     /// Bytes de bloque (no de pixeles) que suman las entradas validas.

@@ -158,6 +158,20 @@ void TextureCache::ReleaseRetired() {
     // Destruir los Allocation es lo que desmapea y libera. El vector se queda
     // con su capacidad para no volver a pedir memoria en cada escena.
     retired.clear();
+    sealed.clear();
+}
+
+void TextureCache::SealRetired(u32 fence) {
+    for (auto& buffer : retired) {
+        sealed.emplace_back(fence, std::move(buffer));
+    }
+    retired.clear();
+}
+
+void TextureCache::ReleaseUpTo(u32 completed_fence) {
+    std::erase_if(sealed, [completed_fence](const auto& item) {
+        return static_cast<s32>(completed_fence - item.first) >= 0;
+    });
 }
 
 void TextureCache::Clear() {
