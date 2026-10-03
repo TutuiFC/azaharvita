@@ -1341,6 +1341,7 @@ struct RasterizerGXM::PipelineCache {
          * intentar en el siguiente (0.1.9.6). Leer de la cache no le espera.
          */
         if (CgBusy() && !CgCached(SCE_SHACCCG_PROFILE_FP, source->c_str())) {
+            CgFsWaiting();
             return fail("compilador ocupado");
         }
         entry->output = CompileCg(SCE_SHACCCG_PROFILE_FP, "azahar_gxm_f.cg", source->c_str());

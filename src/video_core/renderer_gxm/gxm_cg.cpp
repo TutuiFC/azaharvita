@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include "common/common_types.h"
@@ -206,6 +207,9 @@ std::set<const SceShaccCgCompileOutput*> g_cached_outputs;
 std::mutex g_outputs_mutex;
 /// El hilo de compilacion esta compilando (ver CgBusy).
 std::atomic<bool> g_worker_busy{false};
+/// Un shader de fragmentos no se pudo compilar por estar ocupado: el hilo de
+/// compilacion le deja hueco antes de su siguiente compilacion (CgFsWaiting).
+std::atomic<bool> g_fs_waiting{false};
 bool g_cache_dir_ready = false;
 u32 g_cache_notes = 0;
 
@@ -870,6 +874,17 @@ void* CgWorkerMain(void*) {
             if (CgPoisoned()) {
                 break;
             }
+            /**
+             * Los de fragmentos, primero: sin ellos el lote se dibuja por
+             * software, y uno de vertices solo cuesta que el lote siga en la
+             * CPU un rato mas. Con el hilo libre 100 ms, el de emulacion lo
+             * compila en el siguiente lote que lo pida.
+             */
+            if (g_fs_waiting.exchange(false, std::memory_order_relaxed)) {
+                g_worker_busy.store(false, std::memory_order_relaxed);
+                sceKernelDelayThread(100 * 1000);
+                g_worker_busy.store(true, std::memory_order_relaxed);
+            }
             const SceShaccCgCompileOutput* output =
                 CompileCg(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", job->sources[i].c_str());
             if (output != nullptr) {
@@ -888,6 +903,10 @@ void* CgWorkerMain(void*) {
 
 bool CgBusy() {
     return g_worker_busy.load(std::memory_order_relaxed);
+}
+
+void CgFsWaiting() {
+    g_fs_waiting.store(true, std::memory_order_relaxed);
 }
 
 void CgSubmit(std::shared_ptr<CgJob> job) {

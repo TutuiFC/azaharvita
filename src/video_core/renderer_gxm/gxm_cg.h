@@ -95,5 +95,7 @@ void CgSubmit(std::shared_ptr<CgJob> job);
 /// shader de fragmentos en mitad de un fotograma) lo deja para el lote
 /// siguiente.
 bool CgBusy();
+/// Avisa de que un shader de fragmentos espera al compilador (ver CgBusy).
+void CgFsWaiting();
 
 } // namespace Gxm
