@@ -616,9 +616,7 @@ void HelperVfpCdp(ARMul_State* cpu, u32 inst) {
  * escrito el codigo generado antes de llamar.
  */
 template <typename Read, typename Write>
-void VfpTransfer(ARMul_State* cpu, u32 inst, Read&& read, Write&& write) {
-    int index = -1;
-    DecodeARMInstruction(inst, &index);
+void VfpTransfer(ARMul_State* cpu, u32 inst, int index, Read&& read, Write&& write) {
     const bool single = ((inst >> 8) & 1) == 0;
     const u32 d = single ? (((inst >> 12) & 0xF) << 1) | ((inst >> 22) & 1)
                          : ((inst >> 12) & 0xF) | (((inst >> 22) & 1) << 4);
@@ -675,17 +673,24 @@ void VfpTransfer(ARMul_State* cpu, u32 inst, Read&& read, Write&& write) {
     }
 }
 
-void HelperVfpTransfer(ARMul_State* cpu, u32 inst) {
+/**
+ * 'index' es el del decodificador del interprete, calculado AL COMPILAR el
+ * bloque (0.1.8.5). Antes se llamaba a DecodeARMInstruction aqui, en cada
+ * VPUSH/VPOP/VLDM/VSTM ejecutado: una busqueda lineal por toda la tabla de
+ * instrucciones del ARM11, miles de ciclos. crash.txt de 0.1.8.4: "lento" 17 ms
+ * por vblank con ~5.600 llamadas, unos 3 us cada una.
+ */
+void HelperVfpTransfer(ARMul_State* cpu, u32 inst, int index) {
     const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
     VfpTransfer(
-        cpu, inst, [cpu](u32 address) { return cpu->ReadMemory32(address); },
+        cpu, inst, index, [cpu](u32 address) { return cpu->ReadMemory32(address); },
         [cpu](u32 address, u32 value) { cpu->WriteMemory32(address, value); });
     StopLinksIfRescheduled(cpu);
 }
 
-void CheckVfpTransfer(ARMul_State* cpu, u32 inst) {
+void CheckVfpTransfer(ARMul_State* cpu, u32 inst, int index) {
     VfpTransfer(
-        cpu, inst, [](u32 address) { return CheckRead(address, kWord); },
+        cpu, inst, index, [](u32 address) { return CheckRead(address, kWord); },
         [](u32 address, u32 value) { CheckWrite(address, value, kWord); });
 }
 
@@ -2185,8 +2190,11 @@ private:
         e.MovReg(kT0, kFlags);
         e.Mov32(R0, pc);
         e.StrImm(R0, kCpu, RegOffset(15));
+        int index = -1;
+        DecodeARMInstruction(inst, &index); // una vez, al compilar (0.1.8.5)
         e.MovReg(R0, kCpu);
         e.Mov32(R1, inst);
+        e.Mov32(R2, static_cast<u32>(index));
         e.Call(check_mode ? reinterpret_cast<const void*>(&CheckVfpTransfer)
                           : reinterpret_cast<const void*>(&HelperVfpTransfer));
         e.MsrFlags(kT0);
