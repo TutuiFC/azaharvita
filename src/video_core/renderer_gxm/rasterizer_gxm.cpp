@@ -1364,19 +1364,18 @@ struct RasterizerGXM::PipelineCache {
          * esta configuracion no se dibujan (Get: "fs compilando"). De la cache
          * de la tarjeta se lee aqui mismo.
          */
-        if (!CgCached(SCE_SHACCCG_PROFILE_FP, source->c_str())) {
-            auto job = std::make_shared<CgJob>();
-            job->profile = SCE_SHACCCG_PROFILE_FP;
-            job->name = "azahar_gxm_f.cg";
-            job->sources.push_back(std::move(*source));
-            job->variants.push_back(0);
-            entry->job = job;
-            CgSubmit(std::move(job), true);
-            return true;
+        if (const SceShaccCgCompileOutput* cached =
+                LoadCgCache(SCE_SHACCCG_PROFILE_FP, "azahar_gxm_f.cg", source->c_str())) {
+            return Finish(entry, cached, out_reason);
         }
-        return Finish(entry,
-                      CompileCg(SCE_SHACCCG_PROFILE_FP, "azahar_gxm_f.cg", source->c_str()),
-                      out_reason);
+        auto job = std::make_shared<CgJob>();
+        job->profile = SCE_SHACCCG_PROFILE_FP;
+        job->name = "azahar_gxm_f.cg";
+        job->sources.push_back(std::move(*source));
+        job->variants.push_back(0);
+        entry->job = job;
+        CgSubmit(std::move(job), true);
+        return true;
     }
 
     /// Registra el programa compilado y crea el de fragmentos con su mezcla.
@@ -1791,8 +1790,13 @@ private:
          * partida lo lee al momento. Mas grande que eso, a la CPU.
          */
         constexpr std::size_t kMaxCompileSource = 32u * 1024u;
-        const bool cached = CgCached(SCE_SHACCCG_PROFILE_VP, sources.front().c_str());
-        if (sources.front().size() > kMaxCompileSource && !cached) {
+        // De la cache de la tarjeta: es leer un fichero, aqui mismo.
+        if (const SceShaccCgCompileOutput* cached =
+                LoadCgCache(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", sources.front().c_str())) {
+            Finish(program, cached, variants.front());
+            return;
+        }
+        if (sources.front().size() > kMaxCompileSource) {
             static u32 big_notes = 0;
             if (big_notes < 4) {
                 big_notes++;
@@ -1801,15 +1805,6 @@ private:
             }
             program.reason = "vs demasiado grande";
             return;
-        }
-        if (cached) {
-            // De la cache de la tarjeta: es leer un fichero, aqui mismo.
-            const SceShaccCgCompileOutput* output =
-                CompileCg(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", sources.front().c_str());
-            if (output != nullptr) {
-                Finish(program, output, variants.front());
-                return;
-            }
         }
         // Al hilo de compilacion (0.1.9.6); GetProgram recoge el resultado.
         auto job = std::make_shared<CgJob>();
@@ -2874,6 +2869,27 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     return true;
 }
 
+namespace {
+/**
+ * El patron de 'bpp' bytes repetido en [dst, dst + bytes), como
+ * SwBlitter::MemoryFill. Por bloques de 192 bytes (multiplo de 2, 3 y 4):
+ * 0.1.9.8 lo hacia con un memcpy de tamano variable por pixel, que el
+ * compilador no puede convertir en una escritura, y los rellenos pasaron de
+ * ~1 ms a ~11 ms por fotograma (Pokemon Sol del 80% al 50% de velocidad).
+ */
+void FillPattern(u8* dst, u32 bytes, u32 texel, u32 bpp) {
+    alignas(16) u8 block[192];
+    for (u32 i = 0; i < sizeof(block); i += bpp) {
+        std::memcpy(block + i, &texel, bpp);
+    }
+    u32 done = 0;
+    for (; done + sizeof(block) <= bytes; done += sizeof(block)) {
+        std::memcpy(dst + done, block, sizeof(block));
+    }
+    std::memcpy(dst + done, block, bytes - done);
+}
+} // Anonymous namespace
+
 bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
     // Mismo interruptor que la copia de pantalla: los dos son pintar en la
     // GPU lo que antes hacia la CPU en la memoria del invitado.
@@ -2965,9 +2981,7 @@ bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
      */
     u8* const guest = memory.GetPhysicalPointer(start);
     const u32 bytes = end - start;
-    for (u32 offset = 0; offset + target->bpp <= bytes; offset += target->bpp) {
-        std::memcpy(guest + offset, &texel, target->bpp);
-    }
+    FillPattern(guest, bytes, texel, target->bpp);
     if (whole) {
         // Todo el color es el relleno: lo de antes ya no cuenta.
         target->clear_count = 0;

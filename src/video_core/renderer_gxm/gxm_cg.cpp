@@ -606,11 +606,23 @@ bool CgHeapLow() {
     return HeapInUse() + reserve > total;
 }
 
-bool CgCached(SceShaccCgTargetProfile profile, const char* source) {
+const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, const char* name,
+                                           const char* source) {
     const std::size_t source_size = std::strlen(source);
-    SceIoStat stat{};
-    return sceIoGetstat(CachePath(Common::ComputeHash64(source, source_size), profile).c_str(),
-                        &stat) >= 0;
+    CacheHeader key{};
+    key.magic = kCacheMagic;
+    key.version = kCacheVersion;
+    key.profile = static_cast<u32>(profile);
+    key.source_size = static_cast<u32>(source_size);
+    key.hash_city = Common::ComputeHash64(source, source_size);
+    key.hash_fnv = Fnv1a64(source, source_size);
+    const unsigned long long begin_us = Common::VitaMicros();
+    const SceShaccCgCompileOutput* cached = LoadCached(key, CachePath(key.hash_city, profile));
+    if (cached != nullptr) {
+        NoteCache(fmt::format("{} leido de la cache en {} us", name,
+                              Common::VitaMicros() - begin_us));
+    }
+    return cached;
 }
 
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,

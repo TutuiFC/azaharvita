@@ -57,8 +57,14 @@ bool CgHeapLow();
  */
 u32 CgGeneration();
 
-/// Ese codigo ya esta compilado en la cache de la tarjeta (0.1.9.2).
-bool CgCached(SceShaccCgTargetProfile profile, const char* source);
+/**
+ * Solo la cache de la tarjeta, sin el compilador (0.1.9.9): nullptr si no esta
+ * o no vale. Es lo unico que pide el hilo de emulacion en partida: CompileCg,
+ * si el fichero de la cache no sirve, va al compilador, y con el hilo de
+ * compilacion ocupado eso era esperarle (Yo-kai Watch, 0.1.9.8).
+ */
+const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, const char* name,
+                                           const char* source);
 
 /// Compila un shader. El resultado vive hasta ReleaseCgOutput.
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
