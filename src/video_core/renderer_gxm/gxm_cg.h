@@ -53,6 +53,9 @@ bool CgHeapLow();
  */
 u32 CgGeneration();
 
+/// Ese codigo ya esta compilado en la cache de la tarjeta (0.1.9.2).
+bool CgCached(SceShaccCgTargetProfile profile, const char* source);
+
 /// Compila un shader. El resultado vive hasta ReleaseCgOutput.
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
                                          const char* source);

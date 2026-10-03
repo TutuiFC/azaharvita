@@ -579,6 +579,13 @@ bool CgHeapLow() {
     return HeapInUse() + reserve > total;
 }
 
+bool CgCached(SceShaccCgTargetProfile profile, const char* source) {
+    const std::size_t source_size = std::strlen(source);
+    SceIoStat stat{};
+    return sceIoGetstat(CachePath(Common::ComputeHash64(source, source_size), profile).c_str(),
+                        &stat) >= 0;
+}
+
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
                                          const char* source) {
     // Cache en la tarjeta (0.1.5.8): si este codigo fuente ya se compilo

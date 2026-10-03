@@ -1688,6 +1688,27 @@ private:
                 continue;
             }
             generated = true;
+            /**
+             * TOPE DE TAMANO (0.1.9.2). crash.txt de 0.1.9.0 y 0.1.9.1: al entrar
+             * a la escena del profesor Abedul, un shader de vertices de 26 KB de
+             * Cg tenia el juego congelado mas de 30 s dentro del compilador (con
+             * picos de 27 MB), y Pokemon Sol se paraba igual al arrancar. Uno
+             * asi no se compila en partida: va a la CPU. Si ya esta en la cache
+             * de la tarjeta se usa, porque leerlo es inmediato.
+             */
+            constexpr std::size_t kMaxCompileSource = 16u * 1024u;
+            if (source->size() > kMaxCompileSource &&
+                !CgCached(SCE_SHACCCG_PROFILE_VP, source->c_str())) {
+                static u32 big_notes = 0;
+                if (big_notes < 4) {
+                    big_notes++;
+                    NoteFmt("gxm vs", "{} bytes de Cg: no se compila en partida, a la CPU",
+                            source->size());
+                }
+                g_cg_variant.store(0, std::memory_order_relaxed);
+                program.reason = "vs demasiado grande";
+                return;
+            }
             // CompileCg deja en crash.txt el primer mensaje del compilador.
             program.output =
                 CompileCg(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", source->c_str());
@@ -4312,6 +4333,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         u8 stream = 0;
         u8 format = 0;
         u16 offset = 0;
+        /// Las que trae el invitado y las que declara el programa compilado.
+        u8 components = 0;
+        u8 declared = 0;
     };
     std::array<AttributeSource, 16> attribute_sources{};
     u32 attribute_count = 0;
@@ -4362,6 +4386,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             inputs[reg].components, sceGxmProgramParameterGetComponentCount(program->inputs[reg])));
         out.regIndex =
             static_cast<u16>(sceGxmProgramParameterGetResourceIndex(program->inputs[reg]));
+        attribute_sources[attribute_count - 1].components = out.componentCount;
+        attribute_sources[attribute_count - 1].declared = static_cast<u8>(std::clamp<u32>(
+            sceGxmProgramParameterGetComponentCount(program->inputs[reg]), out.componentCount, 4));
         layout_key = Common::HashCombine(
             layout_key, (static_cast<u64>(out.streamIndex) << 48) |
                             (static_cast<u64>(out.offset) << 32) |
@@ -4395,6 +4422,14 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             out.streamIndex = 0;
             out.offset = static_cast<u16>(converted_stride);
             out.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+            /**
+             * Todas las componentes que declara el programa (0.1.9.2). crash.txt
+             * de 0.1.9.1: los shaders de piel declaran float4 en cada entrada y
+             * GXM no los enlaza con 2 o 3 (err 0x805b0023, tambien en float).
+             * Las que el invitado no trae van con los valores por defecto de
+             * la PICA: 0 y la w a 1.
+             */
+            out.componentCount = attribute_sources[i].declared;
             converted_stride += out.componentCount * 4u;
             converted_key = Common::HashCombine(
                 converted_key, (static_cast<u64>(out.componentCount) << 16) | out.regIndex);
@@ -4499,7 +4534,10 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 const u32 stride =
                     attributes.attribute_loaders[loader_of_stream[source.stream]].byte_count;
                 const u8* in = stream_source[source.stream] + v * stride + source.offset;
-                const u32 components = gxm_attributes[i].componentCount;
+                const u32 components = source.components;
+                for (u32 c = components; c < gxm_attributes[i].componentCount; c++) {
+                    out[c] = c == 3 ? 1.0f : 0.0f;
+                }
                 for (u32 c = 0; c < components; c++) {
                     switch (static_cast<PipelineRegs::VertexAttributeFormat>(source.format)) {
                     case PipelineRegs::VertexAttributeFormat::BYTE:
@@ -4522,6 +4560,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                     }
                     }
                 }
+                out += gxm_attributes[i].componentCount - components;
             }
         }
         stream_data[0] = space;
