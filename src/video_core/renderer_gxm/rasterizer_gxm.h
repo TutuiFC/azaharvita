@@ -108,20 +108,25 @@ public:
     bool AccelerateDrawBatch(bool is_indexed) override;
 
     /**
-     * COPIA DE PANTALLA EN LA GPU (0.1.8.6). Cada fotograma el juego dibuja en
+     * COPIA DE PANTALLA EN LA GPU (0.1.8.7). Cada fotograma el juego dibuja en
      * un framebuffer en tiles y lo copia (DisplayTransfer) al de pantalla. Por
-     * el camino de software eso era: esperar a la GPU, volcar la superficie a la
+     * el camino de software eso es: esperar a la GPU, volcar la superficie a la
      * memoria del invitado, deshacer los tiles, convertir de formato y, al
-     * presentar, volver a subirlo todo a la GPU (crash.txt de 0.1.8.4: "tran"
-     * ~26 ms por vblank con "fin" 16, mas "sub" 5,5). Aqui, si el origen es una
-     * superficie nuestra y la copia es directa (sin escalar ni voltear, mismo
-     * formato o RGBA8 -> RGB8), no se copia nada: se apunta que esa pantalla ES
-     * la superficie recortada, y el presentador dibuja desde ella. La escena se
-     * cierra sin esperar, asi que la GPU dibuja mientras la CPU sigue.
+     * presentar, volver a subirlo todo a la GPU (crash.txt de 0.1.8.6 en el
+     * titulo de Zafiro Alfa: 73% de "gx", unos 40 ms por fotograma). Aqui la
+     * copia la hace la propia GPU, con un quad, a un buffer suyo para esa
+     * pantalla, y el presentador dibuja desde ese buffer. La CPU no espera ni
+     * copia nada, y la superficie de origen se puede volver a usar enseguida:
+     * la GPU hace las escenas en orden.
      *
-     * La memoria del invitado de la pantalla NO se escribe. Si algo la necesita
-     * (se lee, o el juego va a dibujar otra vez en la superficie mientras esa
-     * pantalla esta a la vista), se hace la copia de verdad en ese momento.
+     * Solo para las pantallas (las direcciones que el juego ha puesto en la
+     * configuracion de los framebuffers): el resto de copias, que si las puede
+     * leer la CPU, siguen por software. La memoria del invitado de la pantalla
+     * se escribe solo si algo la pide (FlushRegion y compania).
+     *
+     * 0.1.8.6 hacia lo mismo SIN copiar, apuntando a la superficie de origen,
+     * y por eso tenia que hacer la copia de verdad en cuanto el juego volvia a
+     * dibujar en ella con la pantalla a la vista: casi siempre.
      */
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
 
@@ -133,8 +138,8 @@ public:
 
     /**
      * Lo que hace SwapBuffers antes de presentar: como FlushPending, pero las
-     * superficies que son origen de una copia de pantalla en la GPU no se
-     * vuelcan (el presentador las lee directamente).
+     * superficies cuyo contenido ya se llevo una copia de pantalla en la GPU no
+     * se vuelcan (siguen sucias: si algo pide su memoria, se vuelcan entonces).
      */
     void FlushForPresent();
 
@@ -312,22 +317,35 @@ private:
     struct Surface;
     struct PipelineCache;
 
-    /// Una copia de pantalla hecha en la GPU (ver AccelerateDisplayTransfer).
-    struct Forward;
-    std::vector<Forward> forwards;
-    /// La copia sigue valiendo: la superficie existe y no ha cambiado desde.
-    bool ForwardValid(const Forward& forward) const;
-    /// La superficie va a cambiar (dibujo nuevo o recarga): las copias que
-    /// salen de ella se hacen de verdad si su pantalla esta a la vista, y si no
-    /// se olvidan.
-    void SurfaceWillChange(Surface& surface);
-    /// Hace la copia de verdad (volcado y transferencia por software).
-    void Materialize(std::size_t index);
-    void MaterializeAll();
-    /// Olvida las copias cuyo destino pisa el tramo.
-    void DropForwards(PAddr addr, u32 size);
-    /// El tramo pisa un framebuffer que se esta mostrando ahora.
-    bool DisplayedOverlaps(PAddr addr, u32 size) const;
+    /// Una pantalla copiada por la GPU (ver AccelerateDisplayTransfer).
+    struct ScreenCopy;
+    std::vector<std::unique_ptr<ScreenCopy>> screen_copies;
+    /// El quad que copia: los programas del blit del presentador.
+    struct BlitProgram;
+    std::unique_ptr<BlitProgram> blit;
+    /// El blit se intento crear y fallo: no se reintenta.
+    bool blit_failed = false;
+    /// Cuenta de copias hechas, para saber cual lleva mas sin usarse.
+    u32 copy_clock = 0;
+    bool EnsureBlitProgram();
+    /// La copia de esa pantalla, con su render target, creada o rehecha si
+    /// hace falta. nullptr si no hay memoria.
+    ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format);
+    /// El quad de la superficie a la copia, en una escena suya.
+    bool BlitToCopy(ScreenCopy& copy, const Surface& source, bool flip);
+    /// La direccion es una de las pantallas que el juego ha configurado.
+    bool IsDisplayFramebuffer(PAddr addr);
+    /// Las ultimas direcciones vistas en la configuracion de las pantallas:
+    /// un juego puede escribir siempre en la misma ranura y alternar la
+    /// direccion, y la copia llega antes de que la pantalla nueva se configure.
+    std::array<PAddr, 8> display_addresses{};
+    u32 display_address_next = 0;
+    /// Escribe en la memoria del invitado lo que solo esta en la copia.
+    void MaterializeCopy(ScreenCopy& copy);
+    void MaterializeCopies(PAddr addr, u32 size);
+    void MaterializeAllCopies();
+    /// El invitado ha escrito en esa pantalla por otro camino: copia olvidada.
+    void DropCopies(PAddr addr, u32 size);
 
     /// Pesquisa un pipeline (y compila el shader si es la primera vez).
     /// Devuelve nullptr si la configuracion no esta soportada.

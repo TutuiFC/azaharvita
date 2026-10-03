@@ -13,6 +13,12 @@
 
 namespace Gxm {
 
+/// Los dos shaders del quad texturizado del presentador. La copia de pantalla
+/// del rasterizador (0.1.8.7) usa los mismos: con el mismo texto, la cache de
+/// shaders de la tarjeta los sirve sin compilar.
+extern const char kBlitVertexSource[];
+extern const char kBlitFragmentSource[];
+
 /**
  * Presenta las dos pantallas del 3DS con el chip grafico de la consola.
  *

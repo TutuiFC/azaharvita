@@ -26,6 +26,7 @@
 #include "video_core/pica_types.h"
 #include "video_core/utils.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
+#include "video_core/renderer_gxm/gxm_presenter.h"
 #include "video_core/renderer_gxm/gxm_texture_cache.h"
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
@@ -610,9 +611,9 @@ struct RasterizerGXM::Surface {
     u32 gxm_color_format = 0;
     /// Hay dibujado nuestro que el invitado todavia no ha visto.
     bool dirty = false;
-    /// Sube cada vez que cambia color_buffer (escena nueva o recarga): una
-    /// copia de pantalla en la GPU vale mientras no cambie (0.1.8.6).
-    u32 content_serial = 0;
+    /// Su contenido ya se lo ha llevado una copia de pantalla en la GPU y no
+    /// ha cambiado desde (0.1.8.7): FlushForPresent no la vuelca.
+    bool copied = false;
     /// El invitado ha cambiado este framebuffer por otro camino (un relleno de
     /// color, una transferencia): hay que volver a leerlo antes de dibujar.
     bool needs_reload = false;
@@ -651,23 +652,86 @@ struct RasterizerGXM::Surface {
     Allocation depth_buffer;
 };
 
-/// Una copia de pantalla hecha en la GPU (0.1.8.6, ver AccelerateDisplayTransfer).
-struct RasterizerGXM::Forward {
-    bool valid = false;
-    /// Destino en la memoria del invitado y lo que ocupa.
+/// Una pantalla copiada por la GPU (0.1.8.7, ver AccelerateDisplayTransfer).
+struct RasterizerGXM::ScreenCopy {
+    ~ScreenCopy() {
+        if (render_target != nullptr) {
+            sceGxmDestroyRenderTarget(render_target);
+        }
+        if (driver_uid >= 0) {
+            sceKernelFreeMemBlock(driver_uid);
+        }
+    }
+
+    /// La pantalla en la memoria del invitado (lineal) y lo que ocupa alli.
     PAddr dst = 0;
     u32 dst_size = 0;
-    /// Origen: la superficie, y su content_serial cuando se hizo la copia.
-    Surface* surface = nullptr;
-    u32 serial = 0;
-    /// Medidas y formato de la salida (lineal).
     u32 width = 0;
     u32 height = 0;
+    /// El formato de la superficie de origen, que es el de la copia (32 bits).
+    u32 gxm_color_format = 0;
+    /// Stride del buffer, en pixeles.
+    u32 stride = 0;
     Pica::PixelFormat input_format = Pica::PixelFormat::RGBA8;
     Pica::PixelFormat output_format = Pica::PixelFormat::RGBA8;
-    /// El presentador ya la ha mostrado al menos una vez.
-    bool presented = false;
+    /// Tiene la ultima copia a esa pantalla...
+    bool valid = false;
+    /// ...y la memoria del invitado todavia no.
+    bool pending = false;
+    /// Para elegir cual se rehace si hacen falta mas de kMaxScreenCopies.
+    u32 last_use = 0;
+    /// La textura sobre la superficie de origen del ultimo blit.
+    SceGxmTexture source_texture{};
+    SceGxmRenderTarget* render_target = nullptr;
+    SceUID driver_uid = -1;
+    SceGxmColorSurface color_surface{};
+    Allocation color_buffer;
+    /// Sin profundidad: la superficie "desactivada" de GXM, sin memoria.
+    SceGxmDepthStencilSurface depth_surface{};
 };
+
+/// El quad de la copia de pantalla, con los shaders del presentador.
+struct RasterizerGXM::BlitProgram {
+    ~BlitProgram() {
+        if (patcher != nullptr) {
+            if (fragment_program != nullptr) {
+                sceGxmShaderPatcherReleaseFragmentProgram(patcher, fragment_program);
+            }
+            if (vertex_program != nullptr) {
+                sceGxmShaderPatcherReleaseVertexProgram(patcher, vertex_program);
+            }
+            if (fragment_registered) {
+                sceGxmShaderPatcherUnregisterProgram(patcher, fragment_id);
+            }
+            if (vertex_registered) {
+                sceGxmShaderPatcherUnregisterProgram(patcher, vertex_id);
+            }
+        }
+        ReleaseCgOutput(vertex_output);
+        ReleaseCgOutput(fragment_output);
+    }
+
+    SceGxmShaderPatcher* patcher = nullptr;
+    const SceShaccCgCompileOutput* vertex_output = nullptr;
+    const SceShaccCgCompileOutput* fragment_output = nullptr;
+    SceGxmShaderPatcherId vertex_id{};
+    SceGxmShaderPatcherId fragment_id{};
+    bool vertex_registered = false;
+    bool fragment_registered = false;
+    SceGxmVertexProgram* vertex_program = nullptr;
+    SceGxmFragmentProgram* fragment_program = nullptr;
+    u32 texture_unit = 0;
+    /// Dos quads de cuatro vertices (recto y volteado) y sus cuatro indices.
+    Allocation quad;
+};
+
+namespace {
+/// Pantallas a la vez: las dos de arriba y las dos de abajo del doble buffer.
+constexpr std::size_t kMaxScreenCopies = 4;
+/// Vertice del quad del blit: posicion float4 y coordenada float2, como el
+/// presentador.
+constexpr u32 kBlitVertexStride = 6 * sizeof(float);
+} // Anonymous namespace
 
 /// Comprueba que el tramo [address, address + size) de la memoria del invitado
 /// este mapeado y sea contiguo. Es la misma comprobacion que hace el
@@ -1666,6 +1730,12 @@ RasterizerGXM::RasterizerGXM(VideoCore::RasterizerInterface& software_, Memory::
 RasterizerGXM::~RasterizerGXM() {
     s_instance = nullptr;
     FlushPending();
+    // El presentador puede seguir leyendo una copia de pantalla en la GPU.
+    if (context != nullptr) {
+        sceGxmFinish(context);
+    }
+    screen_copies.clear();
+    blit.reset();
     textures.reset();
     // Antes que los de fragmentos: los dos usan el mismo parcheador.
     hw_shaders.reset();
@@ -1881,7 +1951,10 @@ void RasterizerGXM::WriteBack(Surface& surface) {
 }
 
 void RasterizerGXM::Reload(Surface& surface) {
-    SurfaceWillChange(surface);
+    surface.copied = false;
+    // Lo que lee del invitado tiene que estar escrito: una copia de pantalla
+    // en la GPU que pise el tramo, primero a la memoria.
+    MaterializeCopies(surface.guest_address, surface.guest_stride * surface.height);
     // Lee y escribe color_buffer: misma razon que WriteBack.
     WaitGpu();
     surface.needs_reload = false;
@@ -1920,32 +1993,36 @@ bool PresentTextureFormat(u32 color_format, SceGxmTextureFormat& out) {
 
 RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address) {
     DirectPresent out;
-    if (s_instance == nullptr || present_direct.load(std::memory_order_relaxed) == 0 ||
-        guest_address == 0) {
+    if (s_instance == nullptr || guest_address == 0) {
         return out;
     }
     RasterizerGXM& self = *s_instance;
-    // La textura va a muestrear color_buffer: si 4.5 dejo la espera pendiente,
-    // hay que pagarla aqui o el chip podria seguir escribiendo debajo.
-    self.WaitGpu();
-    // Una pantalla que es una copia hecha en la GPU (0.1.8.6): la superficie de
-    // origen, recortada a las medidas de la salida, con su paso y su formato.
-    for (auto& forward : self.forwards) {
-        if (forward.dst != guest_address || !self.ForwardValid(forward)) {
+    /**
+     * Una pantalla copiada por la GPU (0.1.8.7): su buffer, tal cual. Sin
+     * esperar a la GPU: el presentador dibuja en una escena posterior a la del
+     * blit, y la GPU las hace en orden.
+     */
+    for (const auto& copy : self.screen_copies) {
+        if (!copy->valid || copy->dst != guest_address) {
             continue;
         }
-        forward.presented = true;
         SceGxmTextureFormat tex_format{};
-        if (!PresentTextureFormat(forward.surface->gxm_color_format, tex_format)) {
+        if (!PresentTextureFormat(copy->gxm_color_format, tex_format)) {
             break;
         }
-        out.data = static_cast<const u8*>(forward.surface->color_buffer.Data());
-        out.width = forward.width;
-        out.height = forward.height;
-        out.stride_bytes = forward.surface->color_stride * forward.surface->rt_bpp;
+        out.data = static_cast<const u8*>(copy->color_buffer.Data());
+        out.width = copy->width;
+        out.height = copy->height;
+        out.stride_bytes = copy->stride * 4;
         out.gxm_texture_format = static_cast<u32>(tex_format);
         return out;
     }
+    if (present_direct.load(std::memory_order_relaxed) == 0) {
+        return out;
+    }
+    // La textura va a muestrear color_buffer: si 4.5 dejo la espera pendiente,
+    // hay que pagarla aqui o el chip podria seguir escribiendo debajo.
+    self.WaitGpu();
     for (const auto& surface : self.surfaces) {
         if (surface->guest_address != guest_address) {
             continue;
@@ -1988,212 +2065,453 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
     return out;
 }
 
-bool RasterizerGXM::ForwardValid(const Forward& forward) const {
-    if (!forward.valid || forward.surface == nullptr) {
-        return false;
-    }
-    bool alive = false;
-    for (const auto& surface : surfaces) {
-        if (surface.get() == forward.surface) {
-            alive = true;
-            break;
-        }
-    }
-    return alive && forward.surface->content_serial == forward.serial &&
-           forward.surface->color_buffer.Valid();
-}
-
-bool RasterizerGXM::DisplayedOverlaps(PAddr addr, u32 size) const {
+bool RasterizerGXM::IsDisplayFramebuffer(PAddr addr) {
     for (u32 i = 0; i < 2; i++) {
         const auto& framebuffer = pica.regs.framebuffer_config[i];
-        const PAddr shown =
-            framebuffer.active_fb == 0 ? framebuffer.address_left1 : framebuffer.address_left2;
-        const u32 shown_size = framebuffer.stride * framebuffer.height;
-        if (shown_size != 0 && addr < shown + shown_size && shown < addr + size) {
-            return true;
+        for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2}) {
+            if (shown == 0 || std::find(display_addresses.begin(), display_addresses.end(),
+                                        shown) != display_addresses.end()) {
+                continue;
+            }
+            display_addresses[display_address_next] = shown;
+            display_address_next = (display_address_next + 1) % display_addresses.size();
         }
     }
-    return false;
+    return addr != 0 &&
+           std::find(display_addresses.begin(), display_addresses.end(), addr) !=
+               display_addresses.end();
 }
 
-void RasterizerGXM::DropForwards(PAddr addr, u32 size) {
-    for (auto& forward : forwards) {
-        if (forward.valid && addr < forward.dst + forward.dst_size &&
-            forward.dst < addr + size) {
-            forward.valid = false;
+void RasterizerGXM::DropCopies(PAddr addr, u32 size) {
+    for (auto& copy : screen_copies) {
+        if (copy->valid && addr < copy->dst + copy->dst_size && copy->dst < addr + size) {
+            copy->valid = false;
+            copy->pending = false;
         }
     }
 }
 
 /**
- * La copia de verdad, DESDE NUESTRO BUFFER DE COLOR y no desde la memoria del
- * invitado: si el juego ya ha borrado la superficie de origen con un relleno
- * para dibujar el fotograma siguiente, su memoria tiene ese borrado, y lo que
- * vale para la pantalla es lo que la GPU dibujo y sigue en color_buffer (la
- * recarga, que lo pisa, llama aqui antes). La salida es lineal, asi que es
- * fila a fila: los mismos bytes que el invitado (CopyTiledGuest los mueve tal
- * cual), y de RGBA8 a RGB8 los bytes 1, 2 y 3, como UntileRGBA8ToRGB8.
+ * La copia de verdad a la memoria del invitado, desde el buffer de la copia.
+ * La pantalla es lineal, asi que es fila a fila: los mismos bytes que el
+ * invitado (CopyTiledGuest los mueve tal cual), y de RGBA8 a RGB8 los bytes 1,
+ * 2 y 3, como UntileRGBA8ToRGB8. La copia sigue valiendo para presentar.
  */
-void RasterizerGXM::Materialize(std::size_t index) {
-    const Forward forward = forwards[index];
-    forwards[index].valid = false;
-    if (!ForwardValid(forward) || forward.width > 1024) {
+void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
+    if (!copy.valid || !copy.pending) {
         return;
     }
-    Surface& surface = *forward.surface;
-    if (open_surface == &surface) {
-        EndScene();
+    copy.pending = false;
+    if (copy.width > 1024 || !GuestSpanMapped(memory, copy.dst, copy.dst_size)) {
+        return;
     }
+    // El blit tiene que haber terminado.
     WaitGpu();
-    InvalidateRegion(forward.dst, forward.dst_size);
-    if (!GuestSpanMapped(memory, forward.dst, forward.dst_size)) {
-        return;
-    }
-    u8* const dst = memory.GetPhysicalPointer(forward.dst);
-    const u8* const src = static_cast<const u8*>(surface.color_buffer.Data());
-    const u32 src_stride = surface.color_stride * surface.rt_bpp;
-    const u32 in_bpp = surface.rt_bpp;
-    const u32 out_bpp = Pica::BytesPerPixel(forward.output_format);
-    const bool rgba_to_rgb = forward.input_format == Pica::PixelFormat::RGBA8 &&
-                             forward.output_format == Pica::PixelFormat::RGB8;
+    u8* const dst = memory.GetPhysicalPointer(copy.dst);
+    const u8* const src = static_cast<const u8*>(copy.color_buffer.Data());
+    const u32 src_stride = copy.stride * 4;
+    const u32 out_bpp = Pica::BytesPerPixel(copy.output_format);
+    const bool rgba_to_rgb = copy.input_format == Pica::PixelFormat::RGBA8 &&
+                             copy.output_format == Pica::PixelFormat::RGB8;
     alignas(16) u8 row[1024 * 4];
-    for (u32 y = 0; y < forward.height; y++) {
+    for (u32 y = 0; y < copy.height; y++) {
         // CDRAM se lee sin cache: la fila de una vez y despues de memoria normal.
-        std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride, forward.width * in_bpp);
-        u8* out = dst + static_cast<std::size_t>(y) * forward.width * out_bpp;
+        std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride, copy.width * 4);
+        u8* out = dst + static_cast<std::size_t>(y) * copy.width * out_bpp;
         if (rgba_to_rgb) {
-            for (u32 x = 0; x < forward.width; x++) {
+            for (u32 x = 0; x < copy.width; x++) {
                 out[x * 3 + 0] = row[x * 4 + 1];
                 out[x * 3 + 1] = row[x * 4 + 2];
                 out[x * 3 + 2] = row[x * 4 + 3];
             }
-        } else if (in_bpp == out_bpp) {
-            std::memcpy(out, row, forward.width * out_bpp);
+        } else if (out_bpp == 4) {
+            std::memcpy(out, row, copy.width * 4);
         } else {
             // RGB8: la superficie lleva 4 bytes por pixel y los 3 primeros son
             // los del invitado (ver CurrentSurface).
-            for (u32 x = 0; x < forward.width; x++) {
-                std::memcpy(out + x * out_bpp, row + x * in_bpp, out_bpp);
+            for (u32 x = 0; x < copy.width; x++) {
+                std::memcpy(out + x * 3, row + x * 4, 3);
             }
         }
     }
     transfer_materialized.fetch_add(1, std::memory_order_relaxed);
+    // Lo que se hubiera quedado con la memoria vieja de esa pantalla.
+    if (textures != nullptr) {
+        textures->InvalidateRange(copy.dst, copy.dst_size);
+    }
+    software.InvalidateRegion(copy.dst, copy.dst_size);
 }
 
-void RasterizerGXM::MaterializeAll() {
-    for (std::size_t i = 0; i < forwards.size(); i++) {
-        if (forwards[i].valid) {
-            Materialize(i);
+void RasterizerGXM::MaterializeCopies(PAddr addr, u32 size) {
+    for (auto& copy : screen_copies) {
+        if (copy->pending && addr < copy->dst + copy->dst_size && copy->dst < addr + size) {
+            MaterializeCopy(*copy);
         }
     }
 }
 
-void RasterizerGXM::SurfaceWillChange(Surface& surface) {
-    for (std::size_t i = 0; i < forwards.size(); i++) {
-        Forward& forward = forwards[i];
-        if (!forward.valid || forward.surface != &surface) {
-            continue;
-        }
-        /**
-         * Se hace la copia de verdad si esa pantalla todavia se va a ver: si
-         * aun no se ha presentado nunca (muchos juegos copian la pantalla de
-         * arriba y reutilizan la misma superficie para la de abajo antes del
-         * vblank) o si es la que se esta mostrando ahora. Si ya se presento y
-         * ya no esta a la vista, el juego escribira otra encima antes de
-         * volver a mostrarla: basta con olvidarla, y ahi esta la ganancia.
-         */
-        if (forward.serial == surface.content_serial &&
-            (!forward.presented || DisplayedOverlaps(forward.dst, forward.dst_size))) {
-            Materialize(i);
-        } else {
-            forward.valid = false;
+void RasterizerGXM::MaterializeAllCopies() {
+    for (auto& copy : screen_copies) {
+        MaterializeCopy(*copy);
+    }
+}
+
+bool RasterizerGXM::EnsureBlitProgram() {
+    if (blit != nullptr) {
+        return true;
+    }
+    if (blit_failed) {
+        return false;
+    }
+    // Un solo intento: si falla aqui, fallara igual en el siguiente lote.
+    blit_failed = true;
+    const auto fail = [](const char* why, int rc) {
+        NoteFmt("gxm copia", "blit: {} ({:#x}); las pantallas siguen por software", why,
+                static_cast<u32>(rc));
+        return false;
+    };
+    auto program = std::make_unique<BlitProgram>();
+    program->patcher = patcher;
+    program->vertex_output = CompileCg(SCE_SHACCCG_PROFILE_VP, "azahar_blit_v.cg", kBlitVertexSource);
+    program->fragment_output =
+        CompileCg(SCE_SHACCCG_PROFILE_FP, "azahar_blit_f.cg", kBlitFragmentSource);
+    if (program->vertex_output == nullptr || program->fragment_output == nullptr) {
+        return fail("sin shaders", 0);
+    }
+    const auto* vertex_gxp =
+        reinterpret_cast<const SceGxmProgram*>(program->vertex_output->programData);
+    const auto* fragment_gxp =
+        reinterpret_cast<const SceGxmProgram*>(program->fragment_output->programData);
+    int rc = sceGxmShaderPatcherRegisterProgram(patcher, vertex_gxp, &program->vertex_id);
+    if (rc != 0) {
+        return fail("registro de vertices", rc);
+    }
+    program->vertex_registered = true;
+    rc = sceGxmShaderPatcherRegisterProgram(patcher, fragment_gxp, &program->fragment_id);
+    if (rc != 0) {
+        return fail("registro de fragmentos", rc);
+    }
+    program->fragment_registered = true;
+
+    const SceGxmProgramParameter* position_param =
+        sceGxmProgramFindParameterByName(vertex_gxp, "position");
+    const SceGxmProgramParameter* texcoord_param =
+        sceGxmProgramFindParameterByName(vertex_gxp, "texcoord");
+    if (position_param == nullptr || texcoord_param == nullptr) {
+        return fail("sin position/texcoord", 0);
+    }
+    SceGxmVertexAttribute attributes[2]{};
+    attributes[0].streamIndex = 0;
+    attributes[0].offset = 0;
+    attributes[0].format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+    attributes[0].componentCount = 4;
+    attributes[0].regIndex = sceGxmProgramParameterGetResourceIndex(position_param);
+    attributes[1].streamIndex = 0;
+    attributes[1].offset = 4 * sizeof(float);
+    attributes[1].format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+    attributes[1].componentCount = 2;
+    attributes[1].regIndex = sceGxmProgramParameterGetResourceIndex(texcoord_param);
+    SceGxmVertexStream stream{};
+    stream.stride = static_cast<u16>(kBlitVertexStride);
+    stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+    rc = sceGxmShaderPatcherCreateVertexProgram(patcher, program->vertex_id, attributes, 2,
+                                                &stream, 1, &program->vertex_program);
+    if (rc != 0) {
+        return fail("programa de vertices", rc);
+    }
+    // Sin mezcla: los bytes de la superficie, tal cual, alfa incluido.
+    SceGxmBlendInfo blend{};
+    blend.colorMask = SCE_GXM_COLOR_MASK_ALL;
+    blend.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
+    blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+    blend.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
+    blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+    blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    rc = sceGxmShaderPatcherCreateFragmentProgram(
+        patcher, program->fragment_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+        SCE_GXM_MULTISAMPLE_NONE, &blend, vertex_gxp, &program->fragment_program);
+    if (rc != 0) {
+        return fail("programa de fragmentos", rc);
+    }
+    const SceGxmProgramParameter* sampler_param =
+        sceGxmProgramFindParameterByName(fragment_gxp, "tex");
+    program->texture_unit =
+        sampler_param != nullptr ? sceGxmProgramParameterGetResourceIndex(sampler_param) : 0;
+
+    /**
+     * La fila 0 de la superficie (v = 0, el principio de su memoria) va a la
+     * fila 0 de la copia, que es la de arriba: y = +1 con el viewport de
+     * BlitToCopy, igual que en el presentador. Volteado, al reves, como hace
+     * la copia por software con flip_vertically.
+     */
+    static constexpr float kQuads[8][6] = {
+        {-1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f},
+        {-1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 1.0f}, {1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        {-1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f}, {1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+        {-1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 0.0f}, {1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 0.0f},
+    };
+    static constexpr u16 kIndices[4] = {0, 1, 2, 3};
+    static_assert(sizeof(kQuads) == 8 * kBlitVertexStride);
+    program->quad = Allocate(Pool::Host, sizeof(kQuads) + sizeof(kIndices));
+    if (!program->quad.Valid()) {
+        return fail("sin memoria", 0);
+    }
+    std::memcpy(program->quad.Data(), kQuads, sizeof(kQuads));
+    std::memcpy(static_cast<u8*>(program->quad.Data()) + sizeof(kQuads), kIndices,
+                sizeof(kIndices));
+    blit = std::move(program);
+    blit_failed = false;
+    return true;
+}
+
+RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u32 height,
+                                                       u32 gxm_color_format) {
+    std::unique_ptr<ScreenCopy>* slot = nullptr;
+    for (auto& copy : screen_copies) {
+        if (copy->dst == dst) {
+            slot = &copy;
+            break;
         }
     }
-    surface.content_serial++;
+    if (slot != nullptr && (*slot)->width == width && (*slot)->height == height &&
+        (*slot)->gxm_color_format == gxm_color_format) {
+        return slot->get();
+    }
+
+    // Una nueva, con las mismas cuentas que la superficie de color de
+    // CurrentSurface (lineal, stride a 8 pixeles) y sin profundidad.
+    static bool noted = false;
+    auto copy = std::make_unique<ScreenCopy>();
+    copy->dst = dst;
+    copy->width = width;
+    copy->height = height;
+    copy->gxm_color_format = gxm_color_format;
+    copy->stride = (width + 7) & ~7u;
+    copy->color_buffer = Allocate(Pool::Cdram, copy->stride * height * 4, SCE_GXM_MEMORY_ATTRIB_RW);
+    if (!copy->color_buffer.Valid()) {
+        NoteOnce(noted, "gxm copia", "sin memoria para {}x{}", width, height);
+        return nullptr;
+    }
+    int rc = sceGxmColorSurfaceInit(&copy->color_surface,
+                                    static_cast<SceGxmColorFormat>(gxm_color_format),
+                                    SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE,
+                                    SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, width, height,
+                                    copy->stride, copy->color_buffer.Data());
+    if (rc != 0) {
+        NoteOnce(noted, "gxm copia", "color {}x{} err {:#x}", width, height, static_cast<u32>(rc));
+        return nullptr;
+    }
+    rc = sceGxmDepthStencilSurfaceInitDisabled(&copy->depth_surface);
+    if (rc != 0) {
+        NoteOnce(noted, "gxm copia", "prof desactivada err {:#x}", static_cast<u32>(rc));
+        return nullptr;
+    }
+    SceGxmRenderTargetParams params{};
+    params.flags = 0;
+    params.width = static_cast<u16>(width);
+    params.height = static_cast<u16>(height);
+    params.scenesPerFrame = 1;
+    params.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
+    params.multisampleLocations = 0;
+    unsigned int driver_size = 0;
+    rc = sceGxmGetRenderTargetMemSize(&params, &driver_size);
+    if (rc < 0 || driver_size == 0) {
+        NoteOnce(noted, "gxm copia", "rt memsize err {:#x}", static_cast<u32>(rc));
+        return nullptr;
+    }
+    const SceSize driver_bytes = (driver_size + 0xFFFu) & ~0xFFFu;
+    const SceUID driver_uid = sceKernelAllocMemBlock(
+        "azahar_gxm_copy", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, driver_bytes, nullptr);
+    if (driver_uid < 0) {
+        NoteOnce(noted, "gxm copia", "rt memblock err {:#x}", static_cast<u32>(driver_uid));
+        return nullptr;
+    }
+    copy->driver_uid = driver_uid;
+    params.driverMemBlock = driver_uid;
+    rc = sceGxmCreateRenderTarget(&params, &copy->render_target);
+    if (rc != 0) {
+        copy->render_target = nullptr;
+        NoteOnce(noted, "gxm copia", "rt {}x{} err {:#x}", width, height, static_cast<u32>(rc));
+        return nullptr;
+    }
+
+    if (slot == nullptr && screen_copies.size() < kMaxScreenCopies) {
+        screen_copies.push_back(std::move(copy));
+        return screen_copies.back().get();
+    }
+    if (slot == nullptr) {
+        slot = &screen_copies.front();
+        for (auto& candidate : screen_copies) {
+            if (candidate->last_use < (*slot)->last_use) {
+                slot = &candidate;
+            }
+        }
+    }
+    // La que se va puede tenerla todavia la GPU (un blit o el presentador), y
+    // su pantalla puede no estar escrita en el invitado.
+    MaterializeCopy(**slot);
+    EndScene();
+    sceGxmFinish(context);
+    gpu_pending = false;
+    *slot = std::move(copy);
+    return slot->get();
+}
+
+bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, const Surface& source, bool flip) {
+    SceGxmTextureFormat tex_format{};
+    if (!PresentTextureFormat(source.gxm_color_format, tex_format)) {
+        return false;
+    }
+    SceGxmTexture& texture = copy.source_texture;
+    if (sceGxmTextureInitLinearStrided(&texture, source.color_buffer.Data(), tex_format,
+                                       copy.width, copy.height,
+                                       source.color_stride * source.rt_bpp) < 0) {
+        return false;
+    }
+    sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+    sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+    sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetVAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+
+    // Lo dibujado en la superficie se manda antes que el blit que lo lee.
+    EndScene();
+    const int rc = sceGxmBeginScene(context, 0, copy.render_target, nullptr, nullptr, nullptr,
+                                    &copy.color_surface, &copy.depth_surface);
+    if (rc != 0) {
+        static bool noted = false;
+        NoteOnce(noted, "gxm copia", "beginscene err {:#x}", static_cast<u32>(rc));
+        return false;
+    }
+    // El estado del contexto es compartido: todo lo que el quad necesita, aqui.
+    const float half_width = static_cast<float>(copy.width) * 0.5f;
+    const float half_height = static_cast<float>(copy.height) * 0.5f;
+    sceGxmSetViewport(context, half_width, half_width, half_height, -half_height, 0.5f, 0.5f);
+    sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_NONE, 0, 0, 0, 0);
+    sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+    sceGxmSetBackPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+    sceGxmSetCullMode(context, SCE_GXM_CULL_NONE);
+    sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    sceGxmSetBackDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    sceGxmSetFrontStencilFunc(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+                              SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
+    sceGxmSetBackStencilFunc(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+                             SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
+    sceGxmSetVertexProgram(context, blit->vertex_program);
+    sceGxmSetFragmentProgram(context, blit->fragment_program);
+    const u8* quad = static_cast<const u8*>(blit->quad.Data());
+    sceGxmSetVertexStream(context, 0, quad + (flip ? 4 * kBlitVertexStride : 0));
+    sceGxmSetFragmentTexture(context, blit->texture_unit, &texture);
+    sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
+               quad + 8 * kBlitVertexStride, 4);
+    sceGxmEndScene(context, nullptr, nullptr);
+    gpu_pending = true;
+    return true;
 }
 
 bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
-    if (transfer_on_gpu.load(std::memory_order_relaxed) == 0 ||
-        present_direct.load(std::memory_order_relaxed) == 0 || !available) {
-        return false;
-    }
-    if (config.input_linear || config.dont_swizzle || config.flip_vertically ||
-        config.scaling != Pica::DisplayTransferConfig::NoScale) {
-        return false;
-    }
-    const Pica::PixelFormat in_format = config.input_format;
-    const Pica::PixelFormat out_format = config.output_format;
-    if (in_format > Pica::PixelFormat::RGBA4 || out_format > Pica::PixelFormat::RGBA4) {
-        return false;
-    }
-    if (in_format != out_format &&
-        !(in_format == Pica::PixelFormat::RGBA8 && out_format == Pica::PixelFormat::RGB8)) {
-        return false;
-    }
     const PAddr src = config.GetPhysicalInputAddress();
     const PAddr dst = config.GetPhysicalOutputAddress();
+    const u32 width = config.output_width;
+    const u32 height = config.output_height;
+    const Pica::PixelFormat in_format = config.input_format;
+    const Pica::PixelFormat out_format = config.output_format;
     Surface* source = nullptr;
+
+    /**
+     * Cada motivo de rechazo, UNA vez en crash.txt y con los numeros: en
+     * 0.1.8.6 la copia en la GPU no se hizo ni una vez y no habia forma de
+     * saber por que.
+     */
+    const auto reject = [&](const char* why) {
+        static const char* noted[12] = {};
+        static u32 noted_count = 0;
+        for (u32 i = 0; i < noted_count; i++) {
+            if (noted[i] == why) {
+                return false;
+            }
+        }
+        if (noted_count < 12) {
+            noted[noted_count++] = why;
+            if (source != nullptr) {
+                NoteFmt("gxm copia", "no ({}): {:#x}->{:#x} {}x{} fmt {}->{}, sup {}x{} bpp {} rec {}",
+                        why, src, dst, width, height, static_cast<u32>(in_format),
+                        static_cast<u32>(out_format), source->width, source->height,
+                        source->bpp, source->needs_reload ? 1 : 0);
+            } else {
+                NoteFmt("gxm copia", "no ({}): {:#x}->{:#x} {}x{} de {}x{} fmt {}->{}", why, src,
+                        dst, width, height, static_cast<u32>(config.input_width.Value()),
+                        static_cast<u32>(config.input_height.Value()),
+                        static_cast<u32>(in_format), static_cast<u32>(out_format));
+            }
+        }
+        return false;
+    };
+
+    if (transfer_on_gpu.load(std::memory_order_relaxed) == 0) {
+        return reject("apagada");
+    }
+    if (!available) {
+        return reject("sin gxm");
+    }
+    if (config.input_linear || config.dont_swizzle ||
+        config.scaling != Pica::DisplayTransferConfig::NoScale) {
+        return reject("modo");
+    }
+    // Superficies de 32 bits: RGBA8 a RGBA8 o RGB8, y RGB8 a RGB8.
+    if ((in_format != Pica::PixelFormat::RGBA8 && in_format != Pica::PixelFormat::RGB8) ||
+        (in_format != out_format &&
+         !(in_format == Pica::PixelFormat::RGBA8 && out_format == Pica::PixelFormat::RGB8))) {
+        return reject("formato");
+    }
+    if (!IsDisplayFramebuffer(dst)) {
+        return reject("no es pantalla");
+    }
     for (auto& surface : surfaces) {
         if (surface->guest_address == src) {
             source = surface.get();
             break;
         }
     }
-    // Sin superficie, o con la memoria del invitado por delante de la nuestra
-    // (needs_reload): por software, que lee la memoria del invitado.
-    if (source == nullptr || source->needs_reload || !source->color_buffer.Valid() ||
-        source->width != config.input_width || source->bpp != Pica::BytesPerPixel(in_format)) {
-        return false;
+    if (source == nullptr) {
+        return reject("sin superficie");
     }
-    const u32 width = config.output_width;
-    const u32 height = config.output_height;
-    SceGxmTextureFormat tex_format{};
-    if (width == 0 || height == 0 || width > source->width || height > source->height ||
-        !PresentTextureFormat(source->gxm_color_format, tex_format)) {
-        return false;
+    // Con la memoria del invitado por delante de la nuestra: por software.
+    if (source->needs_reload || !source->color_buffer.Valid()) {
+        return reject("superficie por recargar");
+    }
+    if (source->width != config.input_width || source->bpp != Pica::BytesPerPixel(in_format) ||
+        source->rt_bpp != 4 || width == 0 || height == 0 || width > source->width ||
+        height > source->height || width > 1024) {
+        return reject("medidas");
+    }
+    if (!EnsureBlitProgram()) {
+        return reject("sin blit");
+    }
+    ScreenCopy* copy = GetScreenCopy(dst, width, height, source->gxm_color_format);
+    if (copy == nullptr) {
+        return reject("sin copia");
     }
     const u32 dst_size = width * height * Pica::BytesPerPixel(out_format);
-
-    // La GPU empieza ya con lo dibujado (sin esperar): para cuando se presente,
-    // lo normal es que ya haya terminado.
-    if (open_surface == source) {
-        EndScene();
-    }
-    // Lo que hubiera en el destino deja de valer, como en la copia por software.
+    // Lo que hubiera en esa pantalla deja de valer, como en la copia por
+    // software (la copia anterior a ella incluida).
     InvalidateRegion(dst, dst_size);
-
-    std::size_t slot = forwards.size();
-    for (std::size_t i = 0; i < forwards.size(); i++) {
-        if (forwards[i].dst == dst || !forwards[i].valid) {
-            slot = i;
-            break;
-        }
+    if (!BlitToCopy(*copy, *source, config.flip_vertically != 0)) {
+        return reject("escena");
     }
-    if (slot == forwards.size()) {
-        if (forwards.size() < 4) {
-            forwards.emplace_back();
-        } else {
-            // Las cuatro ocupadas: la mas vieja se hace de verdad y se reutiliza.
-            Materialize(0);
-            std::rotate(forwards.begin(), forwards.begin() + 1, forwards.end());
-            slot = forwards.size() - 1;
-        }
-    }
-    Forward& forward = forwards[slot];
-    forward.valid = true;
-    forward.dst = dst;
-    forward.dst_size = dst_size;
-    forward.surface = source;
-    forward.serial = source->content_serial;
-    forward.width = width;
-    forward.height = height;
-    forward.input_format = in_format;
-    forward.output_format = out_format;
-    forward.presented = false;
+    copy->dst_size = dst_size;
+    copy->input_format = in_format;
+    copy->output_format = out_format;
+    copy->valid = true;
+    copy->pending = true;
+    copy->last_use = ++copy_clock;
+    source->copied = true;
     gpu_transfers.fetch_add(1, std::memory_order_relaxed);
     static bool noted = false;
-    NoteOnce(noted, "gxm copia", "pantalla {:#010x} {}x{} desde la superficie {:#010x} en la GPU",
-             dst, width, height, src);
+    NoteOnce(noted, "gxm copia", "pantalla {:#010x} {}x{} desde {:#010x}, copiada en la GPU", dst,
+             width, height, src);
     return true;
 }
 
@@ -2385,7 +2703,7 @@ void RasterizerGXM::ClearDepthIfNeeded(Surface& surface) {
 }
 
 void RasterizerGXM::FlushPending() {
-    MaterializeAll();
+    MaterializeAllCopies();
     EndScene();
     for (auto& surface : surfaces) {
         WriteBack(*surface);
@@ -2395,14 +2713,7 @@ void RasterizerGXM::FlushPending() {
 void RasterizerGXM::FlushForPresent() {
     EndScene();
     for (auto& surface : surfaces) {
-        bool presented_from_gpu = false;
-        for (const auto& forward : forwards) {
-            if (forward.surface == surface.get() && ForwardValid(forward)) {
-                presented_from_gpu = true;
-                break;
-            }
-        }
-        if (!presented_from_gpu) {
+        if (!surface->copied) {
             WriteBack(*surface);
         }
     }
@@ -2541,8 +2852,10 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
          * recrea leyendo del invitado, que es correcto aunque cueste.
          */
         FlushPending();
+        // Un blit de copia de pantalla puede seguir leyendo alguna.
+        sceGxmFinish(context);
+        gpu_pending = false;
         surfaces.clear();
-        forwards.clear();
         NoteOnce(fb_noted[7], "gxm fb", "tope de {} superficies", kMaxSurfaces);
     }
 
@@ -3075,9 +3388,9 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                                    const SceGxmVertexProgram* vertex_program,
                                    const SceGxmFragmentProgram* fragment_program) {
     if (!surface->scene_open) {
-        // Una escena nueva va a cambiar el color: las copias de pantalla que
-        // salen de esta superficie se resuelven antes (0.1.8.6).
-        SurfaceWillChange(*surface);
+        // Una escena nueva va a cambiar el color: lo que se llevo una copia de
+        // pantalla ya no es lo que hay (0.1.8.7).
+        surface->copied = false;
         // Si la profundidad o la plantilla estan por rehacer, se deja la
         // superficie preparada ANTES de abrir: el borrado lo hace GXM al cargar
         // los tiles y solo mira la superficie en sceGxmBeginScene.
@@ -3472,13 +3785,8 @@ void RasterizerGXM::FlushAll() {
 }
 
 void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
-    // Alguien va a leer una pantalla copiada en la GPU: copia de verdad.
-    for (std::size_t i = 0; i < forwards.size(); i++) {
-        if (forwards[i].valid && addr < forwards[i].dst + forwards[i].dst_size &&
-            forwards[i].dst < addr + size) {
-            Materialize(i);
-        }
-    }
+    // Alguien va a leer una pantalla copiada en la GPU: a la memoria.
+    MaterializeCopies(addr, size);
     /**
      * Volcar SOLO lo que pisa el tramo, y cerrar la escena SOLO si hay algo que
      * pisar.
@@ -3525,7 +3833,7 @@ void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
 
 void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
     // El invitado escribe encima de una pantalla copiada en la GPU: se olvida.
-    DropForwards(addr, size);
+    DropCopies(addr, size);
     /**
      * Invalidar NO es volcar: es lo contrario, y confundirlo se comia el
      * trabajo del juego.
@@ -3566,12 +3874,8 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
-    for (std::size_t i = 0; i < forwards.size(); i++) {
-        if (forwards[i].valid && addr < forwards[i].dst + forwards[i].dst_size &&
-            forwards[i].dst < addr + size) {
-            Materialize(i);
-        }
-    }
+    MaterializeCopies(addr, size);
+    DropCopies(addr, size);
     // Las dos cosas y en este orden: el invitado se lleva lo que hemos dibujado
     // y despues lo que el haga ahi es lo que manda.
     for (auto& surface : surfaces) {

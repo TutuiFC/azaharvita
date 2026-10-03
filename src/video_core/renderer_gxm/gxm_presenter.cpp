@@ -17,6 +17,45 @@
 
 namespace Gxm {
 
+/**
+ * Shader de vertices: solo coloca y pasa la coordenada de textura.
+ *
+ * Las posiciones llegan ya en coordenadas de recorte (NDC) calculadas en la
+ * CPU, asi que no hace falta matriz por uniform: son cuatro vertices por
+ * pantalla, y la transformada de pixel a NDC son dos restas y dos divisiones.
+ * Evitar el uniform evita tambien reservarlo y rellenarlo por fotograma.
+ *
+ * El nombre de los parametros importa: Init busca "position" y "texcoord" en
+ * el GXP compilado para ligar los atributos del stream.
+ */
+const char kBlitVertexSource[] = R"(
+void main(float4 position : POSITION,
+          float2 texcoord : TEXCOORD0,
+          out float4 gl_Position : POSITION,
+          out float2 gl_TexCoord : TEXCOORD0)
+{
+    gl_Position = position;
+    gl_TexCoord = texcoord;
+}
+)";
+
+/**
+ * Shader de fragmentos: muestra la textura tal cual.
+ *
+ * La textura que se enlaza puede ser la pantalla del juego o el texel de 1x1
+ * que se usa para el relleno de color, asi que este unico programa cubre los
+ * dos casos. El canal alfa se respeta tal cual viene del framebuffer del 3DS,
+ * que es lo que hace el rasterizador de software.
+ */
+const char kBlitFragmentSource[] = R"(
+uniform sampler2D tex;
+void main(float2 texcoord : TEXCOORD0,
+          out float4 gl_FragColor : COLOR)
+{
+    gl_FragColor = tex2D(tex, texcoord);
+}
+)";
+
 namespace {
 
 /**
@@ -60,45 +99,6 @@ void* ShaccCgAlloc(unsigned int size) {
 void ShaccCgFree(void* pointer) {
     std::free(pointer);
 }
-
-/**
- * Shader de vertices: solo coloca y pasa la coordenada de textura.
- *
- * Las posiciones llegan ya en coordenadas de recorte (NDC) calculadas en la
- * CPU, asi que no hace falta matriz por uniform: son cuatro vertices por
- * pantalla, y la transformada de pixel a NDC son dos restas y dos divisiones.
- * Evitar el uniform evita tambien reservarlo y rellenarlo por fotograma.
- *
- * El nombre de los parametros importa: Init busca "position" y "texcoord" en
- * el GXP compilado para ligar los atributos del stream.
- */
-constexpr const char kVertexSource[] = R"(
-void main(float4 position : POSITION,
-          float2 texcoord : TEXCOORD0,
-          out float4 gl_Position : POSITION,
-          out float2 gl_TexCoord : TEXCOORD0)
-{
-    gl_Position = position;
-    gl_TexCoord = texcoord;
-}
-)";
-
-/**
- * Shader de fragmentos: muestra la textura tal cual.
- *
- * La textura que se enlaza puede ser la pantalla del juego o el texel de 1x1
- * que se usa para el relleno de color, asi que este unico programa cubre los
- * dos casos. El canal alfa se respeta tal cual viene del framebuffer del 3DS,
- * que es lo que hace el rasterizador de software.
- */
-constexpr const char kFragmentSource[] = R"(
-uniform sampler2D tex;
-void main(float2 texcoord : TEXCOORD0,
-          out float4 gl_FragColor : COLOR)
-{
-    gl_FragColor = tex2D(tex, texcoord);
-}
-)";
 
 /// Formato de vertice del quad: posicion float4 + coordenada float2. Se
 /// declaran cuatro componentes aunque z y w sean constantes para que el
@@ -156,8 +156,8 @@ bool ScreenPresenter::Init() {
     }
 
     // 3. Los dos programas.
-    vertex_output = CompileShader(SCE_SHACCCG_PROFILE_VP, "azahar_blit_v.cg", kVertexSource);
-    fragment_output = CompileShader(SCE_SHACCCG_PROFILE_FP, "azahar_blit_f.cg", kFragmentSource);
+    vertex_output = CompileShader(SCE_SHACCCG_PROFILE_VP, "azahar_blit_v.cg", kBlitVertexSource);
+    fragment_output = CompileShader(SCE_SHACCCG_PROFILE_FP, "azahar_blit_f.cg", kBlitFragmentSource);
     if (vertex_output == nullptr || fragment_output == nullptr) {
         status = "vita2d (error de shader)";
         return fail("no se han podido compilar los shaders de presentacion", 0);
