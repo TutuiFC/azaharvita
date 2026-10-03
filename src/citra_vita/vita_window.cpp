@@ -82,6 +82,9 @@ EmuWindow_Vita::~EmuWindow_Vita() {
     if (bottom_texture != nullptr) {
         vita2d_free_texture(bottom_texture);
     }
+    if (overlay_texture != nullptr) {
+        vita2d_free_texture(overlay_texture);
+    }
 }
 
 EmuWindow_Vita::ScreenRects EmuWindow_Vita::RectsFor(int layout) {
@@ -512,6 +515,38 @@ void EmuWindow_Vita::PresentScreens() {
     // sumadas no dicen nada sobre cual hay que arreglar.
     const unsigned long long draw_begin = Common::VitaMicros();
     const Common::ScopedVitaStage stage{"presentar"};
+    /**
+     * EL OVERLAY, EN UNA TEXTURA (0.1.9.6). Pintar sus ~30 lineas de texto
+     * costaba ~2,5 ms en CADA fotograma ("ovl"), y las cifras solo cambian una
+     * vez por segundo. Ahora se pintan en una textura cuando cambian, fuera de
+     * la escena de la pantalla, y cada fotograma la pone encima con un quad.
+     * Sin textura (sin memoria de video), como antes: directo cada fotograma.
+     */
+    bool overlay_from_texture = false;
+    {
+        const unsigned long long overlay_begin = Common::VitaMicros();
+        if (stats_overlay_visible && overlay_texture == nullptr) {
+            overlay_texture = vita2d_create_empty_texture_rendertarget(
+                kVitaScreenWidth, kVitaScreenHeight, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+            stats_next_update_us = 0;
+        }
+        if (stats_overlay_visible && overlay_texture != nullptr) {
+            overlay_from_texture = true;
+            if (sceKernelGetProcessTimeWide() >= stats_next_update_us) {
+                const unsigned int clear_color = vita2d_get_clear_color();
+                vita2d_start_drawing_advanced(overlay_texture, 0);
+                vita2d_set_clear_color(RGBA8(0, 0, 0, 0));
+                vita2d_clear_screen();
+                DrawStatsOverlay();
+                vita2d_end_drawing();
+                vita2d_set_clear_color(clear_color);
+            }
+        } else if (!stats_overlay_visible) {
+            // Solo las cifras y las notas de crash.txt: no pinta nada.
+            DrawStatsOverlay();
+        }
+        Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
+    }
     vita2d_start_drawing();
     vita2d_clear_screen();
     if (use_gxm) {
@@ -540,7 +575,11 @@ void EmuWindow_Vita::PresentScreens() {
         // 'dib' mezclaba lo que cuesta presentar el juego con lo que cuesta
         // medirlo.
         const unsigned long long overlay_begin = Common::VitaMicros();
-        DrawStatsOverlay();
+        if (overlay_from_texture) {
+            vita2d_draw_texture(overlay_texture, 0.0f, 0.0f);
+        } else if (stats_overlay_visible) {
+            DrawStatsOverlay();
+        }
         Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
     }
     vita2d_end_drawing();

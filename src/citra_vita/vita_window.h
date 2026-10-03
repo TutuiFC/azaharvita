@@ -115,6 +115,9 @@ private:
 
     vita2d_texture* top_texture = nullptr;
     vita2d_texture* bottom_texture = nullptr;
+    /// El overlay ya dibujado (0.1.9.6): se rehace cuando cambian las cifras
+    /// (una vez por segundo) y en cada fotograma se pinta con un solo quad.
+    vita2d_texture* overlay_texture = nullptr;
 
     /**
      * Presentacion con el chip grafico (sceGxm).
