@@ -375,8 +375,9 @@ struct UserSettings {
     bool gpu_thread = false;
     /// 0.2.0.3: sin esperar al refresco al presentar (VitaFrontend::g_unlimited_speed).
     bool unlimited_speed = false;
-    /// 0.2.0.3: resolucion de la GPU, 1 o 2 (RasterizerGXM::resolution_scale).
-    int gpu_scale = 1;
+    /// Resolucion de la GPU en mitades: 1 = 0.5x, 2 = 1x, 4 = 2x
+    /// (RasterizerGXM::resolution_scale).
+    int gpu_scale = 2;
 };
 UserSettings g_user;
 
@@ -446,7 +447,7 @@ void ApplyUserSettings() {
                                               std::memory_order_relaxed);
     VideoCore::GPU::async_enabled.store(g_user.gpu_thread, std::memory_order_relaxed);
     VitaFrontend::g_unlimited_speed.store(g_user.unlimited_speed, std::memory_order_relaxed);
-    Gxm::RasterizerGXM::resolution_scale.store(g_user.gpu_scale == 2 ? 2u : 1u,
+    Gxm::RasterizerGXM::resolution_scale.store(static_cast<u32>(g_user.gpu_scale),
                                                std::memory_order_relaxed);
 }
 
@@ -505,8 +506,9 @@ void LoadUserSettings() {
     read_bool("copia_gpu=", g_user.gpu_screen_copy);
     read_bool("gpu_hilo=", g_user.gpu_thread);
     read_bool("sin_limite=", g_user.unlimited_speed);
-    if (read_int("resolucion_gpu=", value)) {
-        g_user.gpu_scale = value == 2 ? 2 : 1;
+    // Clave nueva en 0.2.0.4, en mitades (la de 0.2.0.3 iba en enteros).
+    if (read_int("resolucion_gpu2=", value)) {
+        g_user.gpu_scale = value == 1 || value == 4 ? value : 2;
     }
 }
 
@@ -518,7 +520,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
         "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
-        "resolucion_gpu=%d\n",
+        "resolucion_gpu2=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -606,7 +608,7 @@ void DrawSettings(vita2d_pgf* font, int row) {
         g_user.gpu_screen_copy ? "ON" : "OFF",
         g_user.gpu_thread ? "ON" : "OFF",
         g_user.unlimited_speed ? "Sin limite" : "100% (refresco)",
-        g_user.gpu_scale == 2 ? "2x (experimental)" : "1x"};
+        g_user.gpu_scale == 4 ? "2x (experimental)" : g_user.gpu_scale == 1 ? "0.5x" : "1x"};
 
     for (int i = 0; i < kSettingsRows; i++) {
         const int y = kFirstY + i * kRowStep;
@@ -679,8 +681,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
         {"Sin limite: no espera al refresco de la pantalla; puede pasar del 100% de velocidad.",
          "Ganancia: menus y escenas ligeras van mas rapido que en la consola.",
          "Contra: el juego puede ir acelerado y el sonido estirado. Se aplica al momento."},
-        {"2x: la GPU de la Vita dibuja el doble de pixeles por eje (800x480 la de arriba).",
-         "Mejora la nitidez; cuesta GPU y memoria de video. Se aplica al arrancar el juego.",
+        {"0.5x: la GPU dibuja la mitad por eje (menos nitido). 2x: el doble (mas nitido).",
+         "0.5x alivia la GPU de la Vita; 2x cuesta GPU y memoria de video. Al arrancar el juego.",
          "Contra: experimental. Lo que vaya por software sigue a 1x. Si va lento o raro, 1x."},
     };
     vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
@@ -717,7 +719,7 @@ void RunSettingsMenu(vita2d_pgf* font) {
     g_user.gpu_thread = VideoCore::GPU::async_enabled.load(std::memory_order_relaxed);
     g_user.unlimited_speed = VitaFrontend::g_unlimited_speed.load(std::memory_order_relaxed);
     g_user.gpu_scale =
-        Gxm::RasterizerGXM::resolution_scale.load(std::memory_order_relaxed) == 2 ? 2 : 1;
+        static_cast<int>(Gxm::RasterizerGXM::resolution_scale.load(std::memory_order_relaxed));
 
     int row = 0;
     // Todo lo que ya este pulsado al entrar (el START que la abrio) cuenta como
@@ -798,7 +800,9 @@ void RunSettingsMenu(vita2d_pgf* font) {
                 g_user.unlimited_speed = !g_user.unlimited_speed;
                 break;
             default:
-                g_user.gpu_scale = g_user.gpu_scale == 2 ? 1 : 2;
+                // 0.5x -> 1x -> 2x con DERECHA, al reves con IZQUIERDA.
+                g_user.gpu_scale = step > 0 ? (g_user.gpu_scale == 1 ? 2 : g_user.gpu_scale == 2 ? 4 : 1)
+                                            : (g_user.gpu_scale == 4 ? 2 : g_user.gpu_scale == 2 ? 1 : 4);
                 break;
             }
             ApplyUserSettings();
@@ -874,6 +878,30 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
         vita2d_draw_rectangle(560, 430, 300.0f * std::min(settings_hold, 1.0f), 10, kColorAccent);
     }
 
+    vita2d_end_drawing();
+    vita2d_swap_buffers();
+}
+
+/// "Cargando shaders" con barra de progreso, antes de empezar el juego (0.2.0.4).
+void DrawShaderLoading(vita2d_pgf* font, u32 done, u32 total) {
+    vita2d_start_drawing();
+    vita2d_clear_screen();
+    vita2d_pgf_draw_text(font, 40, 200, kColorAccent, 1.3f, "Cargando shaders...");
+    constexpr float kBarX = 40.0f;
+    constexpr float kBarY = 240.0f;
+    constexpr float kBarWidth = 880.0f;
+    vita2d_draw_rectangle(kBarX, kBarY, kBarWidth, 18.0f, 0xFF404040);
+    if (total > 0) {
+        vita2d_draw_rectangle(kBarX, kBarY,
+                              kBarWidth * static_cast<float>(done) / static_cast<float>(total),
+                              18.0f, kColorAccent);
+        vita2d_pgf_draw_textf(font, 40, 300, kColorText, 1.0f, "%u / %u shaders", done, total);
+    } else {
+        vita2d_pgf_draw_text(font, 40, 300, kColorDim, 1.0f,
+                             "No hay shaders guardados de este juego todavia: se iran");
+        vita2d_pgf_draw_text(font, 40, 330, kColorDim, 1.0f,
+                             "guardando al jugar y la proxima vez cargaran aqui.");
+    }
     vita2d_end_drawing();
     vita2d_swap_buffers();
 }
@@ -1466,14 +1494,13 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
         // de este hilo.
         u64 program_id = 0;
         system.GetAppLoader().ReadProgramId(program_id);
-        Gxm::PreloadCgCache(program_id, [font](u32 done, u32 total) {
-            if (total == 0) {
-                return;
-            }
-            char line[64];
-            std::snprintf(line, sizeof(line), "Shaders guardados: %u / %u", done, total);
-            DrawMessage(font, "Cargando shaders...", line);
-        });
+        DrawShaderLoading(font, 0, 0);
+        const u32 loaded = Gxm::PreloadCgCache(
+            program_id, [font](u32 done, u32 total) { DrawShaderLoading(font, done, total); });
+        if (loaded == 0) {
+            // Primera partida de este juego: que se lea el aviso.
+            sceKernelDelayThread(800 * 1000);
+        }
     }
     WriteCrashLog("carga", "System::Load OK, entrando al bucle de emulacion");
     system.RegisterCoreLoopThreadId();
