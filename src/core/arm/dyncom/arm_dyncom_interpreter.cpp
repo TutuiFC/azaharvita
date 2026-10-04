@@ -4066,12 +4066,18 @@ SWI_INST: {
 #ifdef __PSVITA__
         // El tiempo DENTRO de la llamada al sistema (servicios, y con ellos
         // toda la GPU emulada) se mide aparte para restarlo del tiempo del
-        // bucle del ARM: lo que queda es el ARM de verdad.
-        const unsigned long long svc_begin = Common::VitaMicros();
+        // bucle del ARM: lo que queda es el ARM de verdad. Una de cada ocho
+        // (0.2.1.0): son cientos por fotograma y leer el reloj es una llamada
+        // al kernel.
+        static unsigned int svc_tick = 0;
+        const bool svc_timed = (++svc_tick & 7u) == 0;
+        const unsigned long long svc_begin = svc_timed ? Common::VitaMicros() : 0;
 #endif
         Kernel::SVCContext{cpu->system}.CallSVC(inst_cream->num & 0xFFFF);
 #ifdef __PSVITA__
-        Core::ArmJit::AddSvcTime(Common::VitaMicros() - svc_begin);
+        if (svc_timed) {
+            Core::ArmJit::AddSvcTime((Common::VitaMicros() - svc_begin) * 8);
+        }
 #endif
         // The kernel would call ERET to get here, which clears exclusive memory state.
         cpu->UnsetExclusiveMemoryAddress();

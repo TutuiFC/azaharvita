@@ -1972,6 +1972,20 @@ int main(int argc, char** argv) {
         *result.out = 0;
         WriteCrashLog("relojes", buffer);
     }
+    {
+        // Lo que cuesta leer el reloj (0.2.1.0): los desgloses lo leen miles de
+        // veces por fotograma, y en la Vita es una llamada al kernel.
+        const unsigned long long begin = Common::VitaMicros();
+        for (int i = 0; i < 1000; i++) {
+            (void)Common::VitaMicros();
+        }
+        const unsigned long long elapsed = Common::VitaMicros() - begin;
+        char buffer[64];
+        const auto result =
+            fmt::format_to_n(buffer, sizeof(buffer) - 1, "1000 lecturas en {} us", elapsed);
+        *result.out = 0;
+        WriteCrashLog("reloj", buffer);
+    }
 
     // El presupuesto de memoria, anotado ANTES de reservar nada.
     //

@@ -1238,10 +1238,20 @@ void PicaCore::LoadVertices(bool is_indexed) {
     ASSERT(!geometry_pipeline.NeedIndexInput() || is_indexed);
 
 #ifdef __PSVITA__
-    // El bucle entero, una sola lectura de reloj por llamada de dibujado. Ver
-    // Common::FrameStats::vertices_us: hace falta para separar dentro de
-    // "cmdlist" lo que es shader de vertices de lo que es nuestro camino de GPU.
-    const unsigned long long vertices_begin = Common::VitaMicros();
+    // El bucle entero. Ver Common::FrameStats::vertices_us: hace falta para
+    // separar dentro de "cmdlist" lo que es shader de vertices de lo que es
+    // nuestro camino de GPU. Una llamada de dibujado de cada ocho, por ocho
+    // (0.2.1.0): en 3D son cientos por fotograma y leer el reloj es una llamada
+    // al kernel.
+    static u32 vertices_tick = 0;
+    const bool vertices_timed = (++vertices_tick & 7u) == 0;
+    const unsigned long long vertices_begin = vertices_timed ? Common::VitaMicros() : 0;
+    const auto add_vertices_time = [vertices_timed, vertices_begin] {
+        if (vertices_timed) {
+            Common::FrameStats::vertices_us.fetch_add((Common::VitaMicros() - vertices_begin) * 8,
+                                                      std::memory_order_relaxed);
+        }
+    };
 
     /**
      * Sin shader de geometria y sin depurador, el sombreado va repartido entre
@@ -1254,7 +1264,7 @@ void PicaCore::LoadVertices(bool is_indexed) {
     if (!debug_context && pipeline.use_gs == PipelineRegs::UseGS::No) {
         ShadeVerticesParallel(loader, base_address, is_indexed, index_address_8, index_address_16,
                               index_u16);
-        Common::FrameStats::Add(Common::FrameStats::vertices_us, vertices_begin);
+        add_vertices_time();
         return;
     }
 #endif
@@ -1353,7 +1363,7 @@ void PicaCore::LoadVertices(bool is_indexed) {
         geometry_pipeline.SubmitVertex(*submit);
     }
 #ifdef __PSVITA__
-    Common::FrameStats::Add(Common::FrameStats::vertices_us, vertices_begin);
+    add_vertices_time();
 #endif
 }
 
