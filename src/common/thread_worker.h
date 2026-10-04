@@ -69,6 +69,8 @@ public:
             if (pin_to_cores) {
                 Common::VitaPinThreadToUserCore(
                     static_cast<unsigned int>(index) + core_offset, thread_name.data());
+                // Por encima del compilador de shaders: ver kVitaPriorityHelper.
+                Common::VitaSetThreadPriority(Common::kVitaPriorityHelper, thread_name.data());
             }
 #else
             (void)pin_to_cores;

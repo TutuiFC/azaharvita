@@ -343,7 +343,9 @@ public:
                 return;
             }
 
-            auto& renderer = system.GPU().Renderer();
+            auto& gpu = system.GPU();
+            gpu.Sync();
+            auto& renderer = gpu.Renderer();
             VAddr overlap_start = std::max(start, region_start);
             VAddr overlap_end = std::min(end, region_end);
             PAddr physical_start = paddr_region_start + (overlap_start - region_start);
@@ -986,6 +988,31 @@ u8* MemorySystem::GetPhysicalPointer(PAddr address) {
 
     u32 offset_into_region = address - target_mem.region_start;
     return target_mem.backing_mem->get()->GetPtr() + offset_into_region;
+}
+
+u8* MemorySystem::GetPhysicalPointerThreadSafe(PAddr address) const {
+    // Las mismas cuatro regiones y la misma comparacion (fin inclusivo) que
+    // GetPhysMemRegionInfo, pero en variables locales: nada compartido que
+    // pueda pisar otro hilo.
+    const std::shared_ptr<BackingMem>* backing = nullptr;
+    PAddr region_start = 0;
+    if (address >= VRAM_PADDR && address <= VRAM_PADDR + VRAM_SIZE) {
+        backing = &impl->vram_mem;
+        region_start = VRAM_PADDR;
+    } else if (address >= DSP_RAM_PADDR && address <= DSP_RAM_PADDR + DSP_RAM_SIZE) {
+        backing = &impl->dsp_mem;
+        region_start = DSP_RAM_PADDR;
+    } else if (address >= FCRAM_PADDR && address <= FCRAM_PADDR + FCRAM_N3DS_SIZE) {
+        backing = &impl->fcram_mem;
+        region_start = FCRAM_PADDR;
+    } else if (address >= N3DS_EXTRA_RAM_PADDR &&
+               address <= N3DS_EXTRA_RAM_PADDR + N3DS_EXTRA_RAM_SIZE) {
+        backing = &impl->n3ds_extra_ram_mem;
+        region_start = N3DS_EXTRA_RAM_PADDR;
+    } else {
+        return nullptr;
+    }
+    return backing->get()->GetPtr() + (address - region_start);
 }
 
 MemoryRef MemorySystem::GetPhysicalRef(PAddr address) {

@@ -9,10 +9,8 @@
 #ifdef AZAHAR_VITA_NATIVE_IO
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
-#include "common/vita_diag.h"
 #endif
 #include <array>
-#include <atomic>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -146,26 +144,6 @@ typedef struct stat file_stat_t;
 namespace FileUtil {
 
 using Common::GetLastErrorMsg;
-
-#ifdef AZAHAR_VITA_NATIVE_IO
-namespace {
-/**
- * Deja constancia en crash.txt de un fallo de E/S del camino nativo.
- *
- * Los fallos de fichero son silenciosos de otra forma (el registro de la
- * consola no escribe a disco), y un fallo de apertura o de redimensionado se
- * manifiesta como un error del propio juego, sin pista de donde viene. Con
- * presupuesto: un fallo en bucle no debe inundar la tarjeta.
- */
-void NoteVitaIOFailure(const char* what, const char* path) {
-    static std::atomic<int> budget{16};
-    if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
-        return;
-    }
-    Common::VitaNote(what, path != nullptr ? path : "?");
-}
-} // Anonymous namespace
-#endif
 
 // Remove any ending forward slashes from directory paths
 // Modifies argument.
@@ -308,6 +286,87 @@ bool Delete(const std::string& filepath) {
 }
 
 bool CreateDir(const std::string& path) {
+#ifdef AZAHAR_VITA_NATIVE_IO
+    /**
+     * Camino nativo: sceIoMkdir directo, sin pasar por la libc.
+     *
+     * Dos motivos, y los dos vienen de haber perseguido esto a ciegas.
+     *
+     * 1. LA BARRA FINAL. CreateFullPath construye la ruta nivel a nivel y a
+     *    cada trozo le deja la barra ("substr(0, position + 1)"), asi que llega
+     *    algo como ".../data/00000001/". sceIoMkdir la rechaza. Aqui se quita
+     *    siempre antes de llamar, en vez de llamar, fallar y reintentar.
+     *
+     * 2. EL CODIGO DE ERROR DE VERDAD. Pasando por la libc, el error de Sony se
+     *    aplasta a un errno generico: todo lo que no sea "ya existe" acaba como
+     *    EINVAL ("Invalid argument"), que no dice nada. El codigo crudo si
+     *    distingue entre ruta demasiado larga, dispositivo no montado, sin
+     *    permiso o ruta mal formada, y desde la consola es lo unico que se ve.
+     *
+     * Por que importa tanto una carpeta: si no se puede crear la del GUARDADO,
+     * el juego no puede abrir su archivo de guardado y se queda a medio cargar
+     * o se rinde con la pantalla de error del 3DS. Es el fallo por el que no
+     * arrancaban varios juegos.
+     */
+    {
+        std::string dir = path;
+        while (dir.size() > 1 && dir.back() == '/' && dir[dir.size() - 2] != ':') {
+            dir.pop_back();
+        }
+
+        const int rc = sceIoMkdir(dir.c_str(), 0777);
+
+        /**
+         * RASTRO DE TODOS LOS NIVELES, con presupuesto.
+         *
+         * Hasta ahora solo se registraba el nivel que fallaba, y eso resulto
+         * enganoso: si un nivel de MAS ARRIBA fallaba y quedaba tapado (ver
+         * abajo), el primer error visible era el de mas abajo, que solo es la
+         * consecuencia. Con el rastro completo se ve de un vistazo donde se
+         * rompe la cadena de verdad.
+         *
+         * El presupuesto existe porque VitaNote y el registro escriben en la
+         * tarjeta: unas pocas decenas de lineas bastan para ver la cadena de
+         * carpetas de un juego, y a partir de ahi solo estorbarian.
+         */
+        static int trace_budget = 60;
+        if (trace_budget > 0) {
+            trace_budget--;
+            LOG_INFO(Common_Filesystem, "mkdir {} -> {:#010x}", dir,
+                     static_cast<unsigned int>(rc));
+        }
+
+        if (rc >= 0) {
+            return true;
+        }
+        // 0x80010011 es EEXIST en los errores de Sony; ya existir no es fallo.
+        if (static_cast<unsigned int>(rc) == 0x80010011u) {
+            return true;
+        }
+
+        /**
+         * LA COMPROBACION DE "PERO SI YA EXISTE" VA POR sceIoGetstat, NO POR
+         * IsDirectory.
+         *
+         * IsDirectory usa el stat de esta libc, que es el mismo camino de 32
+         * bits que no sabe de ficheros grandes y del que ya no nos fiamos. Si
+         * contestara que si sobre una carpeta que NO existe, este metodo
+         * devolveria exito en silencio, el nivel se daria por creado y el
+         * siguiente fallaria sin que nada dijera cual falto de verdad. Que es
+         * exactamente el sintoma que se estaba persiguiendo.
+         *
+         * sceIoGetstat es la version nativa y trae el bit de directorio.
+         */
+        SceIoStat st{};
+        if (sceIoGetstat(dir.c_str(), &st) >= 0 && SCE_S_ISDIR(st.st_mode)) {
+            return true;
+        }
+
+        LOG_ERROR(Common_Filesystem, "sceIoMkdir fallo en {} (largo {}): {:#010x}", dir,
+                  dir.size(), static_cast<unsigned int>(rc));
+        return false;
+    }
+#endif
     LOG_TRACE(Common_Filesystem, "directory {}", path);
 #ifdef _WIN32
     if (::CreateDirectoryW(Common::UTF8ToUTF16W(path).c_str(), nullptr))
@@ -364,6 +423,42 @@ bool CreateDir(const std::string& path) {
         return true;
     }
 
+#ifdef __PSVITA__
+    /**
+     * SEGUNDO INTENTO SIN LA BARRA FINAL.
+     *
+     * CreateFullPath crea la ruta nivel a nivel y a cada trozo le deja la barra
+     * del final ("substr(0, position + 1)"), asi que a mkdir le llega siempre
+     * algo como ".../data/00000001/". En un sistema de ficheros normal eso da
+     * igual; sceIoMkdir, que es lo que hay debajo aqui, la rechaza con EINVAL.
+     *
+     * Y no es un detalle: la ruta que fallaba es la del GUARDADO del juego
+     * (ux0:/data/azahar/sdmc/Nintendo 3DS/.../title/00040000/0007af00/data/
+     * 00000001/). Sin ella, OpenArchive del archivo de guardado falla y el
+     * juego se rinde con la pantalla de "An error has occurred" del 3DS. Es
+     * decir: el juego no arrancaba por una barra.
+     *
+     * No se toca la ruta antes de llamar por primera vez a proposito. Si
+     * algun dia sceIoMkdir aceptara la barra, el primer intento acierta y esto
+     * no se ejecuta; y si falla por otra cosa, el registro de abajo dice por
+     * cual con el codigo crudo, que es lo unico que se ve desde la consola.
+     */
+    if (path.size() > 1 && path.back() == '/' && path[path.size() - 2] != ':') {
+        const std::string trimmed = path.substr(0, path.size() - 1);
+        if (mkdir(trimmed.c_str(), 0755) == 0) {
+            return true;
+        }
+        const int trimmed_err = errno;
+        if (trimmed_err == EEXIST) {
+            return true;
+        }
+        LOG_ERROR(Common_Filesystem,
+                  "mkdir fallo en {} (largo {}): con barra {} ({}), sin barra {} ({})", path,
+                  path.size(), strerror(err), err, strerror(trimmed_err), trimmed_err);
+        return false;
+    }
+#endif
+
     LOG_ERROR(Common_Filesystem, "mkdir failed on {}: {}", path, strerror(err));
     return false;
 #endif
@@ -377,6 +472,45 @@ bool CreateFullPath(const std::string& fullPath) {
         LOG_DEBUG(Common_Filesystem, "path exists {}", fullPath);
         return true;
     }
+
+#ifdef AZAHAR_VITA_NATIVE_IO
+    /**
+     * En Vita se crean TODOS los niveles, sin preguntar antes si existen.
+     *
+     * La version de abajo se salta un nivel cuando IsDirectory dice que ya
+     * esta, y IsDirectory va por el stat de la libc, que en esta consola no es
+     * de fiar (su st_size es de 32 bits y es el mismo camino que no sabe de
+     * ficheros grandes). Si contesta que si sobre una carpeta que NO existe, el
+     * nivel se salta y el siguiente falla con EINVAL -- crear algo dentro de un
+     * padre inexistente -- sin decir cual era el nivel que faltaba de verdad.
+     *
+     * sceIoMkdir ya distingue "ya existe" (0x80010011) de un error real y
+     * CreateDir lo trata como exito, asi que preguntar antes no aporta nada:
+     * sale mas barato intentarlo siempre. Y si falla, el registro dice el
+     * nivel EXACTO y con el codigo crudo de Sony, que es lo unico que se ve
+     * desde la consola.
+     */
+    {
+        std::size_t vita_pos = 0;
+        while (true) {
+            vita_pos = fullPath.find(DIR_SEP_CHR, vita_pos);
+            if (vita_pos == fullPath.npos) {
+                return true;
+            }
+            const std::string level = fullPath.substr(0, vita_pos + 1);
+            // "ux0:/" y demas raices de dispositivo no se crean: existen o no,
+            // pero mkdir sobre ellas no tiene sentido.
+            if (level.size() > 1 && level[level.size() - 2] != ':') {
+                if (!FileUtil::CreateDir(level)) {
+                    LOG_ERROR(Common, "CreateFullPath: fallo creando el nivel {} de {}", level,
+                              fullPath);
+                    return false;
+                }
+            }
+            vita_pos++;
+        }
+    }
+#endif
 
     std::size_t position = 0;
     while (true) {
@@ -1315,12 +1449,21 @@ void IOFile::Swap(IOFile& other) noexcept {
     std::swap(m_file, other.m_file);
     std::swap(m_fd, other.m_fd);
 #ifdef AZAHAR_VITA_NATIVE_IO
+    /**
+     * EL DESCRIPTOR NATIVO TAMBIEN, Y SIN ESTO NO ABRE NINGUNA ROM.
+     *
+     * Swap es lo que usan el constructor y la asignacion POR MOVIMIENTO, y un
+     * IOFile se mueve constantemente: se devuelve por valor, se guarda en
+     * contenedores, se pasa de una capa a otra. Al no intercambiar m_vita_fd,
+     * el destino se quedaba con -1 -- o sea IsOpen() falso, "fichero cerrado"
+     * -- mientras el origen conservaba el descriptor bueno y lo cerraba al
+     * destruirse. El fichero se perdia en el primer movimiento.
+     *
+     * No salto a la vista al escribir el camino nativo porque el resto de
+     * metodos si miran m_vita_fd; este es el unico sitio que toca el campo sin
+     * nombrarlo, y estuvo compilado fuera hasta que se activo la macro.
+     */
     std::swap(m_vita_fd, other.m_vita_fd);
-    std::swap(m_vita_read_buffer, other.m_vita_read_buffer);
-    std::swap(m_vita_pos, other.m_vita_pos);
-    std::swap(m_vita_buf_start, other.m_vita_buf_start);
-    std::swap(m_vita_buf_len, other.m_vita_buf_len);
-    std::swap(m_vita_buf_pos, other.m_vita_buf_pos);
 #endif
     std::swap(m_good, other.m_good);
     std::swap(filename, other.filename);
@@ -1346,19 +1489,6 @@ int VitaOpenFlags(const std::string& openmode) {
     }
     return update ? SCE_O_RDWR : SCE_O_RDONLY;
 }
-
-/**
- * A partir de que tamano un fichero tiene que ir por sceIo.
- *
- * Por debajo, stdio sirve y ademas trae buffer de lectura, que es lo que
- * mantiene el rendimiento del romfs (miles de lecturas pequenas y aleatorias
- * por segundo). Por encima del maximo de un 'long' de 32 bits (2 GB - 1)stdio
- * no puede ni posicionarse: ahi entra sceIo, que usa SceOff de 64 bits.
- *
- * Se deja margen por debajo de 0x7FFFFFFF para que ningun calculo intermedio
- * con signo se acerque al limite.
- */
-constexpr u64 kNativeIoThreshold = 0x7F000000ULL;
 } // Anonymous namespace
 #endif
 
@@ -1366,30 +1496,30 @@ bool IOFile::Open() {
     Close();
 
 #ifdef AZAHAR_VITA_NATIVE_IO
-    // Solo los ficheros que no caben en el off_t de 32 bits de esta libc van
-    // por sceIo. Poner TODO por sceIo (aunque sea correcto) hundia los juegos
-    // de 2 fps a 0.3: stdio lee con buffer y sceIo paga una llamada al kernel
-    // por cada lectura pequena del romfs. Ver kNativeIoThreshold.
-    {
-        SceIoStat st{};
-        const bool exists = sceIoGetstat(filename.c_str(), &st) >= 0;
-        if (exists && static_cast<u64>(st.st_size) > kNativeIoThreshold) {
-            m_vita_fd = sceIoOpen(filename.c_str(), VitaOpenFlags(openmode), 0666);
-            m_good = m_vita_fd >= 0;
-            if (!m_good) {
-                LOG_ERROR(Common_Filesystem, "sceIoOpen fallo en {} (modo {}): {:#x}", filename,
-                          openmode, static_cast<unsigned int>(m_vita_fd));
-                NoteVitaIOFailure("io open", filename.c_str());
-                return m_good;
-            }
-            m_vita_read_buffer.reset();
-            m_vita_pos = 0;
-            m_vita_buf_start = 0;
-            m_vita_buf_len = 0;
-            m_vita_buf_pos = 0;
-            return true;
+    // Camino nativo: stdio no puede con ficheros de mas de 2 GB en esta libc.
+    // Ver el comentario de m_vita_fd en file_util.h.
+    m_vita_fd = sceIoOpen(filename.c_str(), VitaOpenFlags(openmode), 0666);
+    m_good = m_vita_fd >= 0;
+    if (!m_good) {
+        /**
+         * "No existe" NO es un error que merezca una linea de registro.
+         *
+         * El emulador tantea ficheros que casi nunca estan (mods, parches,
+         * guardados todavia sin crear) y espera que no esten: abrir y fallar es
+         * parte del funcionamiento normal. Registrarlo como error llenaba el
+         * log -- de 9 KB paso a 87 KB en una sola partida -- y escribir cuesta
+         * tiempo en el hilo que emula la CPU. Los demas codigos si se anotan,
+         * porque esos si son algo que va mal.
+         */
+        constexpr unsigned int kSceErrnoEnoent = 0x80010002u;
+        if (static_cast<unsigned int>(m_vita_fd) == kSceErrnoEnoent) {
+            LOG_DEBUG(Common_Filesystem, "sceIoOpen: no existe {}", filename);
+        } else {
+            LOG_ERROR(Common_Filesystem, "sceIoOpen fallo en {} (modo {}): {:#010x}", filename,
+                      openmode, static_cast<unsigned int>(m_vita_fd));
         }
     }
+    return m_good;
 #endif
 
     // Any filename with the format fd://<file_descriptor> represents a file that
@@ -1521,13 +1651,8 @@ bool IOFile::Close() {
             m_good = false;
         }
         m_vita_fd = -1;
-        m_vita_read_buffer.reset();
-        m_vita_pos = 0;
-        m_vita_buf_start = 0;
-        m_vita_buf_len = 0;
-        m_vita_buf_pos = 0;
-        return m_good;
     }
+    return m_good;
 #endif
     if (!IsOpen() || 0 != FCLOSE(m_file))
         m_good = false;
@@ -1538,87 +1663,71 @@ bool IOFile::Close() {
 
 u64 IOFile::GetSize() const {
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        // Ir al final y volver. sceIoLseek devuelve SceOff (64 bits), asi que
-        // un fichero de mas de 2 GB sale entero en vez de truncado.
-        const SceOff current = sceIoLseek(m_vita_fd, 0, SCE_SEEK_CUR);
-        const SceOff end = sceIoLseek(m_vita_fd, 0, SCE_SEEK_END);
-        sceIoLseek(m_vita_fd, current, SCE_SEEK_SET);
-        return end > 0 ? static_cast<u64>(end) : 0;
+    if (m_vita_fd < 0) {
+        return 0;
     }
-#endif
+    // Ir al final y volver. sceIoLseek devuelve SceOff (64 bits), asi que un
+    // fichero de 4 GB sale entero en vez de truncado a cero.
+    const SceOff current = sceIoLseek(m_vita_fd, 0, SCE_SEEK_CUR);
+    const SceOff end = sceIoLseek(m_vita_fd, 0, SCE_SEEK_END);
+    sceIoLseek(m_vita_fd, current, SCE_SEEK_SET);
+    return end > 0 ? static_cast<u64>(end) : 0;
+#else
     if (IsOpen())
         return FileUtil::GetSize(m_file);
 
     return 0;
+#endif
 }
 
 bool IOFile::Seek(s64 off, int origin) {
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        // La posicion es logica: el descriptor se coloca de verdad al leer o
-        // escribir. Asi los Seek dentro del buffer no cuestan una llamada al
-        // kernel y el buffer sigue siendo valido.
-        s64 target;
-        switch (origin) {
-        case SEEK_SET:
-            target = off;
-            break;
-        case SEEK_CUR:
-            target = static_cast<s64>(m_vita_pos) + off;
-            break;
-        case SEEK_END:
-            target = static_cast<s64>(GetSize()) + off;
-            break;
-        default:
-            m_good = false;
-            return false;
-        }
-        if (target < 0) {
-            m_good = false;
-            return false;
-        }
-        const u64 pos = static_cast<u64>(target);
-        if (m_vita_buf_len > 0 && pos >= m_vita_buf_start &&
-            pos <= m_vita_buf_start + m_vita_buf_len) {
-            m_vita_buf_pos = static_cast<std::size_t>(pos - m_vita_buf_start);
-        } else {
-            m_vita_buf_len = 0;
-            m_vita_buf_pos = 0;
-        }
-        m_vita_pos = pos;
-        return true;
+    if (m_vita_fd < 0) {
+        m_good = false;
+        return m_good;
     }
-#endif
+    // Los SEEK_* de stdio coinciden en valor con los SCE_SEEK_*, pero se
+    // traducen a mano para no depender de esa coincidencia.
+    const int whence = (origin == SEEK_SET)   ? SCE_SEEK_SET
+                       : (origin == SEEK_CUR) ? SCE_SEEK_CUR
+                                              : SCE_SEEK_END;
+    if (sceIoLseek(m_vita_fd, off, whence) < 0) {
+        m_good = false;
+    }
+    return m_good;
+#else
     if (!IsOpen() || 0 != FSEEK(m_file, off, origin))
         m_good = false;
 
     return m_good;
+#endif
 }
 
 u64 IOFile::Tell() const {
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        return m_vita_pos;
+    if (m_vita_fd < 0) {
+        return std::numeric_limits<u64>::max();
     }
-#endif
+    const SceOff pos = sceIoLseek(m_vita_fd, 0, SCE_SEEK_CUR);
+    return pos >= 0 ? static_cast<u64>(pos) : std::numeric_limits<u64>::max();
+#else
     if (IsOpen())
         return FTELL(m_file);
 
     return std::numeric_limits<u64>::max();
+#endif
 }
 
 bool IOFile::Flush() {
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        // sceIo escribe sin buffer intermedio, asi que no hay nada que vaciar.
-        return m_good;
-    }
-#endif
+    // sceIo escribe sin buffer intermedio, asi que no hay nada que vaciar.
+    return m_good;
+#else
     if (!IsOpen() || 0 != FFLUSH(m_file))
         m_good = false;
 
     return m_good;
+#endif
 }
 
 std::size_t IOFile::ReadImpl(void* data, std::size_t length, std::size_t elem_size) {
@@ -1634,44 +1743,14 @@ std::size_t IOFile::ReadImpl(void* data, std::size_t length, std::size_t elem_si
     DEBUG_ASSERT(data != nullptr);
 
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        // Lectura con buffer propio: sceIo no tiene, y sin esto una ROM grande
-        // se carga a base de llamadas al kernel y tarda minutos.
-        if (m_vita_read_buffer == nullptr) {
-            m_vita_read_buffer = std::make_unique_for_overwrite<u8[]>(kNativeReadBufferSize);
+    {
+        const SceSSize got =
+            sceIoRead(m_vita_fd, data, static_cast<SceSize>(length * elem_size));
+        if (got < 0) {
+            m_good = false;
+            return 0;
         }
-        const std::size_t total = length * elem_size;
-        auto* const out = static_cast<u8*>(data);
-        std::size_t done = 0;
-        while (done < total) {
-            if (m_vita_buf_pos >= m_vita_buf_len) {
-                if (sceIoLseek(m_vita_fd, static_cast<SceOff>(m_vita_pos), SCE_SEEK_SET) < 0) {
-                    m_good = false;
-                    NoteVitaIOFailure("io read seek", filename.c_str());
-                    break;
-                }
-                const SceSSize got = sceIoRead(m_vita_fd, m_vita_read_buffer.get(),
-                                               static_cast<SceSize>(kNativeReadBufferSize));
-                if (got < 0) {
-                    m_good = false;
-                    NoteVitaIOFailure("io read", filename.c_str());
-                    break;
-                }
-                if (got == 0) {
-                    break; // EOF
-                }
-                m_vita_buf_start = m_vita_pos;
-                m_vita_buf_len = static_cast<std::size_t>(got);
-                m_vita_buf_pos = 0;
-            }
-            const std::size_t available = m_vita_buf_len - m_vita_buf_pos;
-            const std::size_t take = std::min(available, total - done);
-            std::memcpy(out + done, m_vita_read_buffer.get() + m_vita_buf_pos, take);
-            m_vita_buf_pos += take;
-            m_vita_pos += take;
-            done += take;
-        }
-        return done / elem_size;
+        return static_cast<std::size_t>(got) / elem_size;
     }
 #endif
 
@@ -1723,21 +1802,28 @@ std::size_t IOFile::ReadAtImpl(void* data, std::size_t byte_count, std::size_t o
     DEBUG_ASSERT(data != nullptr);
 
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        // No hay pread en sceIo: se busca, se lee y se sigue. El buffer de
-        // lectura no se toca porque esto no cambia el contenido del fichero, y
-        // la posicion logica tampoco: cada Read/Write coloca el descriptor
-        // antes de usarlo.
-        std::scoped_lock lock(m_file_pos_mutex);
-        if (sceIoLseek(m_vita_fd, static_cast<SceOff>(offset), SCE_SEEK_SET) < 0) {
-            m_good = false;
-            NoteVitaIOFailure("io read at seek", filename.c_str());
-            return 0;
-        }
-        const SceSSize got = sceIoRead(m_vita_fd, data, static_cast<SceSize>(byte_count));
+    {
+        /**
+         * sceIoPread: UNA llamada, sin mover la posicion y sin candado.
+         *
+         * Aqui habia guardar la posicion, saltar, leer y volver a saltar, todo
+         * bajo un mutex, porque el comentario daba por hecho que sceIo no tenia
+         * pread. SI LO TIENE: sceIoPread esta declarado en psp2/io/fcntl.h y
+         * exportado en libSceIofilemgr_stub.a, y ademas toma el desplazamiento
+         * como SceOff de 64 bits, que es justo lo que hacia falta.
+         *
+         * Importa mucho mas de lo que parece: este es el camino por el que se
+         * lee el RomFS, o sea CASI TODO lo que un juego carga. Pasar de cuatro
+         * llamadas al sistema y un candado a una sola llamada cambia el coste
+         * de cargar un juego grande, que es justo donde se notaba que no
+         * terminaba nunca. Y al no tocar la posicion del fichero, dos hilos
+         * pueden leer a la vez sin estorbarse.
+         */
+        const SceSSize got =
+            sceIoPread(m_vita_fd, data, static_cast<SceSize>(byte_count),
+                       static_cast<SceOff>(offset));
         if (got < 0) {
             m_good = false;
-            NoteVitaIOFailure("io read at", filename.c_str());
             return 0;
         }
         return static_cast<std::size_t>(got);
@@ -1775,24 +1861,13 @@ std::size_t IOFile::WriteImpl(const void* data, std::size_t length, std::size_t 
     DEBUG_ASSERT(data != nullptr);
 
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        // Escribir invalida el buffer de lectura (el fichero cambia bajo el) y
-        // necesita el descriptor en la posicion logica.
-        m_vita_buf_len = 0;
-        m_vita_buf_pos = 0;
-        if (sceIoLseek(m_vita_fd, static_cast<SceOff>(m_vita_pos), SCE_SEEK_SET) < 0) {
-            m_good = false;
-            NoteVitaIOFailure("io write seek", filename.c_str());
-            return 0;
-        }
+    {
         const SceSSize put =
             sceIoWrite(m_vita_fd, data, static_cast<SceSize>(length * elem_size));
         if (put < 0) {
             m_good = false;
-            NoteVitaIOFailure("io write", filename.c_str());
             return 0;
         }
-        m_vita_pos += static_cast<std::size_t>(put);
         return static_cast<std::size_t>(put) / elem_size;
     }
 #endif
@@ -1851,10 +1926,10 @@ size_t IOFileBase::WriteLine(const std::string_view line) {
 
 inline bool IOFile::IsOpen() const {
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0)
-        return true;
-#endif
+    return m_vita_fd >= 0;
+#else
     return nullptr != m_file;
+#endif
 }
 
 inline bool IOFile::IsGood() const {
@@ -1864,14 +1939,12 @@ inline bool IOFile::IsGood() const {
 inline void IOFile::Clear() {
     m_good = true;
 
-#ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        // sceIo no tiene buffer de stdio que limpiar; ademas m_file es nulo en
-        // este camino y clearerr(nullptr) seria una desreferencia invalida.
-        return;
-    }
-#endif
-#ifdef HAVE_LIBRETRO_VFS
+#if defined(AZAHAR_VITA_NATIVE_IO)
+    // En el camino nativo no hay FILE*: m_file es SIEMPRE nulo, y
+    // std::clearerr(nullptr) no es "no hacer nada", es desreferenciar un puntero
+    // nulo. sceIo no guarda banderas de error por descriptor, asi que poner
+    // m_good a true de arriba es todo lo que hay que limpiar.
+#elif defined(HAVE_LIBRETRO_VFS)
     filestream_rewind(m_file);
 #else
     std::clearerr(m_file);
@@ -1911,58 +1984,11 @@ int IOFile::GetFd() const {
 
 bool IOFile::Resize(u64 size) {
 #ifdef AZAHAR_VITA_NATIVE_IO
-    if (m_vita_fd >= 0) {
-        // sceIo no expone truncate, pero se puede resolver sin perder nada:
-        //  - encoger: ftruncate de newlib sobre un fd de stdio (existe en libc.a).
-        //  - agrandar: escribir un byte en la ultima posicion, el mismo truco que
-        //    usan los archive para crear ficheros; no depende de que FatFs sepa
-        //    extender con ftruncate.
-        // La posicion del descriptor no debe cambiar para el llamante, que puede
-        // seguir leyendo o escribiendo donde estaba. El buffer se invalida: el
-        // contenido ha cambiado.
-        m_vita_buf_len = 0;
-        m_vita_buf_pos = 0;
-        const SceOff current = sceIoLseek(m_vita_fd, 0, SCE_SEEK_END);
-        if (current < 0) {
-            m_good = false;
-            NoteVitaIOFailure("io resize seek", filename.c_str());
-            return false;
-        }
-        sceIoLseek(m_vita_fd, static_cast<SceOff>(m_vita_pos), SCE_SEEK_SET);
-
-        if (static_cast<u64>(current) != size) {
-            if (static_cast<u64>(current) > size) {
-                std::FILE* raw = std::fopen(filename.c_str(), "r+b");
-                if (raw == nullptr) {
-                    m_good = false;
-                    NoteVitaIOFailure("io resize fopen", filename.c_str());
-                    return false;
-                }
-                const int rc = ftruncate(fileno(raw), static_cast<off_t>(size));
-                std::fclose(raw);
-                if (rc != 0) {
-                    m_good = false;
-                    NoteVitaIOFailure("io resize trunc", filename.c_str());
-                    return false;
-                }
-            } else {
-                if (sceIoLseek(m_vita_fd, static_cast<SceOff>(size) - 1, SCE_SEEK_SET) < 0) {
-                    m_good = false;
-                    NoteVitaIOFailure("io resize grow seek", filename.c_str());
-                    return false;
-                }
-                const char zero = 0;
-                if (sceIoWrite(m_vita_fd, &zero, 1) != 1) {
-                    m_good = false;
-                    NoteVitaIOFailure("io resize grow write", filename.c_str());
-                    return false;
-                }
-            }
-        }
-
-        sceIoLseek(m_vita_fd, static_cast<SceOff>(m_vita_pos), SCE_SEEK_SET);
-        return true;
-    }
+    // Sin equivalente directo en sceIo. Solo lo usan rutas de escritura de
+    // guardado, que en la Vita no se ejercitan todavia; se deja avisado en vez
+    // de fingir que ha funcionado.
+    LOG_WARNING(Common_Filesystem, "Resize({}) no implementado en Vita", size);
+    return false;
 #endif
     if (!IsOpen() || 0 !=
 #if defined(HAVE_LIBRETRO_VFS)
@@ -1988,25 +2014,12 @@ template <>
 void OpenFStream<std::ios_base::in>(
     boost_iostreams<boost::iostreams::file_descriptor_source>& fstream,
     const std::string& filename) {
-#ifdef AZAHAR_VITA_NATIVE_IO
-    // En el camino nativo IOFile no expone un descriptor POSIX (sceIo no es un
-    // fd). Estos ficheros (llaves, cheats) son pequenos, asi que se abre con
-    // stdio solo para obtener un descriptor duplicable.
-    std::FILE* raw = std::fopen(filename.c_str(), "rb");
-    if (raw == nullptr)
-        return;
-    const int fd = dup(fileno(raw));
-    std::fclose(raw);
-    if (fd == -1)
-        return;
-#else
     IOFile file(filename, "r");
     if (file.GetFd() == -1)
         return;
     int fd = dup(file.GetFd());
     if (fd == -1)
         return;
-#endif
     boost::iostreams::file_descriptor_source file_descriptor_source(fd,
                                                                     boost::iostreams::close_handle);
     fstream.open(file_descriptor_source);
@@ -2015,22 +2028,12 @@ void OpenFStream<std::ios_base::in>(
 template <>
 void OpenFStream<std::ios_base::out>(
     boost_iostreams<boost::iostreams::file_descriptor_sink>& fstream, const std::string& filename) {
-#ifdef AZAHAR_VITA_NATIVE_IO
-    std::FILE* raw = std::fopen(filename.c_str(), "wb");
-    if (raw == nullptr)
-        return;
-    const int fd = dup(fileno(raw));
-    std::fclose(raw);
-    if (fd == -1)
-        return;
-#else
     IOFile file(filename, "w");
     if (file.GetFd() == -1)
         return;
     int fd = dup(file.GetFd());
     if (fd == -1)
         return;
-#endif
     boost::iostreams::file_descriptor_sink file_descriptor_sink(fd, boost::iostreams::close_handle);
     fstream.open(file_descriptor_sink);
 }

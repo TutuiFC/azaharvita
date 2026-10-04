@@ -18,8 +18,9 @@ void RendererGXM::SwapBuffers() {
     // El rasterizador GXM puede tener una escena abierta con lo que ha dibujado
     // este fotograma. Hay que cerrarla y volcarla a memoria del invitado ANTES
     // de que PrepareRenderTarget (y el frontend) lean los framebuffers: si no,
-    // se presentaria la imagen anterior.
-    rasterizer.FlushPending();
+    // se presentaria la imagen anterior. Las superficies que el presentador lee
+    // directamente por una copia de pantalla en la GPU no se vuelcan (0.1.8.6).
+    rasterizer.FlushForPresent();
 
     // El fotograma lo produce el camino de software completo (salto de
     // fotogramas incluido). La diferencia con el renderer de software esta

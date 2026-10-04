@@ -203,6 +203,29 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         return ResultStatus::ErrorSavestate;
     }
 
+    /**
+     * GPU en otro nucleo (0.2.0.0): las interrupciones que ha levantado el hilo
+     * de la GPU se dan aqui, en el hilo de emulacion, que es el de GSP. Y si
+     * ningun nucleo emulado tiene un hilo que ejecutar mientras la GPU tiene
+     * ordenes pendientes, el juego la esta esperando: se espera a la GPU en vez
+     * de dejar correr el tiempo emulado hasta el siguiente evento.
+     */
+    if (gpu) {
+        if (gpu->HasInterruptWork()) {
+            bool cores_idle = true;
+            for (const auto& cpu_core : cpu_cores) {
+                if (kernel->GetThreadManager(cpu_core->GetID()).GetCurrentThread() != nullptr) {
+                    cores_idle = false;
+                    break;
+                }
+            }
+            if (cores_idle) {
+                gpu->WaitForInterrupts();
+            }
+        }
+        gpu->DeliverInterrupts();
+    }
+
     // All cores should have executed the same amount of ticks. If this is not the case an event was
     // scheduled with a cycles_into_future smaller then the current downcount.
     // So we have to get those cores to the same global time first
@@ -500,8 +523,11 @@ void System::PrepareReschedule() {
 }
 
 PerfStats::Results System::GetAndResetPerfStats() {
-    return (perf_stats && timing) ? perf_stats->GetAndResetStats(timing->GetGlobalTimeUs())
-                                  : PerfStats::Results{};
+    if (!perf_stats || !timing) {
+        return PerfStats::Results{};
+    }
+    // Con la GPU en otro nucleo esto lo pide el overlay desde ese hilo.
+    return perf_stats->GetAndResetStats(gpu ? gpu->PresentTimeUs() : timing->GetGlobalTimeUs());
 }
 
 PerfStats::Results System::GetLastPerfStats() {
@@ -720,6 +746,10 @@ void System::Shutdown(bool is_deserializing) {
     // Shutdown emulation session
     is_powered_on = false;
 
+    // Antes de soltar el puntero: el hilo de la GPU llama a System::GPU().
+    if (gpu) {
+        gpu->StopThread();
+    }
     gpu.reset();
     if (!is_deserializing) {
         lle_modules.clear();

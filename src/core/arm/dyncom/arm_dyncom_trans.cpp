@@ -8,6 +8,9 @@
 #include "core/arm/skyeye_common/armstate.h"
 #include "core/arm/skyeye_common/armsupp.h"
 #include "core/arm/skyeye_common/vfp/vfp.h"
+#ifdef __PSVITA__
+#include "core/arm/dyncom/arm_dyncom_jit.h"
+#endif
 
 // alignas: es un char[], o sea alineacion 1. Que hasta ahora cayera en una
 // direccion multiple de 4 dependia del enlazador. Los punteros que salen de
@@ -57,7 +60,19 @@ void GetTransCacheFlushCounts(std::size_t& by_capacity, std::size_t& by_invalida
     by_invalidation = g_flushes_by_invalidation;
 }
 
+static void ResetInterpreterTranslations();
+
 void ResetTransCache() {
+#ifdef __PSVITA__
+    // El JIT se vacia en los mismos momentos que las traducciones del
+    // interprete, y por lo mismo: el codigo del juego (o el mapa de memoria)
+    // puede haber cambiado. Ver arm_dyncom_jit.h.
+    Core::ArmJit::Reset();
+#endif
+    ResetInterpreterTranslations();
+}
+
+static void ResetInterpreterTranslations() {
     for (ARMul_State* cpu : trans_cache_users) {
         cpu->instruction_cache.clear();
         // OBLIGATORIO junto al de arriba: block_cache es un atajo delante del
@@ -70,12 +85,71 @@ void ResetTransCache() {
     trans_cache_buf_top = 0;
 }
 
+#ifdef __PSVITA__
+/**
+ * VACIADOS POR INVALIDACION, AGRUPADOS (0.1.6.3).
+ *
+ * crash.txt: ~12.000 vaciados por invalidacion en CADA sesion de Pokemon, la
+ * misma cifra siempre, o sea al cargar. Al cargar un modulo .cro, LDR:RO
+ * aplica sus reubicaciones y cada una llama a InvalidateCacheRange de UNA
+ * palabra, que vaciaba la cache de traduccion entera Y todo el JIT (que luego
+ * tiene que analizar, compilar y comprobar cuatro veces cada bloque otra vez).
+ * Miles de veces seguidas: es lo que hacia tan lenta la carga del 2D al 3D.
+ *
+ * Ahora se marca como pendiente y se corta la rodaja que este en marcha
+ * (NumInstrsToExecute = 0: el interprete sale en la siguiente instruccion y
+ * el JIT no encadena mas). El vaciado de verdad se hace UNA vez, en
+ * FlushTransCacheIfNeeded, antes de volver a ejecutar codigo del juego. Entre
+ * la invalidacion y ese punto no se ejecuta ni una instruccion del juego, asi
+ * que el resultado es el mismo que vaciar en el acto.
+ */
+bool g_invalidation_pending = false;
+/// Solo tramos: el interprete se vacia entero (rehacer sus traducciones es
+/// barato), el JIT solo en esos tramos (0.2.0.5, ver ArmJit::InvalidateRange).
+bool g_range_invalidation_pending = false;
+#endif
+
+void ResetTransCacheFromRange(u32 start, std::size_t size) {
+#ifdef __PSVITA__
+    Core::ArmJit::InvalidateRange(start, static_cast<u32>(size));
+    g_range_invalidation_pending = true;
+    for (ARMul_State* cpu : trans_cache_users) {
+        cpu->NumInstrsToExecute = 0;
+    }
+    return;
+#endif
+    ResetTransCacheFromInvalidation();
+}
+
 void ResetTransCacheFromInvalidation() {
+#ifdef __PSVITA__
+    g_invalidation_pending = true;
+    for (ARMul_State* cpu : trans_cache_users) {
+        cpu->NumInstrsToExecute = 0;
+    }
+    return;
+#endif
     g_flushes_by_invalidation++;
     ResetTransCache();
 }
 
 bool FlushTransCacheIfNeeded() {
+#ifdef __PSVITA__
+    if (g_invalidation_pending) {
+        g_invalidation_pending = false;
+        g_range_invalidation_pending = false;
+        g_flushes_by_invalidation++;
+        ResetTransCache();
+        return true;
+    }
+    if (g_range_invalidation_pending) {
+        g_range_invalidation_pending = false;
+        g_flushes_by_invalidation++;
+        ResetInterpreterTranslations();
+        Core::ArmJit::ApplyInvalidations();
+        return true;
+    }
+#endif
     if (trans_cache_buf_top <= TRANS_CACHE_SIZE - TRANS_CACHE_MARGIN) [[likely]] {
         return false;
     }

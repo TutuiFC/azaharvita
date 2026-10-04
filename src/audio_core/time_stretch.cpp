@@ -84,10 +84,16 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
         const std::size_t samples_received =
             sound_touch->receiveSamples(float_out.data(), static_cast<u32>(num_out));
 
-        // Converting output samples back to shorts so we can use them
+        // Converting output samples back to shorts so we can use them.
+        // La salida de SoundTouch puede pasarse de [-1, 1] al solapar tramos, y
+        // convertir a s16 un valor fuera de rango no satura: da la vuelta, y
+        // +1.01 sale como un pico negativo enorme. Era el sonido "saturado" en
+        // la Vita, donde el juego va muy lento y el estirado es extremo.
         for (std::size_t i = 0; i < (2 * num_out); i++) {
-            const s16 temp = static_cast<s16>(float_out[i] * std::numeric_limits<s16>::max());
-            out[i] = temp;
+            const float scaled = std::clamp(
+                static_cast<float>(float_out[i]) * std::numeric_limits<s16>::max(), -32768.0f,
+                32767.0f);
+            out[i] = static_cast<s16>(scaled);
         }
 
         return samples_received;

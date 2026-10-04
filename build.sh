@@ -5,8 +5,13 @@
 #   ./build.sh clean      -> borra el directorio de build
 set -u
 
-export VITASDK="D:/sdk-new/vitasdk"
-export PATH="/d/azaharvita-tools/cmake-3.31.6-windows-x86_64/bin:/d/azaharvita-tools/ninja:$VITASDK/bin:$PATH"
+# VITASDK tiene que estar definido (export VITASDK=/ruta/al/vitasdk). cmake y
+# ninja se toman del PATH. Si los tienes en otro sitio, anadelos al PATH antes.
+if [ -z "${VITASDK:-}" ]; then
+    echo "Define VITASDK, p. ej.: export VITASDK=/usr/local/vitasdk" >&2
+    exit 1
+fi
+export PATH="$VITASDK/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$ROOT/build"
@@ -30,24 +35,6 @@ fi
 # muere sin mensaje, dejando errores que parecen de codigo y no lo son.
 JOBS="${AZAHAR_JOBS:-4}"
 
-# Sello de compilacion: fecha y hash de git dentro del binario.
-#
-# La version de vita_version.h se sube a mano y es la que identifica al cambio;
-# esto es lo que permite ver de un vistazo si el VPK instalado en la consola es
-# ESTE build o uno viejo. Se regenera en cada compilacion, asi que cambia
-# siempre, aunque alguien olvide subir la version. El fichero no se versiona.
-BUILD_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
-GIT_HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo sin-git)"
-if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null | head -n 1)" ]; then
-    GIT_HASH="$GIT_HASH+"
-fi
-cat > "$ROOT/src/citra_vita/vita_build_info.inc" <<EOF
-// Generado por build.sh en cada compilacion. NO se versiona.
-namespace VitaFrontend {
-const char kBuildInfo[] = "$BUILD_DATE | $GIT_HASH";
-}
-EOF
-
 ninja -C "$BUILD" -j "$JOBS" ${1:+"$1"}
 NINJA_RC=$?
 
@@ -59,7 +46,7 @@ NINJA_RC=$?
 # "FAILED: azahar.velf" que parece cualquier otra cosa. Aqui se mide y se dice.
 ELF="$BUILD/src/citra_vita/azahar"
 if [ -f "$ELF" ]; then
-    GAP=$("$VITASDK/bin/arm-vita-eabi-readelf.exe" -lW "$ELF" 2>/dev/null | awk '
+    GAP=$("$VITASDK/bin/arm-vita-eabi-readelf" -lW "$ELF" 2>/dev/null | awk '
         /^  LOAD/ { n++; start[n] = strtonum($3); end[n] = strtonum($3) + strtonum($6) }
         END { if (n >= 2) print start[2] - end[1]; else print -1 }')
     if [ -n "$GAP" ] && [ "$GAP" -ge 0 ] 2>/dev/null; then
@@ -98,16 +85,10 @@ if [ -f "$VPK" ]; then
     if [ -n "$VER" ]; then
         mkdir -p "$ROOT/elf"
         cp "$BUILD/src/citra_vita/azahar" "$ROOT/elf/azahar-$VER.elf" 2>/dev/null
-        # Copia del VPK con la version EN EL NOMBRE. azahar.vpk se sobrescribe
-        # en cada build y es facil acabar copiando a la consola uno viejo (ha
-        # pasado: el emulador seguia mostrando 0.1.0.16 con builds mas nuevos ya
-        # hechos). Este nombre no se puede confundir.
-        cp "$VPK" "$ROOT/azahar-$VER.vpk"
     fi
 
     echo
     echo "==> $ROOT/azahar.vpk  ($(du -h "$ROOT/azahar.vpk" | cut -f1))"
-    [ -n "$VER" ] && echo "==> $ROOT/azahar-$VER.vpk  (INSTALA ESTE; el nombre lleva la version)"
     echo "==> $ROOT/azahar.elf  (para analizar volcados de este VPK)"
     [ -n "$VER" ] && echo "==> $ROOT/elf/azahar-$VER.elf  (copia archivada de la version $VER)"
 fi

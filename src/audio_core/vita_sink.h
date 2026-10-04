@@ -28,6 +28,10 @@ private:
     unsigned int sample_rate = 0;
     std::function<void(s16*, std::size_t)> callback;
     std::vector<s16> buffer;
+    /// Muestras del DSP (a native_sample_rate) aun sin convertir, y la
+    /// posicion fraccionaria de la siguiente salida entre ellas.
+    std::vector<s16> source;
+    double source_pos = 0.0;
     std::thread thread;
     std::atomic<bool> running{false};
 };

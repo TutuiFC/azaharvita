@@ -570,6 +570,9 @@ void ResetTransCache();
 /// propia cuenta por separado.
 void ResetTransCacheFromInvalidation();
 
+/// Lo mismo para un tramo: el JIT solo tira los bloques que lo tocan (0.2.0.5).
+void ResetTransCacheFromRange(u32 start, std::size_t size);
+
 /// Cuantas veces se ha vaciado el buffer por cada motivo, desde que arranco el
 /// proceso. Sirve para decidir si agrandar TRANS_CACHE_SIZE serviria de algo:
 /// solo los vaciados "por_capacidad" tienen que ver con el tamano del buffer.

@@ -3,9 +3,9 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <numeric>
-#include <boost/circular_buffer.hpp>
 #include <boost/container/static_vector.hpp>
 #include <nihstro/shader_bytecode.h>
 #include "common/assert.h"
@@ -17,12 +17,282 @@
 #include "video_core/pica/shader_unit.h"
 #include "video_core/pica_types.h"
 #include "video_core/shader/shader_interpreter.h"
+#ifdef __PSVITA__
+#include <atomic>
+#include <cstring>
+#include <string>
+#include <fmt/format.h>
+#include "common/vita_diag.h"
+#include "video_core/shader/shader_interpreter_fast.h"
+#include "video_core/shader/shader_neon_jit.h"
+#endif
 
 using nihstro::Instruction;
 using nihstro::OpCode;
 using nihstro::RegisterType;
 using nihstro::SourceRegister;
 using nihstro::SwizzlePattern;
+
+#ifdef __PSVITA__
+namespace Pica::Shader::Fast {
+
+namespace {
+
+/// Una fuente, con el mismo criterio que LookupSourceRegister del interprete.
+void DecodeSource(Op& op, u32 n, SourceRegister reg, u32 addr_reg, bool negate,
+                  const std::array<u32, 4>& selectors) {
+    Src& src = op.src[n];
+    switch (reg.GetRegisterType()) {
+    case RegisterType::Input:
+        src.type = SrcType::Input;
+        break;
+    case RegisterType::Temporary:
+        src.type = SrcType::Temporary;
+        break;
+    default:
+        src.type = SrcType::Uniform;
+        break;
+    }
+    src.index = static_cast<u8>(reg.GetIndex());
+    src.addr_reg = static_cast<u8>(addr_reg);
+    op.negate[n] = negate ? 0x80000000u : 0u;
+    // Lo que LoadSource usa desde 0.1.6.0 (ver Src).
+    src.negated = negate;
+    src.identity =
+        selectors[0] == 0 && selectors[1] == 1 && selectors[2] == 2 && selectors[3] == 3;
+    switch (src.type) {
+    case SrcType::Input:
+        src.offset = static_cast<u16>(ShaderUnit::InputOffset(src.index));
+        break;
+    case SrcType::Temporary:
+        src.offset = static_cast<u16>(ShaderUnit::TemporaryOffset(src.index));
+        break;
+    default:
+        src.offset = static_cast<u16>(src.index * sizeof(Common::Vec4<f24>));
+        break;
+    }
+    for (u32 lane = 0; lane < 4; lane++) {
+        for (u32 byte = 0; byte < 4; byte++) {
+            op.swizzle[n][lane * 4 + byte] = static_cast<u8>(selectors[lane] * 4 + byte);
+        }
+    }
+}
+
+std::array<u32, 4> Selectors1(const SwizzlePattern& s) {
+    return {static_cast<u32>(s.src1_selector_0.Value()),
+            static_cast<u32>(s.src1_selector_1.Value()),
+            static_cast<u32>(s.src1_selector_2.Value()),
+            static_cast<u32>(s.src1_selector_3.Value())};
+}
+std::array<u32, 4> Selectors2(const SwizzlePattern& s) {
+    return {static_cast<u32>(s.src2_selector_0.Value()),
+            static_cast<u32>(s.src2_selector_1.Value()),
+            static_cast<u32>(s.src2_selector_2.Value()),
+            static_cast<u32>(s.src2_selector_3.Value())};
+}
+std::array<u32, 4> Selectors3(const SwizzlePattern& s) {
+    return {static_cast<u32>(s.src3_selector_0.Value()),
+            static_cast<u32>(s.src3_selector_1.Value()),
+            static_cast<u32>(s.src3_selector_2.Value()),
+            static_cast<u32>(s.src3_selector_3.Value())};
+}
+
+/// Destino y mascara de escritura. False si el destino es el "registro
+/// ficticio" (>= 0x20): el interprete escribe ahi en un array estatico que
+/// tambien se LEE como fuente invalida, y eso se deja en sus manos.
+bool DecodeDest(Op& op, u32 dest_value, const SwizzlePattern& swizzle) {
+    if (dest_value >= 0x20) {
+        return false;
+    }
+    op.dest_is_output = dest_value < 0x10;
+    op.dest_index = static_cast<u8>(op.dest_is_output ? dest_value : dest_value - 0x10);
+    op.full_mask = true;
+    for (u32 lane = 0; lane < 4; lane++) {
+        op.write_mask[lane] = swizzle.DestComponentEnabled(lane) ? 0xFFFFFFFFu : 0u;
+        op.full_mask = op.full_mask && op.write_mask[lane] != 0;
+    }
+    // Ver Op::dest_offset (0.1.6.0).
+    op.dest_offset = static_cast<u16>(op.dest_is_output
+                                          ? ShaderUnit::OutputOffset(op.dest_index)
+                                          : ShaderUnit::TemporaryOffset(op.dest_index));
+    return true;
+}
+
+/// Decodifica una instruccion. False = no entra en tramos (la hace el
+/// interprete). Sigue al pie de la letra el switch de RunInterpreter.
+bool DecodeInstruction(Instruction instr, const SwizzleData& swizzle_data, Op& op) {
+    const auto info = instr.opcode.Value().GetInfo();
+    const auto id = instr.opcode.Value().EffectiveOpCode();
+
+    if (info.type == OpCode::Type::Arithmetic) {
+        const bool inverted = (info.subtype & OpCode::Info::SrcInversed) != 0;
+        const SwizzlePattern swizzle = {swizzle_data[instr.common.operand_desc_id]};
+        switch (id) {
+        case OpCode::Id::ADD:
+            op.kind = Kind::Add;
+            break;
+        case OpCode::Id::MUL:
+            op.kind = Kind::Mul;
+            break;
+        case OpCode::Id::FLR:
+            op.kind = Kind::Flr;
+            break;
+        case OpCode::Id::MAX:
+            op.kind = Kind::Max;
+            break;
+        case OpCode::Id::MIN:
+            op.kind = Kind::Min;
+            break;
+        case OpCode::Id::DP3:
+            op.kind = Kind::Dp3;
+            break;
+        case OpCode::Id::DP4:
+            op.kind = Kind::Dp4;
+            break;
+        case OpCode::Id::DPH:
+        case OpCode::Id::DPHI:
+            op.kind = Kind::Dph;
+            break;
+        case OpCode::Id::RCP:
+            op.kind = Kind::Rcp;
+            break;
+        case OpCode::Id::RSQ:
+            op.kind = Kind::Rsq;
+            break;
+        case OpCode::Id::MOVA:
+            op.kind = Kind::Mova;
+            break;
+        case OpCode::Id::MOV:
+            op.kind = Kind::Mov;
+            break;
+        case OpCode::Id::SGE:
+        case OpCode::Id::SGEI:
+            op.kind = Kind::Sge;
+            break;
+        case OpCode::Id::SLT:
+        case OpCode::Id::SLTI:
+            op.kind = Kind::Slt;
+            break;
+        case OpCode::Id::CMP: {
+            op.kind = Kind::Cmp;
+            const u32 x = static_cast<u32>(instr.common.compare_op.x.Value());
+            const u32 y = static_cast<u32>(instr.common.compare_op.y.Value());
+            // 6 y 7: el interprete avisa y no toca el codigo de condicion.
+            if (x > 5 || y > 5) {
+                return false;
+            }
+            op.cmp_x = static_cast<u8>(x);
+            op.cmp_y = static_cast<u8>(y);
+            break;
+        }
+        case OpCode::Id::EX2:
+            op.kind = Kind::Ex2;
+            break;
+        case OpCode::Id::LG2:
+            op.kind = Kind::Lg2;
+            break;
+        default:
+            // DST, LIT y compania: el interprete no las implementa (avisa y no
+            // escribe nada). Se quedan con el.
+            return false;
+        }
+        const u32 addr = instr.common.address_register_index;
+        DecodeSource(op, 0, instr.common.GetSrc1(inverted), inverted ? 0 : addr,
+                     swizzle.negate_src1.Value() != 0, Selectors1(swizzle));
+        DecodeSource(op, 1, instr.common.GetSrc2(inverted), inverted ? addr : 0,
+                     swizzle.negate_src2.Value() != 0, Selectors2(swizzle));
+        if (op.kind == Kind::Mova) {
+            op.mova_mask = static_cast<u8>((swizzle.DestComponentEnabled(0) ? 1 : 0) |
+                                           (swizzle.DestComponentEnabled(1) ? 2 : 0));
+            return true; // MOVA no escribe en ningun registro de datos.
+        }
+        if (op.kind == Kind::Cmp) {
+            return true; // CMP tampoco: solo el codigo de condicion.
+        }
+        return DecodeDest(op, static_cast<u32>(instr.common.dest.Value()), swizzle);
+    }
+
+    if (info.type == OpCode::Type::MultiplyAdd) {
+        if (id != OpCode::Id::MAD && id != OpCode::Id::MADI) {
+            return false;
+        }
+        const bool inverted = id == OpCode::Id::MADI;
+        const SwizzlePattern swizzle = {swizzle_data[instr.mad.operand_desc_id]};
+        op.kind = Kind::Mad;
+        const u32 addr = instr.mad.address_register_index;
+        DecodeSource(op, 0, instr.mad.GetSrc1(inverted), 0, swizzle.negate_src1.Value() != 0,
+                     Selectors1(swizzle));
+        DecodeSource(op, 1, instr.mad.GetSrc2(inverted), inverted ? 0 : addr,
+                     swizzle.negate_src2.Value() != 0, Selectors2(swizzle));
+        DecodeSource(op, 2, instr.mad.GetSrc3(inverted), inverted ? addr : 0,
+                     swizzle.negate_src3.Value() != 0, Selectors3(swizzle));
+        return DecodeDest(op, static_cast<u32>(instr.mad.dest.Value()), swizzle);
+    }
+
+    return false;
+}
+
+} // Anonymous namespace
+
+void Build(Program& program, const ProgramCode& code, const SwizzleData& swizzle_data,
+           u32 entry_point) {
+    // El interprete trata la ultima direccion como END: no entra en tramos.
+    constexpr u32 kLast = MAX_PROGRAM_CODE_LENGTH - 1;
+    program.entry = entry_point;
+
+    std::vector<Op> decoded(kLast);
+    std::vector<bool> ok(kLast, false);
+    // +2: los destinos se marcan con dest+num y dest+1, que pueden pasarse.
+    std::vector<bool> boundary(MAX_PROGRAM_CODE_LENGTH + 2, false);
+    const auto mark = [&boundary](u32 address) {
+        if (address < boundary.size()) {
+            boundary[address] = true;
+        }
+    };
+    mark(entry_point);
+
+    for (u32 address = 0; address < kLast; address++) {
+        Instruction instr{};
+        instr.hex = code[address];
+        if (DecodeInstruction(instr, swizzle_data, decoded[address])) {
+            ok[address] = true;
+            continue;
+        }
+        // Cualquier otra instruccion corta el tramo, y TODAS las direcciones
+        // que su control de flujo pueda poner en una pila o usar de destino
+        // pasan a ser principio de tramo: destino (IF, CALL, JMP, y else del
+        // IF), final (IF, CALL), final del cuerpo de LOOP (destino + 1) y la
+        // siguiente (vuelta de CALL, entrada de LOOP). Si la instruccion no es
+        // de control de flujo, sobran cortes, que solo cuestan velocidad.
+        const u32 dest = instr.flow_control.dest_offset;
+        const u32 count = instr.flow_control.num_instructions;
+        mark(address + 1);
+        mark(dest);
+        mark(dest + count);
+        mark(dest + 1);
+    }
+
+    program.run_at.fill(kNoRun);
+    program.ops.clear();
+    program.runs.clear();
+    for (u32 address = 0; address < kLast; address++) {
+        if (!ok[address]) {
+            continue;
+        }
+        const bool starts_run = address == 0 || !ok[address - 1] || boundary[address];
+        if (starts_run) {
+            program.run_at[address] = static_cast<u16>(program.runs.size());
+            program.runs.push_back({address + 1, static_cast<u32>(program.ops.size()), 0});
+        }
+        Run& run = program.runs.back();
+        program.ops.push_back(decoded[address]);
+        run.count++;
+        run.end = address + 1;
+    }
+}
+
+} // namespace Pica::Shader::Fast
+#endif // __PSVITA__
 
 namespace Pica::Shader {
 
@@ -44,37 +314,290 @@ struct LoopStackElement {
     u8 previous_aL;
 };
 
-template <bool Debug>
-static void RunInterpreter(const ShaderSetup& setup, ShaderUnit& state,
-                           DebugData<Debug>& debug_data, unsigned entry_point) {
-    /**
-     * Pilas reutilizadas por hilo en vez de creadas en cada llamada.
-     *
-     * RunInterpreter se llama UNA VEZ POR VERTICE, y cada circular_buffer
-     * reservaba memoria en el heap al construirse (y la liberaba al salir): en
-     * un fotograma con decenas de miles de vertices eso son decenas de miles de
-     * malloc/free EN EL HILO QUE EMULA LA CPU. Las pilas se vacian al entrar,
-     * asi que el estado no se hereda de un vertice al siguiente.
-     *
-     * thread_local y no static: el rasterizador tiene hilos propios y el motor
-     * de shaders podria acabar usandose desde ellos.
-     */
-    struct Stacks {
-        boost::circular_buffer<IfStackElement> if_stack{8};
-        boost::circular_buffer<CallStackElement> call_stack{4};
-        boost::circular_buffer<LoopStackElement> loop_stack{4};
+/**
+ * Pila de capacidad fija con la MISMA semantica que boost::circular_buffer,
+ * pero sin memoria dinamica.
+ *
+ * POR QUE. RunInterpreter se llama una vez POR VERTICE, y las tres pilas eran
+ * boost::circular_buffer construidos con capacidad: cada uno reserva su
+ * almacenamiento en el heap al construirse y lo libera al salir. Son tres
+ * malloc y tres free por vertice -- con ~19.000 vertices por fotograma en la
+ * cinematica de Rubi Omega, mas de cien mil idas y vueltas al asignador de
+ * newlib, que ademas coge un cerrojo en cada una. Todo para pilas de 4 y 8
+ * elementos que caben de sobra en la pila del hilo.
+ *
+ * LA SEMANTICA ES LA MISMA, incluido el caso raro: circular_buffer, lleno,
+ * NO rechaza el push_back -- sobrescribe el elemento MAS ANTIGUO (el del
+ * frente) y el nuevo pasa a ser back(). El hardware se comporta igual con los
+ * anidamientos que se pasan de hondo, y es lo que el interprete reproduce, asi
+ * que aqui se hace exactamente eso: 'head' marca el mas antiguo y avanza al
+ * sobrescribirlo.
+ *
+ * Solo se usan empty(), size(), back(), push_back() y pop_back(); pop_back con
+ * la pila vacia no ocurre (el interprete comprueba empty() antes), igual que
+ * con circular_buffer, donde seria comportamiento indefinido.
+ */
+template <typename T, u32 N>
+class FixedRingStack {
+    static_assert((N & (N - 1)) == 0, "el indice circular usa una mascara");
 
-        void Reset() {
-            if_stack.clear();
-            call_stack.clear();
-            loop_stack.clear();
+public:
+    bool empty() const {
+        return count == 0;
+    }
+    u32 size() const {
+        return count;
+    }
+    T& back() {
+        return items[(head + count - 1) & (N - 1)];
+    }
+    void push_back(const T& value) {
+        if (count == N) {
+            // Llena: el nuevo ocupa el hueco del mas antiguo, que se pierde.
+            items[head] = value;
+            head = (head + 1) & (N - 1);
+        } else {
+            items[(head + count) & (N - 1)] = value;
+            count++;
+        }
+    }
+    void pop_back() {
+        count--;
+    }
+
+private:
+    std::array<T, N> items;
+    u32 head = 0;
+    u32 count = 0;
+};
+
+#ifdef __PSVITA__
+/**
+ * CONTROL DE FLUJO DEL PROGRAMA ENTERO COMPILADO (0.1.7.2).
+ *
+ * El codigo NEON de shader_neon_jit.cpp ejecuta los tramos aritmeticos en
+ * linea y, para cada instruccion de control de flujo, llama aqui. Todo lo de
+ * abajo es COPIA LITERAL de RunInterpreter (mismo orden, mismas pilas con la
+ * misma FixedRingStack, mismas rarezas del hardware: el cuarto CALL que no
+ * vuelve, LOOP que guarda como aL anterior el propio y, END que aun hace las
+ * comprobaciones de pila), para que el resultado sea el del interprete bit a
+ * bit. La autocomprobacion de InterpreterEngine::Run lo compara igualmente.
+ */
+namespace Fast {
+
+struct FlowContext {
+    ShaderUnit* state = nullptr;
+    const ShaderSetup* setup = nullptr;
+    FixedRingStack<IfStackElement, 8> if_stack;
+    FixedRingStack<CallStackElement, 4> call_stack;
+    FixedRingStack<LoopStackElement, 4> loop_stack;
+    bool trapped = false;
+};
+
+namespace {
+
+/// Las comprobaciones de pila que el interprete hace DESPUES de cada
+/// instruccion. 'program_counter' llega ya incrementado.
+u32 CheckStacks(FlowContext& f, u32 old_program_counter, u32 program_counter, bool is_break) {
+    ShaderUnit& state = *f.state;
+    u32 next_program_counter = old_program_counter + 1;
+    for (u32 i = 0; i < 4; i++) {
+        if (f.call_stack.empty() || f.call_stack.back().end_address != next_program_counter)
+            break;
+        if (i < 3) {
+            program_counter = f.call_stack.back().return_address;
+            next_program_counter = program_counter;
+        }
+        f.call_stack.pop_back();
+    }
+    if (!f.if_stack.empty() && f.if_stack.back().else_address == old_program_counter + 1) {
+        program_counter = f.if_stack.back().end_address;
+        f.if_stack.pop_back();
+    }
+    if (!f.loop_stack.empty() &&
+        (f.loop_stack.back().end_address == old_program_counter + 1 || is_break)) {
+        auto& loop = f.loop_stack.back();
+        state.address_registers[2] += loop.address_increment;
+        if (!is_break && loop.loop_downcounter--) {
+            program_counter = loop.entry_address;
+        } else {
+            program_counter = loop.end_address;
+            if (f.loop_stack.size() > 1)
+                state.address_registers[2] = loop.previous_aL;
+            f.loop_stack.pop_back();
+        }
+    }
+    return program_counter;
+}
+
+} // Anonymous namespace
+
+u32 FlowPostCheck(FlowContext* flow, u32 old_pc) {
+    flow->state->slow_instrs++;
+    return CheckStacks(*flow, old_pc, old_pc + 1, false);
+}
+
+u32 FlowTrap(FlowContext* flow, u32) {
+    flow->trapped = true;
+    return kFlowEnd;
+}
+
+u32 FlowStep(FlowContext* flow, u32 pc) {
+    FlowContext& f = *flow;
+    ShaderUnit& state = *f.state;
+    const auto& uniforms = f.setup->uniforms;
+    const auto& program_code = f.setup->GetProgramCode();
+    state.slow_instrs++;
+
+    u32 program_counter = pc;
+    const u32 old_program_counter = pc;
+    bool is_break = false;
+    bool should_stop = false;
+
+    Instruction instr{};
+    if (program_counter < MAX_PROGRAM_CODE_LENGTH - 1) {
+        instr.hex = program_code[program_counter];
+    } else {
+        instr.opcode.Assign(OpCode::Id::END);
+    }
+
+    const auto evaluate_condition = [&state](Instruction::FlowControlType flow_control) {
+        using Op = Instruction::FlowControlType::Op;
+        bool result_x = flow_control.refx.Value() == state.conditional_code[0];
+        bool result_y = flow_control.refy.Value() == state.conditional_code[1];
+        switch (flow_control.op) {
+        case Op::Or:
+            return result_x || result_y;
+        case Op::And:
+            return result_x && result_y;
+        case Op::JustX:
+            return result_x;
+        case Op::JustY:
+            return result_y;
+        default:
+            UNREACHABLE();
+            return false;
         }
     };
-    static thread_local Stacks stacks;
-    stacks.Reset();
-    auto& if_stack = stacks.if_stack;
-    auto& call_stack = stacks.call_stack;
-    auto& loop_stack = stacks.loop_stack;
+    const auto do_if = [&](Instruction i, bool condition) {
+        if (condition) {
+            f.if_stack.push_back({
+                .else_address = i.flow_control.dest_offset,
+                .end_address = i.flow_control.dest_offset + i.flow_control.num_instructions,
+            });
+        } else {
+            program_counter = i.flow_control.dest_offset - 1;
+        }
+    };
+    const auto do_call = [&](Instruction i) {
+        f.call_stack.push_back({
+            .end_address = i.flow_control.dest_offset + i.flow_control.num_instructions,
+            .return_address = program_counter + 1,
+        });
+        program_counter = i.flow_control.dest_offset - 1;
+    };
+    const auto do_loop = [&](Instruction i, const Common::Vec4<u8>& loop_param) {
+        const u8 previous_aL = static_cast<u8>(state.address_registers[2]);
+        f.loop_stack.push_back({
+            .entry_address = program_counter + 1,
+            .end_address = i.flow_control.dest_offset + 1,
+            .loop_downcounter = loop_param.x,
+            .address_increment = loop_param.z,
+            .previous_aL = previous_aL,
+        });
+        state.address_registers[2] = loop_param.y;
+    };
+
+    switch (instr.opcode.Value()) {
+    case OpCode::Id::END:
+        should_stop = true;
+        break;
+    case OpCode::Id::JMPC:
+        if (evaluate_condition(instr.flow_control)) {
+            program_counter = instr.flow_control.dest_offset - 1;
+        }
+        break;
+    case OpCode::Id::JMPU:
+        if (uniforms.b[instr.flow_control.bool_uniform_id] ==
+            !(instr.flow_control.num_instructions & 1)) {
+            program_counter = instr.flow_control.dest_offset - 1;
+        }
+        break;
+    case OpCode::Id::CALL:
+        do_call(instr);
+        break;
+    case OpCode::Id::CALLU:
+        if (uniforms.b[instr.flow_control.bool_uniform_id]) {
+            do_call(instr);
+        }
+        break;
+    case OpCode::Id::CALLC:
+        if (evaluate_condition(instr.flow_control)) {
+            do_call(instr);
+        }
+        break;
+    case OpCode::Id::NOP:
+        break;
+    case OpCode::Id::IFU:
+        do_if(instr, uniforms.b[instr.flow_control.bool_uniform_id]);
+        break;
+    case OpCode::Id::IFC:
+        do_if(instr, evaluate_condition(instr.flow_control));
+        break;
+    case OpCode::Id::LOOP: {
+        const Common::Vec4<u8>& loop_param = uniforms.i[instr.flow_control.int_uniform_id];
+        state.address_registers[2] = loop_param.y;
+        do_loop(instr, loop_param);
+        break;
+    }
+    case OpCode::Id::BREAK:
+        is_break = true;
+        break;
+    case OpCode::Id::BREAKC:
+        if (evaluate_condition(instr.flow_control)) {
+            is_break = true;
+        }
+        break;
+    default:
+        // El compilador solo manda aqui las instrucciones de arriba (ver
+        // IsFlowInstruction en shader_neon_jit.cpp).
+        f.trapped = true;
+        return kFlowEnd;
+    }
+
+    ++program_counter;
+    program_counter = CheckStacks(f, old_program_counter, program_counter, is_break);
+    return should_stop ? kFlowEnd : program_counter;
+}
+
+/// Ejecuta un vertice con el programa entero compilado.
+void RunWhole(const ShaderSetup& setup, ShaderUnit& state, const Program& program) {
+    FlowContext flow;
+    flow.state = &state;
+    flow.setup = &setup;
+    program.whole(&state, &setup.uniforms, &flow);
+    if (flow.trapped) [[unlikely]] {
+        // Llego a codigo sin compilar: no deberia pasar. Este programa vuelve
+        // a la ruta de antes (el vertice lo repasa la comprobacion si toca).
+        program.disabled.store(true, std::memory_order_relaxed);
+    }
+}
+
+} // namespace Fast
+#endif
+
+template <bool Debug>
+static void RunInterpreter(const ShaderSetup& setup, ShaderUnit& state,
+                           DebugData<Debug>& debug_data, unsigned entry_point,
+                           [[maybe_unused]] const void* fast_program = nullptr) {
+#ifdef __PSVITA__
+    // Programa pre-decodificado (ver shader_interpreter_fast.h), o null para el
+    // interprete puro -- que es lo que usan la depuracion y la comprobacion.
+    const auto* fast = static_cast<const Fast::Program*>(fast_program);
+#endif
+    FixedRingStack<IfStackElement, 8> if_stack;
+    FixedRingStack<CallStackElement, 4> call_stack;
+    FixedRingStack<LoopStackElement, 4> loop_stack;
     u32 program_counter = entry_point;
 
     const auto do_if = [&](Instruction instr, bool condition) {
@@ -141,8 +664,41 @@ static void RunInterpreter(const ShaderSetup& setup, ShaderUnit& state,
     bool should_stop = false;
     while (!should_stop) {
         bool is_break = false;
-        const u32 old_program_counter = program_counter;
+        u32 old_program_counter = program_counter;
 
+#ifdef __PSVITA__
+        /**
+         * Tramo pre-decodificado: se ejecuta entero y se sigue como si se
+         * hubiera interpretado instruccion a instruccion hasta su ultima.
+         *
+         * old_program_counter pasa a ser la ULTIMA instruccion del tramo, que
+         * es contra la que el codigo de abajo hace las comprobaciones de pila:
+         * por como se cortan los tramos (ver Fast::Build), ninguna de las
+         * instrucciones anteriores del tramo podia disparar ninguna.
+         */
+        bool ran_fast = false;
+        if constexpr (!Debug) {
+            if (fast != nullptr && program_counter < MAX_PROGRAM_CODE_LENGTH - 1) {
+                const u16 run_id = fast->run_at[program_counter];
+                if (run_id != Fast::kNoRun) {
+                    const Fast::Run& run = fast->runs[run_id];
+                    if (run.code != nullptr) {
+                        run.code(&state, &setup.uniforms); // NEON (0.1.7.0)
+                    } else {
+                        Fast::ExecuteRun(*fast, run, state, setup.uniforms);
+                    }
+                    state.fast_ops += run.count;
+                    old_program_counter = run.end - 1;
+                    program_counter = run.end - 1;
+                    ran_fast = true;
+                }
+            }
+        }
+        if (!ran_fast) {
+            if constexpr (!Debug) {
+                state.slow_instrs++;
+            }
+#endif
         // Always treat the last instruction of the program code as an
         // end instruction. This fixes some games such as Thunder Blade
         // or After Burner II which have malformed geo shaders without an
@@ -165,6 +721,21 @@ static void RunInterpreter(const ShaderSetup& setup, ShaderUnit& state,
             Record<DebugDataRecord::NEXT_INSTR>(debug_data, iteration - 1, program_counter);
 
         debug_data.max_offset = std::max<u32>(debug_data.max_offset, 1 + program_counter);
+
+#ifdef __PSVITA__
+        /**
+         * 0.1.5.2 (4.2a): este bloque solo se alcanza cuando NO ha corrido la
+         * ruta rapida (esta dentro de if (!ran_fast)), asi que aqui "slow" es
+         * de verdad lento. Se cuenta por OPCODE para saber cual de ellas meter
+         * a la ruta rapida; el total ya lo daba slow_instrs. El overlay anota
+         * las 5 mas frecuentes del intervalo en crash.txt una vez por segundo.
+         */
+        // QUITADO en 0.1.5.8: un fetch_add atomico por instruccion lenta, desde
+        // los tres nucleos a la vez sobre la misma linea de cache, subio "sh"
+        // de 92 a 103 ms en 0.1.5.7. Ya dio su dato (crash.txt de 0.1.5.7: las
+        // lentas son DP4, MOV, ADD, DP3 y MUL, o sea programas enteros fuera de
+        // la ruta rapida, no instrucciones sueltas).
+#endif
 
         auto LookupSourceRegister = [&](const SourceRegister& source_reg,
                                         int address_register_index) -> const f24* {
@@ -716,6 +1287,10 @@ static void RunInterpreter(const ShaderSetup& setup, ShaderUnit& state,
         }
         }
 
+#ifdef __PSVITA__
+        } // if (!ran_fast)
+#endif
+
         ++program_counter;
         ++iteration;
 
@@ -762,19 +1337,193 @@ static void RunInterpreter(const ShaderSetup& setup, ShaderUnit& state,
     }
 }
 
+InterpreterEngine::InterpreterEngine() = default;
+InterpreterEngine::~InterpreterEngine() = default;
+
 void InterpreterEngine::SetupBatch(ShaderSetup& setup, unsigned int entry_point) {
     ASSERT(entry_point < MAX_PROGRAM_CODE_LENGTH);
     setup.DoProgramCodeFixup();
     setup.entry_point = entry_point;
+#ifdef __PSVITA__
+    /**
+     * El programa pre-decodificado de este lote, por (codigo, swizzles,
+     * entrada). Los dos hashes los guarda ShaderSetup y solo los recalcula
+     * cuando el juego escribe codigo o swizzles nuevos, asi que en el caso
+     * normal esto es una busqueda en una tabla por lote.
+     *
+     * Tope de programas: cada uno son unos kilobytes, y un juego no usa
+     * cientos. Pasado el tope, los nuevos se quedan en el interprete puro
+     * (cached_shader = null) en vez de vaciar la tabla: vaciarla dejaria
+     * colgando el puntero que tenga guardado el OTRO ShaderSetup (el de
+     * geometria o el de vertices).
+     */
+    constexpr std::size_t kMaxPrograms = 256;
+    const u64 code_hash = setup.GetProgramCodeHash();
+    const u64 swizzle_hash = setup.GetSwizzleDataHash();
+    const u64 key = code_hash ^ ((swizzle_hash << 21) | (swizzle_hash >> 43)) ^
+                    (static_cast<u64>(entry_point) * 0x9E3779B97F4A7C15ull);
+    const auto it = fast_programs.find(key);
+    if (it != fast_programs.end()) {
+        setup.cached_shader = it->second.get();
+        return;
+    }
+    if (fast_programs.size() >= kMaxPrograms) {
+        setup.cached_shader = nullptr;
+        return;
+    }
+    auto program = std::make_unique<Fast::Program>();
+    program->key = key;
+    Fast::Build(*program, setup.GetProgramCode(), setup.GetSwizzleData(), entry_point);
+    // Programa entero a NEON (0.1.7.2); si no se puede, por tramos (0.1.7.0).
+    Fast::CompileWhole(*program, setup.GetProgramCode());
+    if (program->whole == nullptr) {
+        Fast::CompileRuns(*program);
+    }
+    Common::FrameStats::fast_programs.fetch_add(1, std::memory_order_relaxed);
+    setup.cached_shader = program.get();
+    fast_programs.emplace(key, std::move(program));
+#endif
 }
 
 MICROPROFILE_DEFINE(GPU_Shader, "GPU", "Shader", MP_RGB(50, 50, 240));
+
+#ifdef __PSVITA__
+namespace {
+
+/// Primer sitio donde dos estados difieren, para crash.txt. False si son
+/// iguales bit a bit en todo lo que un shader puede escribir.
+bool FindDifference(const ShaderUnit& fast, const ShaderUnit& reference, std::string& where) {
+    const auto compare_regs = [&where](const auto& a, const auto& b, const char* name) {
+        for (std::size_t reg = 0; reg < a.size(); reg++) {
+            for (u32 lane = 0; lane < 4; lane++) {
+                u32 va;
+                u32 vb;
+                std::memcpy(&va, &a[reg][lane], sizeof(u32));
+                std::memcpy(&vb, &b[reg][lane], sizeof(u32));
+                if (va != vb) {
+                    where = fmt::format("{}{}.{} rapido {:#010x} referencia {:#010x}", name, reg,
+                                        "xyzw"[lane], va, vb);
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (compare_regs(fast.output[0], reference.output[0], "o") ||
+        compare_regs(fast.output[1], reference.output[1], "o(banco 1)") ||
+        compare_regs(fast.temporary, reference.temporary, "r")) {
+        return true;
+    }
+    for (u32 i = 0; i < 3; i++) {
+        if (fast.address_registers[i] != reference.address_registers[i]) {
+            where = fmt::format("a{} rapido {} referencia {}", i, fast.address_registers[i],
+                                reference.address_registers[i]);
+            return true;
+        }
+    }
+    for (u32 i = 0; i < 2; i++) {
+        if (fast.conditional_code[i] != reference.conditional_code[i]) {
+            where = fmt::format("cc{} rapido {} referencia {}", i, fast.conditional_code[i],
+                                reference.conditional_code[i]);
+            return true;
+        }
+    }
+    if (fast.output_bank != reference.output_bank) {
+        where = "banco de salida";
+        return true;
+    }
+    return false;
+}
+
+/// El codigo del programa en crash.txt, para poder reproducir la diferencia
+/// fuera de la consola. Solo la primera vez en toda la sesion.
+void NoteProgram(const ShaderSetup& setup) {
+    static std::atomic<bool> noted{false};
+    if (noted.exchange(true)) {
+        return;
+    }
+    const auto& code = setup.GetProgramCode();
+    const auto& swizzles = setup.GetSwizzleData();
+    const u32 code_size = std::min<u32>(setup.GetBiggestProgramSize(), MAX_PROGRAM_CODE_LENGTH);
+    const u32 swizzle_size =
+        std::min<u32>(setup.GetBiggestSwizzleSize(), MAX_SWIZZLE_DATA_LENGTH);
+    Common::VitaNote("vs rapido",
+                     fmt::format("entrada {} codigo {} swizzles {}", setup.entry_point, code_size,
+                                 swizzle_size)
+                         .c_str());
+    for (u32 base = 0; base < code_size; base += 8) {
+        std::string line = fmt::format("c{:04x}:", base);
+        for (u32 i = base; i < std::min(base + 8, code_size); i++) {
+            line += fmt::format(" {:08x}", code[i]);
+        }
+        Common::VitaNote("vs rapido", line.c_str());
+    }
+    for (u32 base = 0; base < swizzle_size; base += 8) {
+        std::string line = fmt::format("s{:04x}:", base);
+        for (u32 i = base; i < std::min(base + 8, swizzle_size); i++) {
+            line += fmt::format(" {:08x}", swizzles[i]);
+        }
+        Common::VitaNote("vs rapido", line.c_str());
+    }
+}
+
+} // Anonymous namespace
+#endif
 
 void InterpreterEngine::Run(const ShaderSetup& setup, ShaderUnit& state) const {
 
     MICROPROFILE_SCOPE(GPU_Shader);
 
     DebugData<false> dummy_debug_data;
+#ifdef __PSVITA__
+    const auto* fast = static_cast<const Fast::Program*>(setup.cached_shader);
+    if (fast != nullptr && !fast->disabled.load(std::memory_order_relaxed)) {
+        /**
+         * AUTOCOMPROBACION. Los primeros kFullCheckVertices vertices de cada
+         * programa, y despues uno de cada kSampleEvery, se ejecutan TAMBIEN con
+         * el interprete puro sobre una copia del estado de entrada, y se
+         * comparan bit a bit. Ver la cabecera de shader_interpreter_fast.h.
+         */
+        const bool check =
+            fast->verified.load(std::memory_order_relaxed) < Fast::kFullCheckVertices ||
+            (state.fast_check_counter++ & (Fast::kSampleEvery - 1)) == 0;
+        // El programa entero compilado a NEON (0.1.7.2) si lo hay; si no, la
+        // ruta rapida por tramos de siempre.
+        const auto run_fast = [&] {
+            if (fast->whole != nullptr) {
+                Fast::RunWhole(setup, state, *fast);
+            } else {
+                RunInterpreter(setup, state, dummy_debug_data, setup.entry_point, fast);
+            }
+        };
+        if (!check) [[likely]] {
+            run_fast();
+            return;
+        }
+        ShaderUnit reference = state;
+        run_fast();
+        RunInterpreter(setup, reference, dummy_debug_data, setup.entry_point, nullptr);
+        fast->verified.fetch_add(1, std::memory_order_relaxed);
+        Common::FrameStats::fast_checks.fetch_add(1, std::memory_order_relaxed);
+        std::string where;
+        if (FindDifference(state, reference, where)) [[unlikely]] {
+            // El vertice se queda con el resultado de referencia, y el programa
+            // vuelve al interprete para siempre. Solo el primer hilo que lo
+            // detecte lo anota.
+            state = reference;
+            if (!fast->disabled.exchange(true)) {
+                Common::FrameStats::fast_mismatches.fetch_add(1, std::memory_order_relaxed);
+                Common::VitaNote(
+                    "vs rapido",
+                    fmt::format("DIFERENCIA en el programa {:016x}: {} -- vuelve al interprete",
+                                fast->key, where)
+                        .c_str());
+                NoteProgram(setup);
+            }
+        }
+        return;
+    }
+#endif
     RunInterpreter(setup, state, dummy_debug_data, setup.entry_point);
 }
 

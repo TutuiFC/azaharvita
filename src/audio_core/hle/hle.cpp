@@ -27,6 +27,9 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#ifdef __PSVITA__
+#include "common/vita_diag.h"
+#endif
 
 using InterruptType = Service::DSP::InterruptType;
 
@@ -277,7 +280,13 @@ void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
             UNIMPLEMENTED();
             return;
         }
+#ifdef __PSVITA__
+        const unsigned long long decode_begin = Common::VitaMicros();
+#endif
         const HLE::BinaryMessage response = aac_decoder->ProcessRequest(request);
+#ifdef __PSVITA__
+        Common::FrameStats::Add(Common::FrameStats::dsp_us, decode_begin);
+#endif
         pipe_data[static_cast<u32>(pipe_number)].resize(sizeof(response));
         std::memcpy(pipe_data[static_cast<u32>(pipe_number)].data(), &response, sizeof(response));
 
@@ -459,7 +468,14 @@ bool DspHle::Impl::Tick() {
 }
 
 void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
+#ifdef __PSVITA__
+    const unsigned long long tick_begin = Common::VitaMicros();
+    const bool ticked = Tick();
+    Common::FrameStats::Add(Common::FrameStats::dsp_us, tick_begin);
+    if (ticked) {
+#else
     if (Tick()) {
+#endif
         // TODO(merry): Signal all the other interrupts as appropriate.
         interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
     }

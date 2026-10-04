@@ -30,6 +30,9 @@
 #include "core/gdbstub/gdbstub.h"
 #endif
 #include "core/hle/kernel/svc.h"
+#ifdef __PSVITA__
+#include "core/arm/dyncom/arm_dyncom_jit.h"
+#endif
 #include "core/memory.h"
 
 #define RM BITS(sht_oper, 0, 3)
@@ -1704,6 +1707,12 @@ unsigned InterpreterMainLoop(ARMul_State* cpu) {
 
     LOAD_NZCVT;
 DISPATCH: {
+#ifdef __PSVITA__
+    // Si el bloque anterior se ejecuto en modo comprobacion del JIT (el JIT en
+    // una variante sin escrituras, y despues el interprete de verdad), aqui es
+    // donde se comparan los dos. Ver arm_dyncom_jit.h.
+    Core::ArmJit::CompletePendingCheck(cpu);
+#endif
     if (!cpu->NirqSig) {
         if (!(cpu->Cpsr & 0x80)) {
             goto END;
@@ -1714,6 +1723,41 @@ DISPATCH: {
         cpu->Reg[15] &= 0xfffffffe;
     else
         cpu->Reg[15] &= 0xfffffffc;
+
+#ifdef __PSVITA__
+    /**
+     * EL JIT (0.1.4.8). Si hay codigo generado para este bloque y cabe entero
+     * en lo que le queda a la rodaja, se ejecuta y se vuelve a despachar como
+     * si el interprete hubiera recorrido el bloque: misma cuenta de
+     * instrucciones, mismo PC de salida, mismos flags. Si no (bloque con algo
+     * que el JIT no sabe hacer, Thumb, poco presupuesto, o una ejecucion que
+     * toca comprobar), devuelve 0 y sigue el interprete como siempre.
+     *
+     * Con NumInstrsToExecute == 1 (paso a paso) no se usa: el interprete
+     * traduce entonces instrucciones sueltas.
+     */
+    /**
+     * 0.1.6.3: si la rodaja ya se acabo (alguien la corto poniendo
+     * NumInstrsToExecute a 0, o se llego al final por un salto), se sale. Sin
+     * esto, "NumInstrsToExecute - num_instrs" daba la vuelta a un presupuesto
+     * enorme y el JIT podia encadenar bloques muy por encima del final de la
+     * rodaja. El interprete solo no llegaba a notarlo: paraba en la siguiente
+     * instruccion.
+     */
+    if (num_instrs >= cpu->NumInstrsToExecute) {
+        goto END;
+    }
+    if (cpu->NumInstrsToExecute != 1) {
+        const u32 jit_done = Core::ArmJit::TryRun(cpu, cpu->NumInstrsToExecute - num_instrs);
+        if (jit_done != 0) {
+            num_instrs += jit_done;
+            if (num_instrs >= cpu->NumInstrsToExecute) {
+                goto END;
+            }
+            goto DISPATCH;
+        }
+    }
+#endif
 
     // Busqueda del bloque traducido, en dos niveles.
     //
@@ -4012,8 +4056,29 @@ SWI_INST: {
         cpu->system.GetRunningCore().GetTimer().AddTicks(num_instrs);
         cpu->NumInstrsToExecute =
             num_instrs >= cpu->NumInstrsToExecute ? 0 : cpu->NumInstrsToExecute - num_instrs;
+#ifdef __PSVITA__
+        // La cuenta se pone a cero aqui: lo ejecutado hasta la llamada al
+        // sistema se cuenta ya, o el JIT saldria por encima del 100 % (0.1.4.9
+        // marcaba 188 %).
+        Core::ArmJit::CountInstructions(num_instrs);
+#endif
         num_instrs = 0;
+#ifdef __PSVITA__
+        // El tiempo DENTRO de la llamada al sistema (servicios, y con ellos
+        // toda la GPU emulada) se mide aparte para restarlo del tiempo del
+        // bucle del ARM: lo que queda es el ARM de verdad. Una de cada ocho
+        // (0.2.1.0): son cientos por fotograma y leer el reloj es una llamada
+        // al kernel.
+        static unsigned int svc_tick = 0;
+        const bool svc_timed = (++svc_tick & 7u) == 0;
+        const unsigned long long svc_begin = svc_timed ? Common::VitaMicros() : 0;
+#endif
         Kernel::SVCContext{cpu->system}.CallSVC(inst_cream->num & 0xFFFF);
+#ifdef __PSVITA__
+        if (svc_timed) {
+            Core::ArmJit::AddSvcTime((Common::VitaMicros() - svc_begin) * 8);
+        }
+#endif
         // The kernel would call ERET to get here, which clears exclusive memory state.
         cpu->UnsetExclusiveMemoryAddress();
     }
@@ -4723,6 +4788,9 @@ YIELD_INST: {
 #undef VFP_INTERPRETER_IMPL
 
 END: {
+#ifdef __PSVITA__
+    Core::ArmJit::AbandonPendingCheck(num_instrs);
+#endif
     SAVE_NZCVT;
     cpu->NumInstrsToExecute = 0;
     return num_instrs;

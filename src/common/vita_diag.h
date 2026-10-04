@@ -27,7 +27,9 @@
 
 #ifdef __PSVITA__
 
+#include <array>
 #include <atomic>
+#include <cstdint>
 
 namespace Common {
 
@@ -75,6 +77,116 @@ inline std::atomic<unsigned long long> upload_us{0};
 inline std::atomic<unsigned long long> draw_us{0};
 /// Intercambio de buffers: esperar a la GPU y al barrido. Casi todo espera.
 inline std::atomic<unsigned long long> swap_us{0};
+/**
+ * El bucle de vertices entero de PicaCore::LoadVertices: cargar atributos,
+ * ejecutar el shader de vertices en el interprete y entregar cada vertice al
+ * ensamblador de primitivas (que por dentro llama a AddTriangle).
+ *
+ * Es UNA lectura de reloj por llamada de dibujado -- unas trescientas por
+ * fotograma --, no por vertice: medir por vertice costaria mas que lo medido.
+ */
+inline std::atomic<unsigned long long> vertices_us{0};
+/// Cuantos vertices han pasado de verdad por el interprete (los que fallan el
+/// cache). Con vertices_us da el coste por vertice, y dice ademas si el cache
+/// se esta usando: en dibujado no indexado no se usa y esto iguala al total.
+inline std::atomic<unsigned int> vertices_shaded{0};
+/// Nuestro camino de GPU: DrawTriangles, o sea empaquetar el lote, poner el
+/// estado de GXM y encolar el dibujado. Una lectura por lote.
+inline std::atomic<unsigned long long> batch_us{0};
+/**
+ * Solo la fase de SOMBREADO de los vertices (cargar atributos + interprete),
+ * medida desde el hilo de emulacion: es tiempo de pared, no la suma de lo que
+ * trabaja cada nucleo. vertices_us - shade_us es lo que cuesta entregar los
+ * vertices ya sombreados (ensamblar, AddTriangle y lo que caiga a software).
+ * Desde 0.1.0.42, que reparte el sombreado entre tres nucleos.
+ */
+inline std::atomic<unsigned long long> shade_us{0};
+/**
+ * Tiempo parado en sceGxmFinish al cerrar escenas de nuestro rasterizador de
+ * GXM. Es la espera a la GPU: si esto se come 'lote', lo que sobra son cierres
+ * de escena, no trabajo de CPU.
+ */
+inline std::atomic<unsigned long long> finish_us{0};
+/// Texturas decodificadas en el cache de GXM (fallos) y lo que ha costado.
+inline std::atomic<unsigned int> texture_decodes{0};
+inline std::atomic<unsigned long long> texture_decode_us{0};
+/**
+ * Por que se decodifica (0.1.0.43). reuses = texturas avisadas como posibles
+ * cambiadas cuyo hash salio igual (decodificacion AHORRADA); changed = las que
+ * si habian cambiado; evictions = expulsadas por falta de sitio (LRU). Si 'tx'
+ * sigue alto con 'changed' bajo, el problema es de capacidad, no de avisos.
+ */
+inline std::atomic<unsigned int> texture_reuses{0};
+inline std::atomic<unsigned int> texture_changed{0};
+inline std::atomic<unsigned int> texture_evictions{0};
+/// Lo que cuesta revisar las sospechosas (0.2.1.1): el hash de sus bytes.
+inline std::atomic<unsigned long long> texture_rehash_us{0};
+inline std::atomic<unsigned long long> texture_rehash_bytes{0};
+/**
+ * Ruta rapida del interprete de shaders (0.1.0.44, ver
+ * shader_interpreter_fast.h). programs = programas pre-decodificados desde el
+ * arranque; checks = vertices comprobados contra el interprete puro en el
+ * intervalo; mismatches = programas que dieron una diferencia y volvieron al
+ * interprete (desde el arranque: tiene que ser 0).
+ */
+inline std::atomic<unsigned int> fast_programs{0};
+inline std::atomic<unsigned int> fast_checks{0};
+inline std::atomic<unsigned int> fast_mismatches{0};
+/**
+ * Sombreado por dentro (0.1.0.45). busy = suma del tiempo de trabajo de los
+ * tres nucleos (comparado con 3 x shade_us dice si el reparto aprovecha los
+ * nucleos o se queda esperando); fast_ops / slow_instrs = instrucciones del
+ * shader ejecutadas por la ruta rapida y por el interprete.
+ */
+inline std::atomic<unsigned long long> shade_busy_us{0};
+/**
+ * Desglose de UN vertice de cada 32 (0.1.7.2), en microsegundos: leer los
+ * atributos (LoadVertex + LoadInput), ejecutar el shader, y guardar y
+ * convertir la salida. Dice si hay que atacar el shader o lo de alrededor.
+ * No se pone a cero con Reset(): lo lee y lo pone a cero el overlay.
+ */
+inline std::atomic<unsigned long long> vtx_samples{0};
+inline std::atomic<unsigned long long> vtx_load_us{0};
+inline std::atomic<unsigned long long> vtx_run_us{0};
+inline std::atomic<unsigned long long> vtx_out_us{0};
+/// Dibujar el propio overlay (dentro de draw_us). Ver vita_window.cpp.
+inline std::atomic<unsigned long long> overlay_us{0};
+/// DSP HLE (0.1.7.7): la mezcla de cada tick de audio y la decodificacion AAC,
+/// las dos en el hilo de emulacion. No aparecia en ninguna medida.
+inline std::atomic<unsigned long long> dsp_us{0};
+/**
+ * JIT del ARM11 (0.1.4.8, ver arm_dyncom_jit.h). Todo lo cuenta el hilo de
+ * emulacion, que es el unico que ejecuta el ARM:
+ *   guest_instrs   instrucciones del juego ejecutadas en el intervalo (JIT +
+ *                  interprete): con 'cpu' da el coste por instruccion.
+ *   jit_instrs     de esas, las que ha ejecutado codigo generado.
+ *   jit_blocks     bloques compilados desde el arranque.
+ *   jit_rejected   bloques que el JIT no sabe compilar (se quedan en el
+ *                  interprete), desde el arranque.
+ *   jit_checks     bloques comprobados contra el interprete en el intervalo.
+ *   jit_mismatches bloques que dieron una diferencia (desde el arranque:
+ *                  tiene que ser 0; crash.txt dice cual).
+ */
+inline std::atomic<unsigned long long> guest_instrs{0};
+inline std::atomic<unsigned long long> jit_instrs{0};
+inline std::atomic<unsigned int> jit_blocks{0};
+inline std::atomic<unsigned int> jit_rejected{0};
+inline std::atomic<unsigned int> jit_checks{0};
+inline std::atomic<unsigned int> jit_mismatches{0};
+inline std::atomic<unsigned long long> shade_fast_ops{0};
+inline std::atomic<unsigned long long> shade_slow_instrs{0};
+/**
+ * Que OPCODES caen a la ruta lenta (0.1.5.2, punto 4.2a). Solo medir: por
+ * cuanto se queda "rap" al 80% no dice que instruccion es la culpable. Hueco
+ * por valor de opcode de la PICA (hasta 0x3F; los pseudo arriba no llegan aqui).
+ */
+constexpr unsigned kSlowOpcodeSlots = 64;
+inline std::array<std::atomic<unsigned long long>, kSlowOpcodeSlots> shade_slow_opcodes{};
+/// Escrituras de registro PICA y su tiempo (0.1.5.2, punto 4.7): cuanto de
+/// "resto de gx" es decodificar escrituras de registro frente a rellenos y
+/// transferencias (esos dos ya tienen su tiempo en VideoCore::GxStats).
+inline std::atomic<unsigned long long> pica_reg_writes{0};
+inline std::atomic<unsigned long long> pica_reg_write_ns{0};
 /// Presentaciones contadas en el intervalo, para poder dividir.
 inline std::atomic<unsigned int> frames{0};
 
@@ -87,6 +199,27 @@ inline void Reset() {
     upload_us.store(0, std::memory_order_relaxed);
     draw_us.store(0, std::memory_order_relaxed);
     swap_us.store(0, std::memory_order_relaxed);
+    vertices_us.store(0, std::memory_order_relaxed);
+    vertices_shaded.store(0, std::memory_order_relaxed);
+    batch_us.store(0, std::memory_order_relaxed);
+    shade_us.store(0, std::memory_order_relaxed);
+    finish_us.store(0, std::memory_order_relaxed);
+    texture_decode_us.store(0, std::memory_order_relaxed);
+    texture_rehash_us.store(0, std::memory_order_relaxed);
+    texture_rehash_bytes.store(0, std::memory_order_relaxed);
+    shade_busy_us.store(0, std::memory_order_relaxed);
+    overlay_us.store(0, std::memory_order_relaxed);
+    dsp_us.store(0, std::memory_order_relaxed);
+    // Los contadores de "desde el arranque" (fast_programs, jit_*, etc) NO se
+    // tocan aqui. shade_slow_opcodes SI: es un desglose del intervalo, como
+    // shade_slow_instrs, y el overlay lo anota en crash.txt una vez por segundo.
+    shade_fast_ops.store(0, std::memory_order_relaxed);
+    shade_slow_instrs.store(0, std::memory_order_relaxed);
+    for (auto& slot : shade_slow_opcodes) {
+        slot.store(0, std::memory_order_relaxed);
+    }
+    pica_reg_writes.store(0, std::memory_order_relaxed);
+    pica_reg_write_ns.store(0, std::memory_order_relaxed);
     frames.store(0, std::memory_order_relaxed);
 }
 
@@ -95,6 +228,62 @@ inline void Reset() {
 /// Anota una linea en ux0:/data/azahar/crash.txt. Seguro en cualquier hilo y en
 /// cualquier momento, incluido antes de main o con el heap agotado.
 void VitaNote(const char* title, const char* detail);
+
+/**
+ * UN crash.txt POR JUEGO (0.1.9.7). Desde que se carga un juego, cada nota va
+ * tambien a este fichero (ux0:/data/azahar/crash_<juego>.txt), ademas de a
+ * crash.txt: asi el de cada juego queda guardado aunque despues se abra otro.
+ * nullptr lo quita.
+ */
+void SetVitaGameLog(const char* path);
+const char* VitaGameLog();
+
+/**
+ * Donde esta ahora el hilo de emulacion, para el vigilante de main.cpp
+ * (0.1.9.0): si el emulador se queda congelado sin crashear, crash.txt dice en
+ * que paso (esperando a la GPU, abriendo una escena, compilando un shader...).
+ * Literales de cadena: el vigilante solo lee el puntero.
+ */
+inline std::atomic<const char*> vita_stage{"-"};
+
+/**
+ * Lo mismo para el hilo de la GPU (0.2.0.0, ver VideoCore::GPU::async_enabled).
+ * Con la GPU en otro nucleo, lo que se marque en ese hilo va aqui y vita_stage
+ * queda para el de emulacion: si no, el vigilante diria que el juego esta
+ * "abriendo una escena" cuando el que esta parado es el otro hilo.
+ *
+ * El hilo se reconoce por su pila (vita_gpu_stack_lo/hi, que pone el propio
+ * hilo al arrancar): sin TLS nativo en este toolchain, preguntar al sistema
+ * por el hilo actual en cada etapa costaria una llamada al kernel.
+ */
+inline std::atomic<const char*> vita_gpu_stage{"-"};
+inline std::atomic<std::uintptr_t> vita_gpu_stack_lo{0};
+inline std::atomic<std::uintptr_t> vita_gpu_stack_hi{0};
+
+inline std::atomic<const char*>& VitaStageSlot() {
+    volatile char marker = 0;
+    const auto here = reinterpret_cast<std::uintptr_t>(&marker);
+    if (here >= vita_gpu_stack_lo.load(std::memory_order_relaxed) &&
+        here < vita_gpu_stack_hi.load(std::memory_order_relaxed)) {
+        return vita_gpu_stage;
+    }
+    return vita_stage;
+}
+
+class ScopedVitaStage {
+public:
+    explicit ScopedVitaStage(const char* stage)
+        : slot{VitaStageSlot()}, previous{slot.exchange(stage, std::memory_order_relaxed)} {}
+    ~ScopedVitaStage() {
+        slot.store(previous, std::memory_order_relaxed);
+    }
+    ScopedVitaStage(const ScopedVitaStage&) = delete;
+    ScopedVitaStage& operator=(const ScopedVitaStage&) = delete;
+
+private:
+    std::atomic<const char*>& slot;
+    const char* previous;
+};
 
 /// Deja constancia de un assert fallido y termina el proceso.
 ///
@@ -122,6 +311,22 @@ const char* LastFatalMessage();
  * @param role  Texto corto para la anotacion en crash.txt ("rasterizador", etc).
  */
 void VitaPinThreadToUserCore(unsigned int index, const char* role);
+
+/**
+ * PRIORIDADES EXPLICITAS (0.2.0.2). Menor numero = mas prioridad. Un hilo de
+ * std::thread nace con 191, la MAS BAJA de usuario, y uno de pthread con
+ * atributos con 159: el volcado de la 0.2.0.1 tenia a los ayudantes del
+ * sombreado de vertices y al audio por debajo del compilador de shaders. Con
+ * la GPU en otro nucleo ya no queda un nucleo libre, asi que el compilador los
+ * dejaba sin CPU segundos enteros: el hilo de la GPU esperando a un ayudante
+ * (Pokemon Sol congelado al pasar al 3D) y el audio a trompicones.
+ */
+constexpr int kVitaPriorityAudio = 96;
+constexpr int kVitaPriorityHelper = 159;
+constexpr int kVitaPriorityBackground = 191;
+
+/// Cambia la prioridad del hilo actual y lo anota en crash.txt con su papel.
+void VitaSetThreadPriority(int priority, const char* role);
 
 /**
  * Reloj REAL de la CPU en MHz, leido de vuelta despues de pedir el overclock.

@@ -116,6 +116,18 @@ struct PageTable {
     Pointers pointers;
 
     /**
+     * El array crudo de punteros por pagina, para el JIT del ARM11 (0.1.4.8).
+     *
+     * El codigo que genera el JIT (arm_dyncom_jit.cpp) hace en linea lo mismo
+     * que MemorySystem::Read32Fast: puntero = raw[direccion >> 12]; si no es
+     * nulo, lee de ahi; si es nulo, llama al camino lento. Para eso necesita la
+     * direccion del array, que es privado. Solo lectura.
+     */
+    u8* const* RawPointers() const {
+        return pointers.raw.data();
+    }
+
+    /**
      * Array of fine grained page attributes. If it is set to any value other than `Memory`, then
      * the corresponding entry in `pointers` MUST be set to null.
      */
@@ -777,6 +789,19 @@ public:
 
     /// Gets a pointer to the memory region beginning at the specified physical address.
     u8* GetPhysicalPointer(PAddr address);
+
+    /**
+     * Lo mismo que GetPhysicalPointer, pero SEGURO DESDE VARIOS HILOS a la vez.
+     *
+     * GetPhysicalPointer pasa por GetPhysMemRegionInfo, que guarda la ultima
+     * region en phys_mem_region_info_cache: un miembro que se ESCRIBE en cada
+     * fallo. Desde que el sombreado de vertices va en tres nucleos (0.1.0.42)
+     * los tres cargaban atributos por ahi a la vez, y un hilo podia leer esa
+     * estructura a medio escribir -- el inicio de una region con el puntero de
+     * otra --: un vertice con datos de otro sitio. Esta version busca la region
+     * igual (mismas regiones, mismo limite inclusivo) sin tocar ese cache.
+     */
+    u8* GetPhysicalPointerThreadSafe(PAddr address) const;
 
     /// Returns a reference to the memory region beginning at the specified physical address
     MemoryRef GetPhysicalRef(PAddr address);

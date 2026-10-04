@@ -18,10 +18,65 @@
 #include "core/hle/service/fs/file.h"
 #include "network/artic_base/artic_base_client.h"
 
+#ifdef __PSVITA__
+/**
+ * EN VITA LOS DOS IDENTIFICADORES SE ACORTAN, Y NO ES UN CAPRICHO.
+ *
+ * ID0 e ID1 son, en una consola de verdad, dos hashes de 32 caracteres. Azahar
+ * los deja a ceros porque no emula ninguna consola concreta: son relleno que no
+ * lee nadie, solo estructura de carpetas en el anfitrion.
+ *
+ * Aqui ese relleno impedia jugar. La ruta de guardado de un juego queda asi:
+ *
+ *   ux0:/data/azahar/sdmc/Nintendo 3DS/<ID0>/<ID1>/title/00040000/xxxxxxxx/
+ *   data/00000001
+ *
+ * que con los identificadores largos son 138 caracteres, y sceIoMkdir falla con
+ * EINVAL (0x80010016) al crear ese ultimo nivel. Medido en consola: todos los
+ * niveles de arriba se crean bien y solo revienta el ultimo; los padres de 129
+ * caracteres "funcionan" unicamente porque ya existian, asi que ni siquiera son
+ * prueba de que se pudieran crear. El limite real esta por debajo de eso.
+ *
+ * Sin poder crear esa carpeta, el juego no abre su archivo de guardado
+ * (OpenArchive con archive_id 0x4 falla) y se queda a medio cargar o se rinde
+ * con la pantalla de error del 3DS. Le pasaba a NSMB2, a los Pokemon, a Smash,
+ * a Yo-kai Watch y a Inazuma.
+ *
+ * Con un caracter cada uno la misma ruta baja a 76, con sitio de sobra. El
+ * emulador se comporta igual: estos identificadores no viajan al juego, solo
+ * nombran carpetas del anfitrion.
+ *
+ * EFECTO SECUNDARIO: los guardados que hubiera bajo las carpetas largas dejan
+ * de verse. En este port todavia no habia ninguno -- los juegos no llegaban a
+ * guardar porque justamente no podian crear la carpeta --, pero si alguien
+ * viene de otra version, mover a mano
+ * "Nintendo 3DS/000...0/000...0/" a "Nintendo 3DS/0/0/" los recupera.
+ */
+static constexpr char SYSTEM_ID[]{"0"};
+static constexpr char SDCARD_ID[]{"0"};
+
+/**
+ * Carpeta de TITULOS INSTALADOS de la tarjeta SD, relativa a SDMCDir.
+ *
+ * En el 3DS es "Nintendo 3DS/<ID0>/<ID1>/title/", cuatro niveles. Aqui se
+ * colapsa a uno por el limite de anidamiento del sistema de ficheros de la
+ * consola (ver la nota larga en archive_source_sd_savedata.cpp): con la
+ * estructura original, un fichero de contenido -- .tmd o .app -- cae a
+ * profundidad 11 y sceIoOpen lo rechaza con EINVAL, asi que no se podian leer
+ * ni actualizaciones ni DLC.
+ *
+ * Vive aqui, junto a los identificadores, para que las tres piezas que la
+ * necesitan -- am.cpp al construir rutas y archive.cpp al reconocerlas -- no
+ * puedan desincronizarse: si una dijera "t/" y otra "Nintendo 3DS", el
+ * emulador escribiria en un sitio y buscaria en otro.
+ */
+static constexpr char SDMC_TITLE_DIR[]{"t/"};
+#else
 /// The unique system identifier hash, also known as ID0
 static constexpr char SYSTEM_ID[]{"00000000000000000000000000000000"};
 /// The scrambled SD card CID, also known as ID1
 static constexpr char SDCARD_ID[]{"00000000000000000000000000000000"};
+#endif
 
 namespace Loader {
 class AppLoader;

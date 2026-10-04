@@ -93,12 +93,13 @@ public:
 
     // Opens filename as an IOFile child and exposes the fragment
     // [sub_file_offset, sub_file_offset + sub_file_size) of it.
-    SubIOFile(const std::string& filename, const char openmode[], u64 sub_file_offset,
-              u64 sub_file_size, int flags = 0);
+    SubIOFile(const std::string& filename, const char openmode[], std::size_t sub_file_offset,
+              std::size_t sub_file_size, int flags = 0);
 
     // Uses an already opened child file and exposes the fragment
     // [sub_file_offset, sub_file_offset + sub_file_size) of it.
-    SubIOFile(std::unique_ptr<IOFileBase>&& child_file, u64 sub_file_offset, u64 sub_file_size);
+    SubIOFile(std::unique_ptr<IOFileBase>&& child_file, std::size_t sub_file_offset,
+              std::size_t sub_file_size);
 
     ~SubIOFile() override;
 
@@ -125,16 +126,12 @@ protected:
 
 private:
     static bool IsReplaceOpenMode(const char* openmode);
-    [[nodiscard]] u64 BytesRemaining() const;
+    [[nodiscard]] std::size_t BytesRemaining() const;
     void Swap(SubIOFile& other) noexcept;
 
-    // u64 y no std::size_t: en ARM de 32 bits (Vita) size_t se desborda a los
-    // 4 GB, y una particion de un NCSD grande llega ahi. El limite de 4 GB de
-    // las propias cabeceras del 3DS no lo salva: size*512 = 0x100000000
-    // envuelve a cero y el fragmento queda vacio.
-    u64 m_sub_file_offset = 0;   // Offset of the fragment inside the child file.
-    u64 m_sub_file_capacity = 0; // Original (maximum) size given at construction.
-    u64 m_sub_file_size = 0;     // Current logical size (<= capacity).
+    std::size_t m_sub_file_offset = 0;   // Offset of the fragment inside the child file.
+    std::size_t m_sub_file_capacity = 0; // Original (maximum) size given at construction.
+    std::size_t m_sub_file_size = 0;     // Current logical size (<= capacity).
     bool m_good = true;
 
     template <class Archive>

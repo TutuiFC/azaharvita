@@ -76,19 +76,6 @@ public:
         return false;
     }
 
-    /**
-     * True si este fotograma no se va a rasterizar (salto de fotogramas).
-     *
-     * El renderer de software ya se saltaba el rasterizado en AddTriangle, pero
-     * el vertex shader, el vertex loader y el ensamblado de primitivas seguian
-     * corriendo para un fotograma que nadie iba a ver. Con esto, PicaCore corta
-     * el trabajo de vertices entero. Es tambien lo que hace que el backend GXM
-     * no acumule ni dibuje lotes en los fotogramas saltados.
-     */
-    virtual bool ShouldSkipDraw() const {
-        return false;
-    }
-
     virtual void LoadDefaultDiskResources(
         [[maybe_unused]] const std::atomic_bool& stop_loading,
         [[maybe_unused]] const DiskResourceLoadCallback& callback) {}

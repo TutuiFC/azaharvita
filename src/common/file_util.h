@@ -653,45 +653,34 @@ private:
     int m_fd = -1;
 #ifdef AZAHAR_VITA_NATIVE_IO
     /**
-     * Descriptor nativo de la consola, alternativo al FILE* de la libreria
-     * estandar. Solo se usa con ficheros que NO caben en el off_t de esta libc.
+     * Descriptor nativo de la consola, en vez del FILE* de la libreria estandar.
      *
      * En esta libc 'off_t' son 4 BYTES: fseeko/ftello no pueden expresar una
      * posicion mas alla de 2 GB, y no existen las variantes de 64 bits
      * (comprobado: fseeko64 no esta ni en la cabecera ni en libc.a). Tampoco
-     * sirve stat, porque su st_size es del mismo tipo. El sintoma es peor que
-     * un error: un ROM de 4 GB justos mide 0x100000000, que truncado a 32 bits
-     * es CERO, y el emulador cree que el fichero esta vacio.
+     * sirve stat, porque su st_size es del mismo tipo.
      *
-     * sceIo si es de 64 bits (SceOff y SceIoStat::st_size ocupan 8 bytes), asi
-     * que los ficheros grandes van por ahi. Los que caben en 2 GB se quedan en
-     * stdio a proposito: stdio trae buffer de lectura y sceIo no, y poner todo
-     * por sceIo hundia los juegos de 2 fps a 0.3 (miles de lecturas pequenas
-     * del romfs pagando una llamada al kernel cada una). Ver kNativeIoThreshold
-     * en file_util.cpp.
+     * El sintoma es peor que un error: un ROM de 4 GB justos mide 0x100000000,
+     * que truncado a 32 bits es CERO. El emulador cree que el fichero esta
+     * vacio y falla al leer la cabecera -- y como ese fallo es el generico, se
+     * presenta al usuario como "no se ha podido determinar el modo de sistema",
+     * culpando a algo que no tiene nada que ver.
      *
-     * Como sceIo no trae buffer, el camino nativo lleva el suyo: sin el,
-     * cargar una ROM grande son miles de lecturas pequenas con una llamada al
-     * kernel cada una y tarda minutos. Se reserva en la primera lectura, no en
-     * Open(), para no pagar 32 KB por cada fichero abierto.
+     * sceIo si es de 64 bits: SceOff y SceIoStat::st_size ocupan 8 bytes
+     * (comprobado). Asi que en Vita IOFile va sobre sceIo y no sobre stdio.
      */
     int m_vita_fd = -1;
-    static constexpr std::size_t kNativeReadBufferSize = 32 * 1024;
-    std::unique_ptr<u8[]> m_vita_read_buffer;
-    u64 m_vita_pos = 0;       // Posicion logica (lo que devuelve Tell).
-    u64 m_vita_buf_start = 0; // Offset del primer byte valido del buffer.
-    std::size_t m_vita_buf_len = 0;
-    std::size_t m_vita_buf_pos = 0;
 #endif
     bool m_good = true;
-#if defined(HAVE_LIBRETRO_VFS) || defined(AZAHAR_VITA_NATIVE_IO)
+#if defined(HAVE_LIBRETRO_VFS)
     // pread() doesn't touch the file position, so it's safe alongside
     // concurrent fread/fwrite. Libretro VFS has no pread equivalent, so
     // ReadAtImpl emulates it with seek+read+seek, which would corrupt the
     // file position for concurrent Read/Write operations.
     //
-    // sceIo tampoco tiene pread, asi que en Vita pasa lo mismo y hace falta
-    // el mismo candado.
+    // En Vita NO hace falta: sceIoPread tampoco toca la posicion, igual que el
+    // pread de siempre. Aqui se creia que no existia y se emulaba con saltos,
+    // que era lo que obligaba al candado.
     mutable std::mutex m_file_pos_mutex;
 #endif
 

@@ -290,6 +290,9 @@ void RasterizerSoftware::AddTriangle(const Pica::OutputVertex& v0, const Pica::O
     FlipQuaternionIfOpposite(buffer_a[1].quat, buffer_a[0].quat);
     FlipQuaternionIfOpposite(buffer_a[2].quat, buffer_a[0].quat);
 
+    auto* output_list = &buffer_a;
+    auto* input_list = &buffer_b;
+
     // NOTE: We clip against a w=epsilon plane to guarantee that the output has a positive w value.
     // TODO: Not sure if this is a valid approach. Also should probably instead use the smallest
     //       epsilon possible within f24 accuracy.
@@ -306,72 +309,39 @@ void RasterizerSoftware::AddTriangle(const Pica::OutputVertex& v0, const Pica::O
         {Common::MakeVec(f0, f0, f0, f1), Common::Vec4<f24>(f0, f0, f0, EPSILON)}, // w = EPSILON
     }};
 
-    auto* output_list = &buffer_a;
-    auto* input_list = &buffer_b;
+    // Simple implementation of the Sutherland-Hodgman clipping algorithm.
+    // TODO: Make this less inefficient (currently lots of useless buffering overhead happens here)
+    const auto clip = [&](const ClippingEdge& edge) {
+        std::swap(input_list, output_list);
+        output_list->clear();
 
-    /**
-     * Aceptacion trivial del recorte.
-     *
-     * Sutherland-Hodgman copia el triangulo entero en cada plano que se le
-     * pide. Si los tres vertices ya estan dentro de los 7 planos (y del plano
-     * custom), el resultado es el mismo triangulo sin tocar, asi que las 7
-     * pasadas sobran. La mayoria de los triangulos de interior caen aqui.
-     *
-     * La condicion es EXACTAMENTE la misma que la de las pasadas (IsInside con
-     * los mismos planos), asi que el resultado no cambia.
-     */
-    bool all_inside = true;
-    for (const ClippingEdge& edge : clipping_edges) {
-        if (!edge.IsInside(buffer_a[0]) || !edge.IsInside(buffer_a[1]) ||
-            !edge.IsInside(buffer_a[2])) {
-            all_inside = false;
-            break;
-        }
-    }
-    if (all_inside && regs.rasterizer.clip_enable) {
-        const ClippingEdge custom_edge{regs.rasterizer.GetClipCoef()};
-        if (!custom_edge.IsInside(buffer_a[0]) || !custom_edge.IsInside(buffer_a[1]) ||
-            !custom_edge.IsInside(buffer_a[2])) {
-            all_inside = false;
-        }
-    }
-
-    if (!all_inside) {
-        // Simple implementation of the Sutherland-Hodgman clipping algorithm.
-        // TODO: Make this less inefficient (currently lots of useless buffering overhead happens
-        // here)
-        const auto clip = [&](const ClippingEdge& edge) {
-            std::swap(input_list, output_list);
-            output_list->clear();
-
-            const Vertex* reference_vertex = &input_list->back();
-            for (const auto& vertex : *input_list) {
-                // NOTE: This algorithm changes vertex order in some cases!
-                if (edge.IsInside(vertex)) {
-                    if (edge.IsOutSide(*reference_vertex)) {
-                        output_list->push_back(edge.GetIntersection(vertex, *reference_vertex));
-                    }
-                    output_list->push_back(vertex);
-                } else if (edge.IsInside(*reference_vertex)) {
+        const Vertex* reference_vertex = &input_list->back();
+        for (const auto& vertex : *input_list) {
+            // NOTE: This algorithm changes vertex order in some cases!
+            if (edge.IsInside(vertex)) {
+                if (edge.IsOutSide(*reference_vertex)) {
                     output_list->push_back(edge.GetIntersection(vertex, *reference_vertex));
                 }
-                reference_vertex = &vertex;
+                output_list->push_back(vertex);
+            } else if (edge.IsInside(*reference_vertex)) {
+                output_list->push_back(edge.GetIntersection(vertex, *reference_vertex));
             }
-        };
-
-        for (const ClippingEdge& edge : clipping_edges) {
-            clip(edge);
-            if (output_list->size() < 3) {
-                return;
-            }
+            reference_vertex = &vertex;
         }
+    };
 
-        if (regs.rasterizer.clip_enable) {
-            const ClippingEdge custom_edge{regs.rasterizer.GetClipCoef()};
-            clip(custom_edge);
-            if (output_list->size() < 3) {
-                return;
-            }
+    for (const ClippingEdge& edge : clipping_edges) {
+        clip(edge);
+        if (output_list->size() < 3) {
+            return;
+        }
+    }
+
+    if (regs.rasterizer.clip_enable) {
+        const ClippingEdge custom_edge{regs.rasterizer.GetClipCoef()};
+        clip(custom_edge);
+        if (output_list->size() < 3) {
+            return;
         }
     }
 
@@ -522,9 +492,18 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
     // en vez de reescribir la formula a mano: es aritmetica entera exacta y
     // lineal, asi que el resultado es identico pixel a pixel, y no hay ocasion
     // de equivocarse al desmontar el punto fijo 12.4.
-    const u16 probe_x = static_cast<u16>(min_x + 8);
+    //
+    // Resolucion 0.5x (0.1.5.1): se sombrea un pixel de cada DOS en x (y una
+    // linea de cada dos en y, mas abajo), asi que la pendiente se toma a DOS
+    // pixeles y la primera columna se alinea a una columna PAR absoluta, por
+    // lo mismo que las filas: que todos los triangulos usen la misma rejilla y
+    // no se vean costuras entre vecinos. Ver FrameSkip::half_resolution.
+    const bool half_res = FrameSkip::half_resolution.load(std::memory_order_relaxed);
+    const u16 x_pitch = static_cast<u16>(half_res ? 0x20 : 0x10);
+    const u16 probe_x = static_cast<u16>(
+        (half_res && (((min_x >> 4) & 1) != 0)) ? min_x + 0x18 : min_x + 8);
     const u16 probe_y = static_cast<u16>(min_y + 8);
-    const u16 probe_x_next = static_cast<u16>(probe_x + 0x10);
+    const u16 probe_x_next = static_cast<u16>(probe_x + x_pitch);
     const s32 dw0_dx = SignedArea(vtxpos[1].xy(), vtxpos[2].xy(), {probe_x_next, probe_y}) -
                        SignedArea(vtxpos[1].xy(), vtxpos[2].xy(), {probe_x, probe_y});
     const s32 dw1_dx = SignedArea(vtxpos[2].xy(), vtxpos[0].xy(), {probe_x_next, probe_y}) -
@@ -559,10 +538,40 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
     // (linea pintada, linea copiada) encajen igual en todos los triangulos. Si
     // dependiera de min_y, dos triangulos vecinos partirian las parejas de
     // forma distinta y se veria una costura entre ellos.
-    const bool half_res = FrameSkip::half_resolution.load(std::memory_order_relaxed);
     const u16 y_pitch = static_cast<u16>(half_res ? 0x20 : 0x10);
     const u16 y_origin =
         (half_res && (((min_y >> 4) & 1) != 0)) ? static_cast<u16>(min_y + 0x10) : min_y;
+
+    /**
+     * Escritura de un pixel sombreado. En 0.5x rellena su bloque de 2x2: el
+     * mismo color a la derecha, abajo y en diagonal.
+     *
+     * Abajo, el limite es 'height' y no 'height - 1' porque el registro guarda
+     * el alto real menos uno (ver DrawPixel). A la derecha, el ancho real del
+     * framebuffer y, con la tijera en modo Include, su borde derecho: la
+     * columna copiada no debe pintar fuera de la zona que el juego permite.
+     * (La fila copiada no mira la tijera, igual que antes de 0.1.5.1.)
+     */
+    const u32 fb_width = regs.framebuffer.framebuffer.width;
+    const u32 x_limit = scissor_mode == RasterizerRegs::ScissorMode::Include
+                            ? std::min<u32>(fb_width, static_cast<u32>(scissor_x2 >> 4))
+                            : fb_width;
+    const auto draw_scaled = [&](u32 px, u32 py, const Common::Vec4<u8>& color) {
+        fb.DrawPixel(px, py, color);
+        if (!half_res) {
+            return;
+        }
+        const bool right = px + 1 < x_limit;
+        if (right) {
+            fb.DrawPixel(px + 1, py, color);
+        }
+        if (py + 1 <= fb_height) {
+            fb.DrawPixel(px, py + 1, color);
+            if (right) {
+                fb.DrawPixel(px + 1, py + 1, color);
+            }
+        }
+    };
 
     /**
      * Cuando se puede descartar un pixel tapado ANTES de sombrearlo.
@@ -835,8 +844,8 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
             s32 w1_row = bias1 + SignedArea(vtxpos[2].xy(), vtxpos[0].xy(), {probe_x, y});
             s32 w2_row = bias2 + SignedArea(vtxpos[0].xy(), vtxpos[1].xy(), {probe_x, y});
 
-            for (u16 x = min_x + 8; x < max_x;
-                 x += 0x10, w0_row += dw0_dx, w1_row += dw1_dx, w2_row += dw2_dx) {
+            for (u16 x = probe_x; x < max_x;
+                 x += x_pitch, w0_row += dw0_dx, w1_row += dw1_dx, w2_row += dw2_dx) {
                 counters.tested++;
                 // Do not process the pixel if it's inside the scissor box and the scissor mode is
                 // set to Exclude.
@@ -1167,19 +1176,13 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
                      */
                     if (ablation_mode == Ablation::kNoMerger) {
                         if (!no_write) {
-                            fb.DrawPixel(px, py, combiner_output);
-                            if (half_res && py + 1 <= fb_height) {
-                                fb.DrawPixel(px, py + 1, combiner_output);
-                            }
+                            draw_scaled(px, py, combiner_output);
                         }
                         counters.drawn++;
                     } else if (blend.standard_src_alpha && blend.all_channels_enabled &&
                                combiner_output.a() == 255) {
                         if (!no_write) {
-                            fb.DrawPixel(px, py, combiner_output);
-                            if (half_res && py + 1 <= fb_height) {
-                                fb.DrawPixel(px, py + 1, combiner_output);
-                            }
+                            draw_scaled(px, py, combiner_output);
                         }
                         counters.drawn++;
                     } else if (blend.standard_src_alpha && blend.all_channels_enabled &&
@@ -1189,14 +1192,7 @@ void RasterizerSoftware::ProcessTriangle(const Vertex& v0, const Vertex& v1, con
                     } else {
                         const auto result = PixelColor(x, y, combiner_output, blend);
                         if (!no_write) {
-                            fb.DrawPixel(px, py, result);
-                            // Media resolucion: la linea sombreada rellena tambien
-                            // la de abajo. El limite es 'height' y no 'height - 1'
-                            // porque el registro guarda el alto real menos uno (ver
-                            // DrawPixel).
-                            if (half_res && py + 1 <= fb_height) {
-                                fb.DrawPixel(px, py + 1, result);
-                            }
+                            draw_scaled(px, py, result);
                         }
                         counters.drawn++;
                     }
@@ -1539,7 +1535,7 @@ std::array<Common::Vec4<u8>, 4> RasterizerSoftware::TextureColor(
             // ahi la comprobacion.
             const u8* texture_data = (texture_address == unit.base_address)
                                          ? unit.data
-                                         : memory.GetPhysicalPointer(texture_address);
+                                         : memory.GetPhysicalPointerThreadSafe(texture_address);
             const auto& info = unit.info;
 
             // TODO: Apply the min and mag filters to the texture

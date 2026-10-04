@@ -15,6 +15,4 @@ elf/
 Thumbs.db
 .vs/
 *.user
-
-# Sello de compilacion generado por build.sh (fecha + hash de git)
-src/citra_vita/vita_build_info.inc
+build.log

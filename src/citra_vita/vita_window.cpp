@@ -3,19 +3,25 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <psp2/ctrl.h>
 #include <psp2/touch.h>
+#include <fmt/format.h>
+#include <string>
 #include "citra_vita/vita_version.h"
 #include "citra_vita/vita_window.h"
 #include "common/settings.h"
+#include "audio_core/dsp_interface.h"
 #include "core/3ds.h"
+#include "core/arm/dyncom/arm_dyncom_jit.h"
 #include "core/arm/dyncom/arm_dyncom_trans.h"
 #include "common/vita_diag.h"
 #include "core/core.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_gxm/gxm_pica_format.h"
 #include "video_core/renderer_gxm/gxm_presenter.h"
+#include "video_core/renderer_gxm/rasterizer_gxm.h"
 #include "video_core/renderer_gxm/renderer_gxm.h"
 #include "video_core/renderer_software/renderer_software.h"
 #include "video_core/renderer_software/sw_rasterizer.h"
@@ -65,6 +71,7 @@ EmuWindow_Vita::EmuWindow_Vita() {
     // UploadScreenNative, cuando el fotograma se presenta por ese camino. Con
     // la presentacion por GXM no se usan, y crearlas aqui serian ~1 MB de CDRAM
     // ocupados para nada (vita2d las reserva en CDRAM por defecto).
+    layout_mode = g_screen_layout.load(std::memory_order_relaxed);
     BuildLayout();
 }
 
@@ -75,20 +82,46 @@ EmuWindow_Vita::~EmuWindow_Vita() {
     if (bottom_texture != nullptr) {
         vita2d_free_texture(bottom_texture);
     }
+    if (overlay_texture != nullptr) {
+        vita2d_free_texture(overlay_texture);
+    }
+}
+
+EmuWindow_Vita::ScreenRects EmuWindow_Vita::RectsFor(int layout) {
+    switch (layout) {
+    case 1: // superior x1.6 a la izquierda, inferior 1:1 a la derecha
+        return {0, 80, 640, 384, 640, 152, 320, 240};
+    case 2: // lado a lado: superior x1.2, inferior x1.5
+        return {0, 128, 480, 288, 480, 92, 480, 360};
+    case 3: // solo superior, x2
+        return {80, 32, 800, 480, 0, 0, 0, 0};
+    case 4: // solo superior, pantalla completa (x2.27, misma proporcion)
+        return {27, 0, 906, 544, 0, 0, 0, 0};
+    default: // normal, 1:1
+        return {static_cast<int>(kTopLeft), static_cast<int>(kTopTop),
+                static_cast<int>(kTopWidth), static_cast<int>(kTopHeight),
+                static_cast<int>(kBottomLeft), static_cast<int>(kBottomTop),
+                static_cast<int>(kBottomWidth), static_cast<int>(kBottomHeight)};
+    }
 }
 
 void EmuWindow_Vita::BuildLayout() {
+    // La disposicion del menu de ajustes (0.1.7.1). El tactil usa estos mismos
+    // rectangulos, asi que sigue a la pantalla inferior donde este.
+    const ScreenRects rects = RectsFor(layout_mode);
     Layout::FramebufferLayout layout{};
     layout.width = kVitaScreenWidth;
     layout.height = kVitaScreenHeight;
     layout.top_screen_enabled = true;
-    layout.bottom_screen_enabled = true;
+    layout.bottom_screen_enabled = rects.bottom_w > 0;
     layout.is_rotated = true;
-    layout.top_screen = Common::Rectangle<u32>{kTopLeft, kTopTop, kTopLeft + kTopWidth,
-                                               kTopTop + kTopHeight};
-    layout.bottom_screen = Common::Rectangle<u32>{kBottomLeft, kBottomTop,
-                                                  kBottomLeft + kBottomWidth,
-                                                  kBottomTop + kBottomHeight};
+    layout.top_screen = Common::Rectangle<u32>{
+        static_cast<u32>(rects.top_x), static_cast<u32>(rects.top_y),
+        static_cast<u32>(rects.top_x + rects.top_w), static_cast<u32>(rects.top_y + rects.top_h)};
+    layout.bottom_screen = Common::Rectangle<u32>{
+        static_cast<u32>(rects.bottom_x), static_cast<u32>(rects.bottom_y),
+        static_cast<u32>(rects.bottom_x + rects.bottom_w),
+        static_cast<u32>(rects.bottom_y + rects.bottom_h)};
 
     NotifyFramebufferLayoutChanged(layout);
 }
@@ -115,6 +148,9 @@ void EmuWindow_Vita::PollEvents() {
 }
 
 void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
+    // Atajos en partida desactivados: los ajustes son fijos salvo el volumen.
+    (void)buttons;
+    return;
     // SELECT + L baja el salto de fotogramas, SELECT + R lo sube.
     //
     // Se ajusta en caliente a proposito: cada recompilacion son ~15 minutos, y
@@ -128,7 +164,8 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
     const bool l = (buttons & SCE_CTRL_LTRIGGER) != 0;
     const bool r = (buttons & SCE_CTRL_RTRIGGER) != 0;
 
-    // L+R a la vez (sin SELECT) enciende y apaga la media resolucion vertical.
+    // L+R a la vez (sin SELECT) cambia entre resolucion 1x y 0.5x (0.1.5.1: antes era
+    // solo media resolucion vertical). Lo mismo que el menu de ajustes.
     // Es un interruptor, no un ajuste: se pulsa una vez para encender y otra
     // para apagar. No choca con el ajuste de salto de fotogramas, que pide
     // SELECT ademas de uno solo de los dos gatillos.
@@ -139,25 +176,69 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
             const bool current =
                 SwRenderer::FrameSkip::half_resolution.load(std::memory_order_relaxed);
             SwRenderer::FrameSkip::half_resolution.store(!current, std::memory_order_relaxed);
+            Common::VitaNote("tecla", current ? "L+R: resolucion 1x" : "L+R: resolucion 0.5x");
         }
         return;
     }
     halfres_combo_held = false;
 
-    // SELECT + ARRIBA recorre los modos de ablacion, que saltan partes del
-    // bucle de pixeles para medir su coste con el FPS de la escena real. Es un
-    // modo de diagnostico que rompe la imagen a proposito.
-    const bool ablate = select && ((buttons & SCE_CTRL_UP) != 0);
-    if (ablate) {
-        if (!ablation_combo_held) {
-            ablation_combo_held = true;
-            u32 value = SwRenderer::Ablation::mode.load(std::memory_order_relaxed);
-            value = (value >= SwRenderer::Ablation::kMax) ? 0 : value + 1;
-            SwRenderer::Ablation::mode.store(value, std::memory_order_relaxed);
+    /**
+     * SELECT + ARRIBA y SELECT + ABAJO ya no cambian la ablacion (0.1.8.7). Eran
+     * modos de diagnostico que rompen la imagen o mandan lotes a software a
+     * proposito, y en la partida de 0.1.8.6 se activo uno sin querer: el 3D de
+     * Zafiro Alfa cayo a 1 FPS con "gxm skip: ablacion" en crash.txt.
+     */
+
+    // SELECT + DERECHA enciende y apaga el JIT del ARM11 (0.1.4.8), para
+    // comparar en la misma escena con y sin el. Ver arm_dyncom_jit.h.
+    const bool jit_toggle = select && ((buttons & SCE_CTRL_RIGHT) != 0);
+    if (jit_toggle) {
+        if (!jit_combo_held) {
+            jit_combo_held = true;
+            const u32 current = Core::ArmJit::mode.load(std::memory_order_relaxed);
+            Core::ArmJit::mode.store(current != 0 ? 0 : 1, std::memory_order_relaxed);
+            Common::VitaNote("tecla", current != 0 ? "SELECT+DERECHA: JIT apagado"
+                                                   : "SELECT+DERECHA: JIT encendido");
         }
         return;
     }
-    ablation_combo_held = false;
+    jit_combo_held = false;
+
+    // SELECT + IZQUIERDA: estirado de audio encendido/apagado (0.1.4.9). Ver
+    // el comentario del sonido en main.cpp.
+    const bool stretch_toggle = select && ((buttons & SCE_CTRL_LEFT) != 0);
+    if (stretch_toggle) {
+        if (!stretch_combo_held) {
+            stretch_combo_held = true;
+            auto& system = Core::System::GetInstance();
+            if (system.IsPoweredOn()) {
+                audio_stretching = !audio_stretching;
+                system.DSP().EnableStretching(audio_stretching);
+                Common::VitaNote("tecla", audio_stretching ? "SELECT+IZQUIERDA: sonido estirado"
+                                                           : "SELECT+IZQUIERDA: sonido directo");
+            }
+        }
+        return;
+    }
+    stretch_combo_held = false;
+
+    // SELECT + TRIANGULO oculta o muestra el overlay de estadisticas (0.1.5.2,
+    // 4.10). ovl mide ~2.3 ms por fotograma solo de pintar texto: apagado se
+    // recupera ese tiempo y la pantalla queda limpia para jugar. El propio
+    // overlay dice ovl ON/OFF cuando esta visible, y SELECT+TRIANGULO otra
+    // vez lo vuelve a poner. TRIANGULO es el X del 3DS; con SELECT delante no
+    // lo pisa ningun juego (mismo criterio que el resto de combos).
+    const bool overlay_toggle = select && ((buttons & SCE_CTRL_TRIANGLE) != 0);
+    if (overlay_toggle) {
+        if (!overlay_combo_held) {
+            overlay_combo_held = true;
+            stats_overlay_visible = !stats_overlay_visible;
+            Common::VitaNote("tecla", stats_overlay_visible ? "SELECT+TRIANGULO: overlay ON"
+                                                            : "SELECT+TRIANGULO: overlay OFF");
+        }
+        return;
+    }
+    overlay_combo_held = false;
 
     const bool down = select && l;
     const bool up = select && r;
@@ -180,6 +261,9 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
         value--;
     }
     SwRenderer::FrameSkip::interval.store(value, std::memory_order_relaxed);
+    Common::VitaNote("tecla", fmt::format("SELECT+{}: salto de fotogramas {}", up ? "R" : "L",
+                                          value)
+                                  .c_str());
 }
 
 void EmuWindow_Vita::UpdateTouch() {
@@ -209,32 +293,13 @@ void EmuWindow_Vita::UpdateTouch() {
     }
 }
 
-void EmuWindow_Vita::UploadScreen(vita2d_texture* texture, const std::vector<u8>& pixels,
-                                  u32 src_width, u32 src_height) {
-    if (texture == nullptr || pixels.empty()) {
-        return;
-    }
-
-    u8* dest = static_cast<u8*>(vita2d_texture_get_datap(texture));
-    const u32 dest_stride = vita2d_texture_get_stride(texture);
-    const u32 src_stride = src_width * 4;
-
-    if (pixels.size() < static_cast<std::size_t>(src_stride) * src_height) {
-        return;
-    }
-
-    // ScreenInfo guarda RGBA byte a byte, igual que SCE_GXM_TEXTURE_FORMAT_A8B8G8R8
-    // en little-endian, asi que no hace falta convertir pixel a pixel: basta
-    // copiar fila a fila respetando el stride de la textura.
-    if (dest_stride == src_stride) {
-        std::memcpy(dest, pixels.data(), static_cast<std::size_t>(src_stride) * src_height);
-        return;
-    }
-    for (u32 y = 0; y < src_height; y++) {
-        std::memcpy(dest + static_cast<std::size_t>(y) * dest_stride,
-                    pixels.data() + static_cast<std::size_t>(y) * src_stride, src_stride);
-    }
-}
+// Aqui habia un UploadScreen(texture, pixels, ancho, alto) que no llamaba nadie:
+// era el camino viejo, de cuando ScreenInfo traia los pixeles ya convertidos a
+// RGBA8. Desde que la conversion la hace la GPU, ese formato fijo ya no se
+// cumple, y desde que el framebuffer no se copia (ver ScreenInfo::source) el
+// vector que recibia esta siempre vacio. Se quita en vez de dejarlo: una funcion
+// muerta que ademas documenta una suposicion que ya es falsa solo sirve para
+// que alguien la use dentro de seis meses.
 
 // La tabla de formatos GXM y el numero de bytes por pixel de cada formato del
 // 3DS viven en video_core/renderer_gxm/gxm_pica_format.h: los necesitan tanto
@@ -243,7 +308,9 @@ void EmuWindow_Vita::UploadScreen(vita2d_texture* texture, const std::vector<u8>
 // (rojo y azul intercambiados). Ver alli el porque de cada sufijo _RGB/_RGBA.
 
 void EmuWindow_Vita::UploadScreenNative(vita2d_texture*& texture, const ScreenInfoRef& info) {
-    if (!info.valid || info.pixels.empty()) {
+    // 'source' apunta al framebuffer del invitado, no a una copia: ver
+    // ScreenInfo::source en renderer_software.h.
+    if (!info.valid || info.source == nullptr) {
         return;
     }
 
@@ -274,13 +341,16 @@ void EmuWindow_Vita::UploadScreenNative(vita2d_texture*& texture, const ScreenIn
     const u32 row_bytes = info.width * Gxm::BytesPerPixelFor(info.format);
 
     if (dest_stride == src_stride) {
-        // Caso normal: una sola copia de bloque, sin tocar un solo pixel.
-        std::memcpy(dest, info.pixels.data(), static_cast<std::size_t>(src_stride) * info.height);
+        // Caso normal: una sola copia de bloque, sin tocar un solo pixel. Se
+        // acota con source_size porque el origen es ahora memoria del invitado.
+        std::memcpy(dest, info.source,
+                    std::min<std::size_t>(static_cast<std::size_t>(src_stride) * info.height,
+                                          info.source_size));
         return;
     }
     for (u32 y = 0; y < info.height; y++) {
         std::memcpy(dest + static_cast<std::size_t>(y) * dest_stride,
-                    info.pixels.data() + static_cast<std::size_t>(y) * src_stride, row_bytes);
+                    info.source + static_cast<std::size_t>(y) * src_stride, row_bytes);
     }
 }
 
@@ -320,9 +390,13 @@ void EmuWindow_Vita::DrawRotatedScreen(vita2d_texture* texture, const ScreenInfo
     const float center_x = static_cast<float>(left) + static_cast<float>(draw_w) * 0.5f;
     const float center_y = static_cast<float>(top) + static_cast<float>(draw_h) * 0.5f;
 
-    vita2d_draw_texture_rotate_hotspot(texture, center_x, center_y, -kHalfPi,
-                                       static_cast<float>(info.width) * 0.5f,
-                                       static_cast<float>(info.height) * 0.5f);
+    // Escalado al rectangulo pedido (0.1.7.1, disposiciones de pantalla). La
+    // textura esta girada: su ancho (240) acaba siendo el ALTO en pantalla.
+    const float x_scale = static_cast<float>(draw_h) / static_cast<float>(info.width);
+    const float y_scale = static_cast<float>(draw_w) / static_cast<float>(info.height);
+    vita2d_draw_texture_scale_rotate_hotspot(texture, center_x, center_y, x_scale, y_scale,
+                                             -kHalfPi, static_cast<float>(info.width) * 0.5f,
+                                             static_cast<float>(info.height) * 0.5f);
 }
 
 void EmuWindow_Vita::PresentScreens() {
@@ -355,6 +429,57 @@ void EmuWindow_Vita::PresentScreens() {
         top = &sw_renderer.Screen(VideoCore::ScreenId::TopLeft);
         bottom = &sw_renderer.Screen(VideoCore::ScreenId::Bottom);
     }
+
+    // Disposicion de pantallas del menu de ajustes (0.1.7.1).
+    const int wanted_layout = g_screen_layout.load(std::memory_order_relaxed);
+    if (wanted_layout != layout_mode) {
+        layout_mode = wanted_layout;
+        BuildLayout();
+        has_presented = false;
+    }
+
+    /**
+     * NO REPETIR UNA IMAGEN QUE NO HA CAMBIADO (0.1.7.1).
+     *
+     * Presentar (subir las dos pantallas a la GPU y dibujarlas) costaba ~19 ms
+     * de cada vblank en la cinematica de Rubi Omega (sub 8 + dib 11), y el juego
+     * solo produce una imagen nueva cada DOS vblanks: la mitad de las veces se
+     * subia y se dibujaba exactamente lo mismo. Si desde la ultima presentacion
+     * la GPU emulada no ha hecho nada que pueda cambiar la imagen (ni listas de
+     * comandos, ni rellenos, ni transferencias, ni DMA; ver
+     * GxStats::frame_work) y los framebuffers son los mismos, no se presenta:
+     * la Vita sigue mostrando el ultimo, que es identico.
+     *
+     * Lo unico que no se ve asi es un juego que dibuje en el framebuffer con la
+     * CPU sin pasar por la GPU. Para eso esta el interruptor del menu.
+     */
+    if (g_skip_repeated_frames.load(std::memory_order_relaxed)) {
+        const unsigned long long work =
+            VideoCore::GxStats::frame_work.load(std::memory_order_relaxed);
+        const u32 fill_colors =
+            (static_cast<u32>(top->fill_r) << 24) | (static_cast<u32>(top->fill_g) << 16) |
+            (static_cast<u32>(bottom->fill_r) << 8) | static_cast<u32>(bottom->fill_b);
+        const bool same = has_presented && work == last_frame_work &&
+                          top->source_address == last_top_address &&
+                          bottom->source_address == last_bottom_address &&
+                          top->source == last_top_source && bottom->source == last_bottom_source &&
+                          top->fill_enabled == last_top_fill &&
+                          bottom->fill_enabled == last_bottom_fill &&
+                          fill_colors == last_fill_colors;
+        last_frame_work = work;
+        last_top_address = top->source_address;
+        last_bottom_address = bottom->source_address;
+        last_top_source = top->source;
+        last_bottom_source = bottom->source;
+        last_top_fill = top->fill_enabled;
+        last_bottom_fill = bottom->fill_enabled;
+        last_fill_colors = fill_colors;
+        if (same) {
+            return;
+        }
+    }
+    has_presented = true;
+    const ScreenRects rects = RectsFor(layout_mode);
 
     /**
      * El presentador GXM se crea la primera vez que se presenta con la API GXM
@@ -392,15 +517,53 @@ void EmuWindow_Vita::PresentScreens() {
     // dibujos y esperar al barrido son tres cosas con costes muy distintos, y
     // sumadas no dicen nada sobre cual hay que arreglar.
     const unsigned long long draw_begin = Common::VitaMicros();
+    const Common::ScopedVitaStage stage{"presentar"};
+    /**
+     * EL OVERLAY, EN UNA TEXTURA (0.1.9.6). Pintar sus ~30 lineas de texto
+     * costaba ~2,5 ms en CADA fotograma ("ovl"), y las cifras solo cambian una
+     * vez por segundo. Ahora se pintan en una textura cuando cambian, fuera de
+     * la escena de la pantalla, y cada fotograma la pone encima con un quad.
+     * Sin textura (sin memoria de video), como antes: directo cada fotograma.
+     */
+    bool overlay_from_texture = false;
+    {
+        const unsigned long long overlay_begin = Common::VitaMicros();
+        if (stats_overlay_visible && overlay_texture == nullptr) {
+            overlay_texture = vita2d_create_empty_texture_rendertarget(
+                kVitaScreenWidth, kVitaScreenHeight, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+            stats_next_update_us = 0;
+        }
+        if (stats_overlay_visible && overlay_texture != nullptr) {
+            overlay_from_texture = true;
+            if (sceKernelGetProcessTimeWide() >= stats_next_update_us) {
+                const unsigned int clear_color = vita2d_get_clear_color();
+                vita2d_start_drawing_advanced(overlay_texture, 0);
+                vita2d_set_clear_color(RGBA8(0, 0, 0, 0));
+                vita2d_clear_screen();
+                DrawStatsOverlay();
+                vita2d_end_drawing();
+                vita2d_set_clear_color(clear_color);
+            }
+        } else if (!stats_overlay_visible) {
+            // Solo las cifras y las notas de crash.txt: no pinta nada.
+            DrawStatsOverlay();
+        }
+        Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
+    }
     vita2d_start_drawing();
     vita2d_clear_screen();
     if (use_gxm) {
-        gxm_presenter->Draw(*top, *bottom, {kTopLeft, kTopTop, kTopWidth, kTopHeight},
-                            {kBottomLeft, kBottomTop, kBottomWidth, kBottomHeight});
+        gxm_presenter->Draw(*top, *bottom, {rects.top_x, rects.top_y, rects.top_w, rects.top_h},
+                            {rects.bottom_x, rects.bottom_y, rects.bottom_w, rects.bottom_h});
     } else {
-        DrawRotatedScreen(top_texture, *top, kTopLeft, kTopTop, kTopWidth, kTopHeight);
-        DrawRotatedScreen(bottom_texture, *bottom, kBottomLeft, kBottomTop, kBottomWidth,
-                          kBottomHeight);
+        DrawRotatedScreen(top_texture, *top, static_cast<u32>(rects.top_x),
+                          static_cast<u32>(rects.top_y), static_cast<u32>(rects.top_w),
+                          static_cast<u32>(rects.top_h));
+        if (rects.bottom_w > 0) {
+            DrawRotatedScreen(bottom_texture, *bottom, static_cast<u32>(rects.bottom_x),
+                              static_cast<u32>(rects.bottom_y), static_cast<u32>(rects.bottom_w),
+                              static_cast<u32>(rects.bottom_h));
+        }
     }
 
     // Estado para el overlay. El presentador puede apagarse a mitad de partida
@@ -409,14 +572,32 @@ void EmuWindow_Vita::PresentScreens() {
     BuildLine(presenter_line, sizeof(presenter_line), "pres ",
               gxm_api ? gxm_presenter->Status() : "vita2d (software)");
 
-    DrawStatsOverlay();
+    {
+        // El overlay, medido aparte (0.1.0.45): son ~30 lineas de texto por
+        // fotograma, y ese coste solo existe mientras se mira. Sin separarlo,
+        // 'dib' mezclaba lo que cuesta presentar el juego con lo que cuesta
+        // medirlo.
+        const unsigned long long overlay_begin = Common::VitaMicros();
+        if (overlay_from_texture) {
+            vita2d_draw_texture(overlay_texture, 0.0f, 0.0f);
+        } else if (stats_overlay_visible) {
+            DrawStatsOverlay();
+        }
+        Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
+    }
     vita2d_end_drawing();
     Common::FrameStats::Add(Common::FrameStats::draw_us, draw_begin);
 
     // vita2d_swap_buffers espera a que la GPU acabe y al barrido de pantalla.
     // Casi todo lo que se mida aqui es la consola PARADA, no trabajo: por eso va
     // en su propio contador y el overlay lo pinta aparte.
+    const int vblank_wait = g_unlimited_speed.load(std::memory_order_relaxed) ? 0 : 1;
+    if (vblank_wait != applied_vblank_wait) {
+        applied_vblank_wait = vblank_wait;
+        vita2d_set_vblank_wait(vblank_wait);
+    }
     const unsigned long long swap_begin = Common::VitaMicros();
+    Common::VitaStageSlot().store("presentar: swap", std::memory_order_relaxed);
     vita2d_swap_buffers();
     Common::FrameStats::Add(Common::FrameStats::swap_us, swap_begin);
 
@@ -511,7 +692,42 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     const SceUInt64 now_us = sceKernelGetProcessTimeWide();
     if (now_us >= stats_next_update_us) {
         const auto stats = Core::System::GetInstance().GetAndResetPerfStats();
-        stats_game_fps = stats.game_fps;
+        {
+            // Media de 5 s: ver fps_frames en vita_window.h.
+            const double seconds =
+                fps_last_us != 0 ? static_cast<double>(now_us - fps_last_us) / 1e6 : 0.0;
+            fps_last_us = now_us;
+            if (seconds > 0.0) {
+                fps_frames[fps_slot] = stats.game_fps * seconds;
+                fps_seconds[fps_slot] = seconds;
+                fps_slot = (fps_slot + 1) % kFpsWindows;
+            }
+            double frames = 0.0;
+            double total = 0.0;
+            for (int i = 0; i < kFpsWindows; i++) {
+                frames += fps_frames[i];
+                total += fps_seconds[i];
+            }
+            stats_game_fps = total > 0.0 ? frames / total : stats.game_fps;
+        }
+        {
+            const double interval_us =
+                stats_gpu_last_us != 0 ? static_cast<double>(now_us - stats_gpu_last_us) : 0.0;
+            stats_gpu_last_us = now_us;
+            const double busy = static_cast<double>(
+                VideoCore::GxStats::thread_busy_us.exchange(0, std::memory_order_relaxed));
+            const double wait = static_cast<double>(
+                VideoCore::GxStats::emu_wait_us.exchange(0, std::memory_order_relaxed));
+            stats_gpu_busy_percent = interval_us > 0.0 ? busy / interval_us * 100.0 : 0.0;
+            stats_gpu_wait_percent = interval_us > 0.0 ? wait / interval_us * 100.0 : 0.0;
+            stats_gpu_irq_waits =
+                VideoCore::GxStats::irq_waits.exchange(0, std::memory_order_relaxed);
+            stats_gpu_syncs = VideoCore::GxStats::syncs.exchange(0, std::memory_order_relaxed);
+            stats_gpu_present_waits =
+                VideoCore::GxStats::present_waits.exchange(0, std::memory_order_relaxed);
+            stats_gpu_queue_max =
+                VideoCore::GxStats::queue_max.exchange(0, std::memory_order_relaxed);
+        }
         stats_speed_percent = stats.emulation_speed * 100.0;
 
         // Reparto del tiempo dentro de cada fotograma. time_vblank_interval es
@@ -550,7 +766,232 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             stats_convert_ms = per_frame_ms(Common::FrameStats::convert_us);
             stats_upload_ms = per_frame_ms(Common::FrameStats::upload_us);
             stats_draw_ms = per_frame_ms(Common::FrameStats::draw_us);
+            stats_overlay_ms = per_frame_ms(Common::FrameStats::overlay_us);
+            stats_dsp_ms = per_frame_ms(Common::FrameStats::dsp_us);
+            {
+                /**
+                 * JIT del ARM11. Desde 0.1.4.9 todo sale de TakeStats: las dos
+                 * cuentas del porcentaje las hace el propio JIT en el mismo
+                 * sitio (en 0.1.4.8 salian de dos lugares distintos y daban un
+                 * imposible 170 %).
+                 */
+                Core::ArmJit::Stats jit{};
+                Core::ArmJit::TakeStats(jit);
+                const double guest = static_cast<double>(jit.instructions);
+                stats_guest_mips = guest / n / 1000000.0;
+                stats_jit_percent =
+                    guest > 0.0 ? static_cast<double>(jit.jit_instructions) / guest * 100.0 : 0.0;
+                // El ARM de verdad: el bucle menos lo que se va dentro de las
+                // llamadas al sistema (que incluyen toda la GPU emulada).
+                stats_arm_ms = static_cast<double>(jit.arm_us > jit.svc_us ? jit.arm_us - jit.svc_us : 0) / n / 1000.0;
+                stats_arm_slices = static_cast<double>(jit.slices) / n;
+                stats_arm_dispatches = static_cast<double>(jit.dispatches) / n;
+                stats_arm_links = static_cast<double>(jit.links) / n;
+                stats_arm_slow = static_cast<double>(jit.slow_calls) / n;
+                stats_arm_vfp = static_cast<double>(jit.vfp_calls) / n;
+                stats_arm_interp_k =
+                    static_cast<double>(jit.instructions > jit.jit_instructions
+                                            ? jit.instructions - jit.jit_instructions
+                                            : 0) /
+                    n / 1000.0;
+                {
+                    const auto to_ms = [n](u64 us) { return static_cast<double>(us) / n / 1000.0; };
+                    stats_arm_jit_ms = to_ms(jit.jit_us);
+                    stats_arm_slow_ms = to_ms(jit.slow_us);
+                    stats_arm_vfp_ms = to_ms(jit.vfp_us);
+                    stats_arm_check_ms = to_ms(jit.check_us);
+                    stats_arm_compile_ms = to_ms(jit.compile_us);
+                    const double rest = stats_arm_ms - stats_arm_jit_ms - stats_arm_check_ms -
+                                        stats_arm_compile_ms;
+                    stats_arm_rest_ms = rest > 0.0 ? rest : 0.0;
+                }
+                {
+                    // Cada 10 s a crash.txt: los datos llegan aunque no haya
+                    // captura (0.1.6.3). Treinta veces desde 0.2.0.0 (eran
+                    // nueve): las escenas 3D que se prueban llegan despues de
+                    // las intros, y con nueve se quedaban fuera.
+                    static u32 arm_ticks = 0;
+                    static u32 arm_notes = 0;
+                    if (++arm_ticks % 10 == 0 && arm_notes < 30) {
+                        arm_notes++;
+                        Common::VitaNote(
+                            "arm desglose",
+                            fmt::format("ms {:.1f} arm {:.1f} jit {:.0f}% Mi {:.2f} rod {:.0f} desp "
+                                        "{:.0f} enl {:.0f} lent {:.0f} vfp {:.0f} int {:.1f}k "
+                                        "vtx {:.1f} sh {:.1f} vsh {}",
+                                        stats_frame_ms, stats_arm_ms, stats_jit_percent,
+                                        stats_guest_mips, stats_arm_slices,
+                                        stats_arm_dispatches, stats_arm_links, stats_arm_slow,
+                                        stats_arm_vfp, stats_arm_interp_k, stats_vertices_ms,
+                                        stats_shade_ms, stats_vertices_shaded)
+                                .c_str());
+                        Common::VitaNote(
+                            "arm tiempos",
+                            fmt::format("ms por fotograma: jit {:.1f} (lento {:.1f} vfp {:.1f}) "
+                                        "comprobar {:.1f} compilar {:.1f} resto {:.1f} dsp {:.1f}",
+                                        stats_arm_jit_ms, stats_arm_slow_ms, stats_arm_vfp_ms,
+                                        stats_arm_check_ms, stats_arm_compile_ms,
+                                        stats_arm_rest_ms, stats_dsp_ms)
+                                .c_str());
+                        // Y el desglose de un vertice (0.1.7.2), en us por vertice.
+                        const double s = static_cast<double>(
+                            Common::FrameStats::vtx_samples.exchange(0, std::memory_order_relaxed));
+                        const double l = static_cast<double>(
+                            Common::FrameStats::vtx_load_us.exchange(0, std::memory_order_relaxed));
+                        const double r = static_cast<double>(
+                            Common::FrameStats::vtx_run_us.exchange(0, std::memory_order_relaxed));
+                        const double o = static_cast<double>(
+                            Common::FrameStats::vtx_out_us.exchange(0, std::memory_order_relaxed));
+                        if (s > 0.0) {
+                            Common::VitaNote("vertice",
+                                             fmt::format("us por vertice: leer {:.2f} shader {:.2f} "
+                                                         "salida {:.2f} ({:.0f} muestras)",
+                                                         l / s, r / s, o / s, s)
+                                                 .c_str());
+                        }
+                    }
+                }
+                // El motivo de rechazo que mas despachos se lleva, en % de los
+                // despachos del intervalo: dice que traducir despues.
+                stats_jit_top_reject = 0;
+                u64 top = 0;
+                for (u32 i = 1; i < Core::ArmJit::kRejectCount; i++) {
+                    if (jit.rejects[i] > top) {
+                        top = jit.rejects[i];
+                        stats_jit_top_reject = i;
+                    }
+                }
+                stats_jit_top_reject_percent =
+                    jit.dispatches > 0 ? static_cast<double>(top) /
+                                             static_cast<double>(jit.dispatches) * 100.0
+                                       : 0.0;
+                stats_jit_blocks = Common::FrameStats::jit_blocks.load(std::memory_order_relaxed);
+                stats_jit_rejected =
+                    Common::FrameStats::jit_rejected.load(std::memory_order_relaxed);
+                stats_jit_checks =
+                    Common::FrameStats::jit_checks.exchange(0, std::memory_order_relaxed);
+                stats_jit_mismatches =
+                    Common::FrameStats::jit_mismatches.load(std::memory_order_relaxed);
+                stats_jit_on = Core::ArmJit::mode.load(std::memory_order_relaxed) != 0;
+            }
             stats_swapwait_ms = per_frame_ms(Common::FrameStats::swap_us);
+            // El reparto de cmdlist. Va AQUI DENTRO y antes del Reset: fuera no
+            // existe per_frame_ms, y despues del Reset los contadores ya valen
+            // cero y la linea saldria siempre a 0.0.
+            stats_vertices_ms = per_frame_ms(Common::FrameStats::vertices_us);
+            stats_batch_ms = per_frame_ms(Common::FrameStats::batch_us);
+            stats_vertices_shaded =
+                Common::FrameStats::vertices_shaded.exchange(0, std::memory_order_relaxed);
+            stats_shade_ms = per_frame_ms(Common::FrameStats::shade_us);
+            {
+                const double busy = static_cast<double>(
+                    Common::FrameStats::shade_busy_us.load(std::memory_order_relaxed));
+                const double wall = static_cast<double>(
+                    Common::FrameStats::shade_us.load(std::memory_order_relaxed));
+                stats_shade_occupancy = wall > 0.0 ? busy / (3.0 * wall) * 100.0 : 0.0;
+                const double fast_ops = static_cast<double>(
+                    Common::FrameStats::shade_fast_ops.exchange(0, std::memory_order_relaxed));
+                const double slow = static_cast<double>(
+                    Common::FrameStats::shade_slow_instrs.exchange(0, std::memory_order_relaxed));
+                // Ya leido y puesto a cero justo arriba: se usa la copia.
+                const double shaded = static_cast<double>(stats_vertices_shaded);
+                stats_instrs_per_vertex = shaded > 0.0 ? (fast_ops + slow) / shaded : 0.0;
+                stats_fast_percent =
+                    (fast_ops + slow) > 0.0 ? fast_ops / (fast_ops + slow) * 100.0 : 0.0;
+            }
+            stats_finish_ms = per_frame_ms(Common::FrameStats::finish_us);
+            stats_texdecode_ms = per_frame_ms(Common::FrameStats::texture_decode_us);
+            stats_texrehash_ms = per_frame_ms(Common::FrameStats::texture_rehash_us);
+            stats_texrehash_kb = static_cast<double>(Common::FrameStats::texture_rehash_bytes.load(
+                                     std::memory_order_relaxed)) /
+                                 n / 1024.0;
+            stats_texdecodes =
+                Common::FrameStats::texture_decodes.exchange(0, std::memory_order_relaxed);
+            stats_texreuses =
+                Common::FrameStats::texture_reuses.exchange(0, std::memory_order_relaxed);
+            stats_texchanged =
+                Common::FrameStats::texture_changed.exchange(0, std::memory_order_relaxed);
+            stats_texevictions =
+                Common::FrameStats::texture_evictions.exchange(0, std::memory_order_relaxed);
+            stats_fast_programs =
+                Common::FrameStats::fast_programs.load(std::memory_order_relaxed);
+            stats_fast_checks =
+                Common::FrameStats::fast_checks.exchange(0, std::memory_order_relaxed);
+            stats_fast_mismatches =
+                Common::FrameStats::fast_mismatches.load(std::memory_order_relaxed);
+            /**
+             * 0.1.5.2 (4.2a y 4.7): anota en crash.txt, una vez por segundo,
+             * las 5 instrucciones de shader que mas veces han caido a la ruta
+             * lenta y el reparto de escrituras de registro PICA / fills /
+             * transfers. Solo medir: sin esto, "rap 80%" no dice que instruccion
+             * meter a la ruta rapida ni que parte del "resto de gx" es decodificar
+             * registros frente a rellenos y transferencias.
+             *
+             * 0.1.5.8: solo las CINCO primeras veces. Cada nota es abrir,
+             * escribir y cerrar crash.txt en la tarjeta de memoria, en el hilo
+             * que presenta: una por segundo subio "ovl" de 2 a 17 ms por
+             * fotograma en 0.1.5.7 (202 notas en una sesion).
+             */
+            // 0.1.8.3: cada 10 s y seis veces, no los cinco primeros segundos:
+            // esos son el menu y la carga, y el shader que importa (el de piel
+            // en el 3D) no salia nunca (crash.txt de 0.1.8.2).
+            static u32 gx_ticks = 0;
+            static u32 gx_notes = 0;
+            if (++gx_ticks % 10 == 0 && gx_notes < 6) {
+                gx_notes++;
+                struct {
+                    u32 op;
+                    unsigned long long count;
+                } top[5] = {};
+                for (u32 i = 0; i < Common::FrameStats::kSlowOpcodeSlots; i++) {
+                    const unsigned long long c =
+                        Common::FrameStats::shade_slow_opcodes[i].exchange(
+                            0, std::memory_order_relaxed);
+                    if (c == 0) {
+                        continue;
+                    }
+                    int slot = -1;
+                    for (int j = 0; j < 5; j++) {
+                        if (c > top[j].count) {
+                            slot = j;
+                            break;
+                        }
+                    }
+                    if (slot < 0) {
+                        continue;
+                    }
+                    for (int j = 4; j > slot; j--) {
+                        top[j] = top[j - 1];
+                    }
+                    top[slot].op = i;
+                    top[slot].count = c;
+                }
+                if (top[0].count > 0) {
+                    std::string line = fmt::format(
+                        "vs lenta top5: {:02x}={:} {:02x}={:} {:02x}={:} {:02x}={:} {:02x}={:}",
+                        top[0].op, top[0].count, top[1].op, top[1].count, top[2].op,
+                        top[2].count, top[3].op, top[3].count, top[4].op, top[4].count);
+                    Common::VitaNote("vs lenta", line.c_str());
+                }
+                const unsigned long long reg_n =
+                    Common::FrameStats::pica_reg_writes.exchange(0, std::memory_order_relaxed);
+                const unsigned long long reg_ns =
+                    Common::FrameStats::pica_reg_write_ns.exchange(0, std::memory_order_relaxed);
+                const unsigned long long fills =
+                    VideoCore::GxStats::fill_count.exchange(0, std::memory_order_relaxed);
+                const unsigned long long transfers =
+                    VideoCore::GxStats::transfer_count.exchange(0, std::memory_order_relaxed);
+                const unsigned long long cmdlists =
+                    VideoCore::GxStats::cmdlist_count.exchange(0, std::memory_order_relaxed);
+                if (reg_n > 0 || fills > 0 || transfers > 0 || cmdlists > 0) {
+                    Common::VitaNote(
+                        "gx 4.7",
+                        fmt::format("regw n={} t_us={:.1} fill={} tran={} cmdl={}", reg_n,
+                                    static_cast<double>(reg_ns) / 1000.0, fills, transfers,
+                                    cmdlists)
+                            .c_str());
+                }
+            }
             Common::FrameStats::Reset();
         }
 
@@ -558,6 +999,20 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         // vacian aqui, una vez por intervalo, para que la linea diga la
         // proporcion del ultimo segundo.
         stats_tri_gpu = Gxm::RasterizerGXM::gpu_triangles.exchange(0, std::memory_order_relaxed);
+        stats_gpu_batches = Gxm::RasterizerGXM::gpu_batches.exchange(0, std::memory_order_relaxed);
+        stats_hw_vs_batches =
+            Gxm::RasterizerGXM::hw_vs_batches.exchange(0, std::memory_order_relaxed);
+        stats_hw_vs_rejects =
+            Gxm::RasterizerGXM::hw_vs_rejects.exchange(0, std::memory_order_relaxed);
+        stats_hw_vs_reason =
+            Gxm::RasterizerGXM::hw_vs_last_reject.load(std::memory_order_relaxed);
+        stats_gpu_scenes = Gxm::RasterizerGXM::gpu_scenes.exchange(0, std::memory_order_relaxed);
+        stats_gpu_writebacks =
+            Gxm::RasterizerGXM::gpu_writebacks.exchange(0, std::memory_order_relaxed);
+        stats_close_full =
+            Gxm::RasterizerGXM::scene_close_full.exchange(0, std::memory_order_relaxed);
+        stats_close_lut =
+            Gxm::RasterizerGXM::scene_close_lut.exchange(0, std::memory_order_relaxed);
         stats_tri_sw =
             Gxm::RasterizerGXM::software_triangles.exchange(0, std::memory_order_relaxed);
 
@@ -787,11 +1242,130 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             stats_gx_transfer = 0.0;
         }
 
+        /**
+         * Vaciados de la cache de traduccion EN ESTE INTERVALO (0.1.0.43).
+         *
+         * Antes se mostraba el total desde el arranque, acotado a 9999, y en
+         * Rubi Omega salia 9999 fijo: no habia forma de saber si los vaciados
+         * venian de la carga (ldr_ro parchea los CRO palabra a palabra y cada
+         * parche vacia la cache entera) o si seguian ocurriendo en cada
+         * fotograma, que es lo que importaria para el tiempo de 'cpu'.
+         */
+        {
+            std::size_t by_capacity = 0;
+            std::size_t by_invalidation = 0;
+            GetTransCacheFlushCounts(by_capacity, by_invalidation);
+            stats_flushes_capacity = by_capacity - last_flushes_capacity;
+            stats_flushes_invalidation = by_invalidation - last_flushes_invalidation;
+            last_flushes_capacity = by_capacity;
+            last_flushes_invalidation = by_invalidation;
+        }
+        {
+            /**
+             * EL OVERLAY EN crash.txt (0.1.8.1): cada 10 s las lineas que
+             * dicen donde se va el fotograma. Sin esto cada prueba en consola
+             * necesitaba una captura de pantalla, y crash.txt es lo unico que
+             * llega siempre. Treinta veces (5 minutos) desde 0.2.0.0: con
+             * seis solo salia el primer minuto, que suele ser la intro.
+             */
+            static u32 frame_ticks = 0;
+            static u32 frame_notes = 0;
+            if (++frame_ticks % 10 == 0 && frame_notes < 30) {
+                frame_notes++;
+                Common::VitaNote(
+                    "fotograma",
+                    fmt::format("fps {:.1f} vel {:.0f}% | ms {:.1f} cpu {:.1f} gx {:.1f} svc {:.1f} "
+                                "vtx {:.1f} lote {:.1f} dsp {:.1f} | conv {:.1f} sub {:.1f} "
+                                "dib {:.1f} ovl {:.1f} esp {:.1f} | sh {:.1f} fin {:.1f} tx {:.1f}",
+                                stats_game_fps, stats_speed_percent, stats_frame_ms, stats_cpu_ms,
+                                stats_gx_ms, stats_svc_ms, stats_vertices_ms, stats_batch_ms,
+                                stats_dsp_ms, stats_convert_ms, stats_upload_ms, stats_draw_ms,
+                                stats_overlay_ms, stats_swapwait_ms, stats_shade_ms,
+                                stats_finish_ms, stats_texdecode_ms)
+                        .c_str());
+                Common::VitaNote(
+                    "gpu",
+                    fmt::format("tri/fot {:.0f} | tg {} ts {} lot {} vsg {} no {} ({}) vsh {} "
+                                "esc {} vol {} | gx tri {:.0f}% rell {:.0f}% tran {:.0f}% | "
+                                "par {:.0f} ins {:.0f} rap {:.0f}% | copia gpu {} de verdad {} | relleno gpu {} "
+                                "sinc soft {} | saltados por compilar {}",
+                                stats_triangles_per_frame, stats_tri_gpu, stats_tri_sw,
+                                stats_gpu_batches, stats_hw_vs_batches, stats_hw_vs_rejects,
+                                Gxm::RasterizerGXM::TakeRejectSummary(),
+                                stats_vertices_shaded, stats_gpu_scenes, stats_gpu_writebacks,
+                                stats_gx_cmdlist, stats_gx_fill, stats_gx_transfer,
+                                stats_shade_occupancy, stats_instrs_per_vertex, stats_fast_percent,
+                                Gxm::RasterizerGXM::gpu_transfers.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::transfer_materialized.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::gpu_fills.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::software_syncs.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::skipped_batches.exchange(
+                                    0, std::memory_order_relaxed))
+                        .c_str());
+                // Lo que cuesta cargar modelos nuevos (0.2.1.1): texturas
+                // decodificadas o revisadas, y las esperas enteras a la GPU.
+                Common::VitaNote(
+                    "texturas",
+                    fmt::format("decodificadas {} ({:.1f} ms/fot) | revisadas iguales {} "
+                                "cambiadas {} expulsadas {} (hash {:.1f} ms y {:.0f} KB por fot) "
+                                "| escenas cerradas por vertices {} por tablas de luz {} | "
+                                "espera a la gpu {:.1f} ms/fot",
+                                stats_texdecodes, stats_texdecode_ms, stats_texreuses,
+                                stats_texchanged, stats_texevictions, stats_texrehash_ms,
+                                stats_texrehash_kb, stats_close_full, stats_close_lut,
+                                stats_finish_ms)
+                        .c_str());
+                Common::VitaNote(
+                    "gpu hilo",
+                    fmt::format("{} | ocupado {:.0f}% ({:.1f} ms/fot) | juego esperando {:.0f}% "
+                                "({:.1f} ms/fot) | esperas irq {} sinc {} pres {} | cola max {}",
+                                VideoCore::GPU::async_enabled.load(std::memory_order_relaxed)
+                                    ? "ON"
+                                    : "off",
+                                stats_gpu_busy_percent,
+                                stats_gpu_busy_percent * stats_frame_ms / 100.0,
+                                stats_gpu_wait_percent,
+                                stats_gpu_wait_percent * stats_frame_ms / 100.0,
+                                stats_gpu_irq_waits, stats_gpu_syncs, stats_gpu_present_waits,
+                                stats_gpu_queue_max)
+                        .c_str());
+                Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
+                Common::VitaNote("jit otro", Core::ArmJit::TakeRejectWords().c_str());
+                u32 code_bytes = 0;
+                u32 code_blocks = 0;
+                Core::ArmJit::CodeUsage(code_bytes, code_blocks);
+                Common::VitaNote(
+                    "jit",
+                    fmt::format("{} {:.0f}% Mi {:.2f} arm {:.1f} | bloques {} rechazados {} "
+                                "comprobados {} diferencias {} | rech {} {:.0f}% | codigo {} KB "
+                                "{} B/bloque",
+                                stats_jit_on ? "ON" : "off", stats_jit_percent, stats_guest_mips,
+                                stats_arm_ms, stats_jit_blocks, stats_jit_rejected,
+                                stats_jit_checks, stats_jit_mismatches,
+                                Core::ArmJit::RejectName(stats_jit_top_reject),
+                                stats_jit_top_reject_percent, code_bytes / 1024,
+                                code_blocks != 0 ? code_bytes / code_blocks : 0)
+                        .c_str());
+            }
+        }
         stats_next_update_us = now_us + 1'000'000;
     }
 
-    char line1[16] = "FPS ";
-    std::size_t n1 = 4;
+    // 4.10 (0.1.5.2): SELECT+TRIANGULO apaga solo el DIBUJADO del overlay
+    // (ver UpdateFrameSkipControl). Los contadores de arriba SIGUEN
+    // actualizandose y anotando en crash.txt: si se saltara el bloque de
+    // arriba, los atomics se acumularian sin Reset y no saldrian ni las notas
+    // de 4.2a/4.7. Lo unico que se ahorra aqui es el coste de 'ovl' (~2.3 ms).
+    if (!stats_overlay_visible) {
+        return;
+    }
+
+    char line1[20] = "FPS(5s) ";
+    std::size_t n1 = 8;
     AppendOneDecimal(line1, n1, stats_game_fps);
     line1[n1] = '\0';
 
@@ -807,9 +1381,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     // igual con un buffer infinito. Son enteros pequenos en la practica, pero
     // se acotan a 9999 por si acaso: el buffer es de sobra para eso, no para un
     // desbordamiento real.
-    std::size_t flushes_capacity = 0;
-    std::size_t flushes_invalidation = 0;
-    GetTransCacheFlushCounts(flushes_capacity, flushes_invalidation);
+    const std::size_t flushes_capacity = stats_flushes_capacity;
+    const std::size_t flushes_invalidation = stats_flushes_invalidation;
 
     char line3[32] = "cache cap ";
     std::size_t n3 = 10;
@@ -856,15 +1429,14 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     }
 
     // La version en pantalla evita la duda de "seguro que instalaste la nueva?".
-    // Se anade el sello de compilacion (fecha + hash de git), que cambia en cada
-    // build aunque la version no se toque.
-    static char build_line[112];
-    if (build_line[0] == '\0') {
-        BuildLine(build_line, sizeof(build_line), kOverlayBuild, kBuildInfo);
-    }
-    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 20, 0xFF60C0FF, 0.7f, build_line);
+    // Detras, ovl ON/OFF: como el overlay puede apagarse entero (SELECT+TRIANGULO),
+    // hay que poder saber SIN overlay si esta encendido -- si no, al ver una
+    // captura limpia no se distingue "lo apago yo" de "no lo pinta".
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 20, 0xFF60C0FF, 0.8f, kOverlayBuild);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 38, 0xFFA0A0A0, 0.8f, line1);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 56, 0xFFA0A0A0, 0.8f, line2);
+    // Solo version, FPS y velocidad; el resto de lineas no se dibuja.
+    return;
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 80, 0xFFA0A0A0, 0.8f, line_cpu);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 98, 0xFFA0A0A0, 0.8f, line_gpu);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 116, 0xFFA0A0A0, 0.8f, line_svc);
@@ -932,22 +1504,54 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     // El reloj real de la CPU y el coste medido por pixel. Los dos existen
     // porque llevaba toda la sesion deduciendo ciclos por pixel a partir de una
     // frecuencia que nunca comprobe y de cifras derivadas de otras cifras.
-    char line_hw[64] = "cpu ";
+    char line_hw[192] = "cpu ";
     std::size_t nh = 4;
     nh += AppendUInt(line_hw + nh, static_cast<unsigned int>(Common::g_arm_clock_mhz));
-    const char* hw_label = "MHz  ns/px ";
-    // ...y al final, si la FPU llego a ver denormales antes de activar FZ.
-    for (std::size_t i = 0; hw_label[i] != '\0'; i++) {
-        line_hw[nh++] = hw_label[i];
-    }
-    nh += AppendUInt(line_hw + nh,
-                     static_cast<unsigned int>(std::min(stats_ns_per_pixel, 999999.0)));
-    // 'denorm si' = la FPU vio denormales ANTES de que se activara flush-to-zero.
-    // Es la confirmacion de la hipotesis: con FZ apagado, cada uno de esos se
-    // sale a codigo de soporte y cuesta cientos de ciclos.
-    const char* denorm_label = Common::VitaSawDenormals() ? "  denorm SI" : "  denorm no";
-    for (std::size_t i = 0; denorm_label[i] != '\0'; i++) {
-        line_hw[nh++] = denorm_label[i];
+    // 0.1.4.9: fuera 'ns/px' y 'denorm' de esta linea. Eran medidas del
+    // rasterizador de software, que ya casi no dibuja nada (salian a 0), y la
+    // linea hace falta para el JIT.
+    line_hw[nh++] = 'M';
+    line_hw[nh++] = 'H';
+    line_hw[nh++] = 'z';
+    /**
+     * El JIT del ARM11 (0.1.4.8), en la misma linea:
+     *   jit ON/off   estado (SELECT + DERECHA lo cambia)
+     *   N%           instrucciones del juego que ha ejecutado el JIT
+     *   Mi X         millones de instrucciones del juego por vblank (JIT +
+     *                interprete): con 'cpu' da el coste por instruccion
+     *   b N x N      bloques compilados / rechazados (desde el arranque)
+     *   c N          bloques comprobados contra el interprete (por segundo)
+     *   d N          DIFERENCIAS (desde el arranque): tiene que ser 0; si no,
+     *                crash.txt dice que bloque y que registro
+     */
+    {
+        const auto append_text = [&](const char* text) {
+            for (std::size_t i = 0; text[i] != '\0'; i++) {
+                line_hw[nh++] = text[i];
+            }
+        };
+        append_text(stats_jit_on ? "  jit ON " : "  jit off ");
+        nh += AppendUInt(line_hw + nh, static_cast<unsigned int>(stats_jit_percent + 0.5));
+        append_text("% Mi ");
+        AppendOneDecimal(line_hw, nh, stats_guest_mips);
+        // arm = ms reales del bucle del ARM por vblank (dentro de 'cpu').
+        append_text(" arm ");
+        AppendOneDecimal(line_hw, nh, stats_arm_ms);
+        append_text(" b");
+        nh += AppendUInt(line_hw + nh, stats_jit_blocks);
+        append_text(" x");
+        nh += AppendUInt(line_hw + nh, stats_jit_rejected);
+        append_text(" c");
+        nh += AppendUInt(line_hw + nh, stats_jit_checks);
+        append_text(" d");
+        nh += AppendUInt(line_hw + nh, stats_jit_mismatches);
+        // rech = lo que mas se queda en el interprete, y en que % de despachos.
+        append_text(" rech ");
+        append_text(Core::ArmJit::RejectName(stats_jit_top_reject));
+        line_hw[nh++] = ' ';
+        nh += AppendUInt(line_hw + nh,
+                         static_cast<unsigned int>(stats_jit_top_reject_percent + 0.5));
+        line_hw[nh++] = '%';
     }
     line_hw[nh] = '\0';
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 332, 0xFF80FF80, 0.8f, line_hw);
@@ -981,13 +1585,28 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     line_skip[ns] = '\0';
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 260, 0xFF80FF80, 0.8f, line_skip);
 
-    // Marcador de media resolucion. Verde cuando esta apagada, naranja cuando
-    // esta encendida: es una perdida de calidad y conviene que se note que el
-    // modo esta puesto, no que pase desapercibido.
+    // Marcador de la resolucion: verde en 1x, naranja en 0.5x. Es una perdida
+    // de calidad y conviene que se note que el modo esta puesto, no que pase
+    // desapercibido.
     const bool half_on = SwRenderer::FrameSkip::half_resolution.load(std::memory_order_relaxed);
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 356,
                          half_on ? 0xFF40C0FF : 0xFF80FF80, 0.8f,
-                         half_on ? "media res SI  L+R" : "media res no  L+R");
+                         half_on ? "res 0.5x  L+R" : "res 1x  L+R");
+    {
+        /**
+         * Desglose del ARM por fotograma (0.1.6.3), a la derecha de "res":
+         *   rod = rodajas del ARM         desp = bloques despachados
+         *   enl = enlaces en el codigo    lent = accesos lentos a memoria
+         *   vfp = aritmetica VFP           int = miles de instrucciones por el
+         *                                        interprete
+         */
+        char line_arm[96];
+        std::snprintf(line_arm, sizeof(line_arm), "rod %.0f desp %.0f enl %.0f lent %.0f vfp %.0f int %.1fk",
+                      stats_arm_slices, stats_arm_dispatches, stats_arm_links, stats_arm_slow,
+                      stats_arm_vfp, stats_arm_interp_k);
+        vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX) + 110, 356, 0xFF80FF80,
+                             0.8f, line_arm);
+    }
 
     // De los pixeles cubiertos, los que mueren en la prueba de alfa y los que
     // mueren en la de profundidad final. Decision que desbloquean: si manda
@@ -1008,6 +1627,22 @@ void EmuWindow_Vita::DrawStatsOverlay() {
 
     // Formatos de textura que se usan de verdad, por unidades y triangulo.
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 380, 0xFFFFA0A0, 0.8f, line_fail);
+    {
+        /**
+         * El reparto de 'arm' en ms por fotograma (0.1.7.5):
+         *   jit = codigo generado; lento y vfp son la parte de jit que se va en
+         *         los caminos lentos de memoria y en la VFP por funcion
+         *   chk = comprobaciones contra el interprete   cmp = compilar
+         *   rst = lo que queda: interprete y despacho
+         */
+        char line_armt[96];
+        std::snprintf(line_armt, sizeof(line_armt),
+                      "jit %.1f (lento %.1f vfp %.1f) chk %.1f cmp %.1f rst %.1f",
+                      stats_arm_jit_ms, stats_arm_slow_ms, stats_arm_vfp_ms, stats_arm_check_ms,
+                      stats_arm_compile_ms, stats_arm_rest_ms);
+        vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX) + 130, 380, 0xFF80FF80,
+                             0.8f, line_armt);
+    }
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 398, 0xFFFFA0A0, 0.8f,
                          stats_format_line);
 
@@ -1016,7 +1651,6 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     //   set = % del tiempo en preparar el triangulo
     //   esp = % esperando a los hilos (raster en paralelo)
     //   un  = % rasterizando en el propio hilo (triangulos pequenos)
-    // Y debajo, el modo de ablacion vigente (SELECT+ARRIBA lo cambia).
     const auto append_labeled_percent = [](char* out, std::size_t& n, const char* label,
                                            double value) {
         for (std::size_t i = 0; label[i] != '\0'; i++) {
@@ -1042,7 +1676,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     //   ras = que parte de las listas de comandos es ProcessTriangle. Lo que
     //         quede fuera (vertices, recorte, decodificacion) es el techo de lo
     //         que puede dar cualquier optimizacion del bucle de pixeles.
-    char line_occ[64];
+    char line_occ[176];
     std::size_t noc = 0;
     append_labeled_percent(line_occ, noc, "ocu ", stats_occupancy_percent);
     append_labeled_percent(line_occ, noc, "  ras ", stats_raster_share_percent);
@@ -1059,6 +1693,52 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             line_occ[noc++] = sw_label[i];
         }
         noc += AppendUInt(line_occ + noc, stats_tri_sw);
+        // lot = lotes en la GPU. tg/lot es el tamano medio de lote: con lotes
+        // pequenos manda el coste fijo por lote y con lotes grandes el de por
+        // triangulo, y lo que hay que optimizar es lo contrario en cada caso.
+        const char* batch_label = " lot ";
+        for (std::size_t i = 0; batch_label[i] != '\0'; i++) {
+            line_occ[noc++] = batch_label[i];
+        }
+        noc += AppendUInt(line_occ + noc, stats_gpu_batches);
+        // vsg = de esos lotes, cuantos con el shader de vertices en la GPU
+        // (0.1.4.6). Si es 0 con 'lot' alto, crash.txt dice por que.
+        const char* hwvs_label = " vsg ";
+        for (std::size_t i = 0; hwvs_label[i] != '\0'; i++) {
+            line_occ[noc++] = hwvs_label[i];
+        }
+        noc += AppendUInt(line_occ + noc, stats_hw_vs_batches);
+        // no = lotes que el shader de vertices en la GPU no pudo coger, y el
+        // ultimo motivo (0.1.4.9): lo que hay que arreglar para subir 'vsg'.
+        const char* hwvs_no_label = " no ";
+        for (std::size_t i = 0; hwvs_no_label[i] != '\0'; i++) {
+            line_occ[noc++] = hwvs_no_label[i];
+        }
+        noc += AppendUInt(line_occ + noc, stats_hw_vs_rejects);
+        line_occ[noc++] = ' ';
+        for (std::size_t i = 0; stats_hw_vs_reason[i] != '\0' && i < 28; i++) {
+            line_occ[noc++] = stats_hw_vs_reason[i];
+        }
+        // vsh = vertices que han pasado por el interprete. Si iguala a tg*3 es
+        // que el cache de vertices no sirve de nada aqui (dibujado no indexado).
+        const char* shaded_label = " vsh ";
+        for (std::size_t i = 0; shaded_label[i] != '\0'; i++) {
+            line_occ[noc++] = shaded_label[i];
+        }
+        noc += AppendUInt(line_occ + noc, stats_vertices_shaded);
+        // esc = escenas cerradas (cada una para la GPU); vol = volcados del
+        // framebuffer (cada uno convierte la imagen entera). Los dos deberian
+        // ser un punado por fotograma; si son decenas, ahi esta el tiempo.
+        const char* scene_label = " esc ";
+        for (std::size_t i = 0; scene_label[i] != '\0'; i++) {
+            line_occ[noc++] = scene_label[i];
+        }
+        noc += AppendUInt(line_occ + noc, stats_gpu_scenes);
+        const char* wb_label = " vol ";
+        for (std::size_t i = 0; wb_label[i] != '\0'; i++) {
+            line_occ[noc++] = wb_label[i];
+        }
+        noc += AppendUInt(line_occ + noc, stats_gpu_writebacks);
     }
     line_occ[noc] = '\0';
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 452, 0xFF80D0FF, 0.8f, line_occ);
@@ -1085,7 +1765,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
      *          entero en la CPU; si crece al cambiar de backend grafico, es que
      *          ahora se espera mas al barrido, no que se trabaje mas.
      */
-    char line_ms[64];
+    char line_ms[96];
     {
         std::size_t n = 0;
         const char* label = "ms ";
@@ -1102,10 +1782,16 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         append(" cpu ", stats_cpu_ms);
         append(" gx ", stats_gx_ms);
         append(" svc ", stats_svc_ms);
+        // El reparto de cmdlist: 'vtx' es el bucle de vertices entero y 'lote'
+        // nuestro camino de GPU. Lo que sobre de gx es decodificar comandos.
+        append(" vtx ", stats_vertices_ms);
+        append(" lote ", stats_batch_ms);
+        // dsp = sonido emulado (0.1.7.7); no se suma: va dentro de cpu y svc.
+        append(" dsp ", stats_dsp_ms);
         line_ms[n] = '\0';
     }
 
-    char line_pres[64];
+    char line_pres[128];
     {
         std::size_t n = 0;
         const char* label = "conv ";
@@ -1121,7 +1807,26 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         };
         append(" sub ", stats_upload_ms);
         append(" dib ", stats_draw_ms);
+        // ovl = la parte de 'dib' que es este overlay (0.1.0.45).
+        append(" ovl ", stats_overlay_ms);
         append(" esp ", stats_swapwait_ms);
+        // par = ocupacion de los tres nucleos al sombrear (100 = los tres
+        // trabajando todo el rato); ins = instrucciones de shader por vertice;
+        // rap = % de ellas por la ruta rapida (0.1.0.45).
+        const auto append_whole = [&](const char* text, double value) {
+            for (std::size_t i = 0; text[i] != '\0'; i++) {
+                line_pres[n++] = text[i];
+            }
+            n += AppendUInt(line_pres + n, static_cast<unsigned int>(value + 0.5));
+        };
+        append_whole(" par ", stats_shade_occupancy);
+        append_whole(" ins ", stats_instrs_per_vertex);
+        append_whole(" rap ", stats_fast_percent);
+        // snd = sonido con estirado (est) o directo (dir). SELECT + IZQUIERDA.
+        const char* snd_label = audio_stretching ? " snd est" : " snd dir";
+        for (std::size_t i = 0; snd_label[i] != '\0'; i++) {
+            line_pres[n++] = snd_label[i];
+        }
         line_pres[n] = '\0';
     }
 
@@ -1134,19 +1839,56 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 506,
                          presenter_uses_gxm ? 0xFF60FFC0 : 0xFFA0A0A0, 0.8f, presenter_line);
 
-    const u32 ablation_mode = SwRenderer::Ablation::mode.load(std::memory_order_relaxed);
-    char line_abl[40] = "abl ";
-    std::size_t nab = 4;
-    nab += AppendUInt(line_abl + nab, ablation_mode);
-    line_abl[nab++] = ' ';
-    const char* ablation_name = SwRenderer::Ablation::Name(ablation_mode);
-    for (std::size_t i = 0; ablation_name[i] != '\0' && nab < sizeof(line_abl) - 1; i++) {
-        line_abl[nab++] = ablation_name[i];
+    /**
+     * sh  = sombrear vertices (tiempo de pared, ya repartido en tres nucleos)
+     * fin = parado esperando a la GPU al cerrar escenas (sceGxmFinish)
+     * tx  = texturas decodificadas en el intervalo y los ms por fotograma
+     * ll / lu = escenas cerradas por buffer de vertices lleno / tablas de luz
+     *
+     * Es la linea que dice si 0.1.0.42 ha hecho lo que se esperaba: 'sh'
+     * deberia quedar en torno a un tercio de lo que era 'vtx', y ll/lu en cero.
+     */
+    char line_sh[96];
+    {
+        std::size_t n = 0;
+        const char* label = "sh ";
+        for (std::size_t i = 0; label[i] != '\0'; i++) {
+            line_sh[n++] = label[i];
+        }
+        AppendMillis(line_sh, n, stats_shade_ms);
+        const auto append_text = [&](const char* text) {
+            for (std::size_t i = 0; text[i] != '\0'; i++) {
+                line_sh[n++] = text[i];
+            }
+        };
+        append_text(" fin ");
+        AppendMillis(line_sh, n, stats_finish_ms);
+        append_text(" tx ");
+        n += AppendUInt(line_sh + n, stats_texdecodes);
+        line_sh[n++] = '/';
+        AppendMillis(line_sh, n, stats_texdecode_ms);
+        // r = reutilizadas por hash, c = cambiadas, e = expulsadas por sitio.
+        append_text(" r");
+        n += AppendUInt(line_sh + n, stats_texreuses);
+        append_text(" c");
+        n += AppendUInt(line_sh + n, stats_texchanged);
+        append_text(" e");
+        n += AppendUInt(line_sh + n, stats_texevictions);
+        append_text(" ll ");
+        n += AppendUInt(line_sh + n, stats_close_full);
+        append_text(" lu ");
+        n += AppendUInt(line_sh + n, stats_close_lut);
+        // vs = programas en la ruta rapida / comprobados en el intervalo /
+        // DIFERENCIAS (tiene que ser 0; si no, crash.txt dice donde).
+        append_text(" vs ");
+        n += AppendUInt(line_sh + n, stats_fast_programs);
+        line_sh[n++] = '/';
+        n += AppendUInt(line_sh + n, stats_fast_checks);
+        line_sh[n++] = '/';
+        n += AppendUInt(line_sh + n, stats_fast_mismatches);
+        line_sh[n] = '\0';
     }
-    line_abl[nab] = '\0';
-    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 434,
-                         ablation_mode == SwRenderer::Ablation::kNormal ? 0xFF80D0FF : 0xFF40C0FF,
-                         0.8f, line_abl);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 524, 0xFF60FFC0, 0.8f, line_sh);
 }
 
 } // namespace VitaFrontend

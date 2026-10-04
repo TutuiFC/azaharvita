@@ -10,6 +10,10 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_software/sw_blitter.h"
 #include "video_core/utils.h"
+#ifdef __PSVITA__
+#include <fmt/format.h>
+#include "common/vita_diag.h"
+#endif
 
 namespace SwRenderer {
 
@@ -117,6 +121,148 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
     }
 }
 
+namespace {
+/**
+ * Mosaico -> lineal con el MISMO formato, que es la transferencia de cada
+ * fotograma: del framebuffer donde se dibuja al que barre la pantalla.
+ *
+ * El bucle general de mas abajo decodifica y vuelve a codificar CADA pixel, y
+ * ademas recalcula por pixel cosas que son constantes en toda la transferencia:
+ * los bytes por pixel de los dos formatos (un switch cada uno), cual de las
+ * cuatro combinaciones de disposicion toca, y el desplazamiento Morton. Cuando
+ * los dos formatos coinciden, todo ese ir y venir produce exactamente los
+ * mismos bytes que mover la memoria de sitio.
+ *
+ * Y se puede mover de dos en dos. En el orden Morton de 8x8, fijada la fila,
+ * los texels de x par e impar caen seguidos (la fila de abajo del mosaico es
+ * 00 01 04 05 16 17 20 21), y en el lado lineal x y x+1 tambien lo son. Aqui
+ * los dos lados tienen el mismo tamano de pixel, asi que la pareja es contigua
+ * en ambos y vale para 2, 3 y 4 bytes.
+ *
+ * Medido en consola: estas transferencias eran el 45% del tiempo de GPU
+ * emulada, unos 51 ms de un fotograma de 143.
+ */
+template <u32 kBpp>
+void UntileSameFormat(const u8* src, u8* dst, u32 output_width, u32 output_height,
+                      u32 input_width, bool flip_vertically) {
+    const u32 full_tiles = output_width & ~7u;
+    for (u32 y = 0; y < output_height; ++y) {
+        const u32 output_y = flip_vertically ? (output_height - y - 1) : y;
+        u8* const dst_row = dst + static_cast<std::size_t>(output_y) * output_width * kBpp;
+        const u8* const tile_row =
+            src + static_cast<std::size_t>(y & ~7u) * input_width * kBpp;
+
+        u32 pair_offset[4];
+        for (u32 k = 0; k < 4; k++) {
+            pair_offset[k] = VideoCore::GetMortonOffset(k * 2, y, kBpp);
+        }
+
+        for (u32 tile_x = 0; tile_x < full_tiles; tile_x += 8) {
+            // GetMortonOffset ya mete el salto de mosaico en su termino
+            // coarse_x, asi que aqui solo se suma el del mosaico en curso.
+            const u8* const tile_base =
+                tile_row + static_cast<std::size_t>(tile_x) * 8 * kBpp;
+            u8* const linear_base = dst_row + static_cast<std::size_t>(tile_x) * kBpp;
+            for (u32 k = 0; k < 4; k++) {
+                std::memcpy(linear_base + k * 2 * kBpp, tile_base + pair_offset[k], kBpp * 2);
+            }
+        }
+        for (u32 x = full_tiles; x < output_width; ++x) {
+            std::memcpy(dst_row + static_cast<std::size_t>(x) * kBpp,
+                        tile_row + VideoCore::GetMortonOffset(x, y, kBpp), kBpp);
+        }
+    }
+}
+/**
+ * Mosaico RGBA8 -> lineal RGB8, sin escalado: la copia de pantalla de Pokemon.
+ *
+ * Pokemon (y muchos otros) dibuja en RGBA8 y su buffer de pantalla es RGB8
+ * (crash.txt: "fmt 0" en el de dibujo, "formato 1" en el de pantalla). Con
+ * formatos distintos no se aplicaba UntileSameFormat y caia al bucle general,
+ * que por cada pixel recalcula el Morton y pasa por dos switch de formato.
+ *
+ * La conversion es solo mover bytes: RGBA8 guarda A,B,G,R (DecodeRGBA8 lee
+ * r = byte 3, g = 2, b = 1) y EncodeRGB8 escribe b, g, r en los bytes 0, 1, 2.
+ * O sea, el pixel de salida son los bytes 1, 2 y 3 del de entrada, en orden:
+ * los mismos bytes que produce el bucle general.
+ */
+void UntileRGBA8ToRGB8(const u8* src, u8* dst, u32 output_width, u32 output_height,
+                       u32 input_width, bool flip_vertically) {
+    const u32 full_tiles = output_width & ~7u;
+    for (u32 y = 0; y < output_height; ++y) {
+        const u32 output_y = flip_vertically ? (output_height - y - 1) : y;
+        u8* const dst_row = dst + static_cast<std::size_t>(output_y) * output_width * 3;
+        const u8* const tile_row = src + static_cast<std::size_t>(y & ~7u) * input_width * 4;
+
+        u32 pair_offset[4];
+        for (u32 k = 0; k < 4; k++) {
+            pair_offset[k] = VideoCore::GetMortonOffset(k * 2, y, 4);
+        }
+
+        for (u32 tile_x = 0; tile_x < full_tiles; tile_x += 8) {
+            const u8* const tile_base = tile_row + static_cast<std::size_t>(tile_x) * 8 * 4;
+            u8* out = dst_row + static_cast<std::size_t>(tile_x) * 3;
+            for (u32 k = 0; k < 4; k++) {
+                // La pareja x, x+1 esta seguida en el mosaico (ver arriba).
+                const u8* in = tile_base + pair_offset[k];
+                out[0] = in[1];
+                out[1] = in[2];
+                out[2] = in[3];
+                out[3] = in[5];
+                out[4] = in[6];
+                out[5] = in[7];
+                out += 6;
+            }
+        }
+        for (u32 x = full_tiles; x < output_width; ++x) {
+            const u8* in = tile_row + VideoCore::GetMortonOffset(x, y, 4);
+            u8* out = dst_row + static_cast<std::size_t>(x) * 3;
+            out[0] = in[1];
+            out[1] = in[2];
+            out[2] = in[3];
+        }
+    }
+}
+
+#ifdef __PSVITA__
+/// Cada combinacion distinta de transferencia, una vez, en crash.txt: con eso
+/// se sabe que caminos rapidos faltan sin tener que adivinar. Hasta ocho.
+void NoteTransferConfig(const Pica::DisplayTransferConfig& config, u32 output_width,
+                        u32 output_height) {
+    static u32 seen[8] = {};
+    static u32 seen_count = 0;
+    const u32 signature = static_cast<u32>(config.input_format.Value()) |
+                          static_cast<u32>(config.output_format.Value()) << 4 |
+                          static_cast<u32>(config.scaling.Value()) << 8 |
+                          (config.input_linear ? 1u : 0u) << 12 |
+                          (config.dont_swizzle ? 1u : 0u) << 13 |
+                          (config.flip_vertically ? 1u : 0u) << 14 | (output_width << 16);
+    for (u32 i = 0; i < seen_count; i++) {
+        if (seen[i] == signature) {
+            return;
+        }
+    }
+    if (seen_count == 8) {
+        return;
+    }
+    seen[seen_count++] = signature;
+    Common::VitaNote("transferencia",
+                     fmt::format("fmt {}->{} escala {} lineal {} sin_swz {} flip {} {}x{} -> "
+                                 "{}x{}",
+                                 static_cast<u32>(config.input_format.Value()),
+                                 static_cast<u32>(config.output_format.Value()),
+                                 static_cast<u32>(config.scaling.Value()),
+                                 static_cast<u32>(config.input_linear.Value()),
+                                 static_cast<u32>(config.dont_swizzle.Value()),
+                                 static_cast<u32>(config.flip_vertically.Value()),
+                                 static_cast<u32>(config.input_width.Value()),
+                                 static_cast<u32>(config.input_height.Value()), output_width,
+                                 output_height)
+                         .c_str());
+}
+#endif
+} // Anonymous namespace
+
 void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
     const PAddr src_addr = config.GetPhysicalInputAddress();
     PAddr dst_addr = config.GetPhysicalOutputAddress();
@@ -187,6 +333,9 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
 
     rasterizer->FlushRegion(config.GetPhysicalInputAddress(), input_size);
     rasterizer->InvalidateRegion(config.GetPhysicalOutputAddress(), output_size);
+#ifdef __PSVITA__
+    NoteTransferConfig(config, output_width, output_height);
+#endif
 
     /**
      * Caminos rapidos: transferencias que no transforman nada.
@@ -230,7 +379,56 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
                         static_cast<std::size_t>(output_size));
             return;
         }
+
+        /**
+         * Mosaico -> lineal: deshacer el entrelazado y nada mas.
+         *
+         * Es la transferencia que hace cada juego en cada fotograma para
+         * llevar lo dibujado al buffer que barre la pantalla. Con los dos
+         * formatos iguales no hay nada que convertir, solo recolocar, y eso lo
+         * hace UntileSameFormat de dos pixeles en dos. El bucle general de
+         * abajo llega al mismo resultado decodificando y recodificando pixel a
+         * pixel, que es de donde salia el 45% del tiempo de GPU emulada.
+         */
+        if (!config.input_linear && !config.dont_swizzle) {
+            switch (bytes_per_pixel) {
+            case 2:
+                UntileSameFormat<2>(src_pointer, dst_pointer, output_width, output_height,
+                                    config.input_width, config.flip_vertically != 0);
+                return;
+            case 3:
+                UntileSameFormat<3>(src_pointer, dst_pointer, output_width, output_height,
+                                    config.input_width, config.flip_vertically != 0);
+                return;
+            case 4:
+                UntileSameFormat<4>(src_pointer, dst_pointer, output_width, output_height,
+                                    config.input_width, config.flip_vertically != 0);
+                return;
+            default:
+                // Formato de tamano raro: al bucle general, que lo sabe tratar.
+                break;
+            }
+        }
     }
+
+    if (config.scaling == config.NoScale && !config.input_linear && !config.dont_swizzle &&
+        config.input_format.Value() == Pica::PixelFormat::RGBA8 &&
+        config.output_format.Value() == Pica::PixelFormat::RGB8) {
+        UntileRGBA8ToRGB8(src_pointer, dst_pointer, output_width, output_height,
+                          config.input_width, config.flip_vertically != 0);
+        return;
+    }
+
+    /**
+     * Los bytes por pixel, UNA vez y no por pixel.
+     *
+     * Estaban dentro del bucle interno, y BytesPerPixel es un switch sobre el
+     * formato: dos switches por pixel para leer dos valores que no cambian en
+     * toda la transferencia. Sacarlos deja ademas que el compilador mantenga
+     * los strides en registros.
+     */
+    const u32 dst_bytes_per_pixel = BytesPerPixel(config.output_format);
+    const u32 src_bytes_per_pixel = BytesPerPixel(config.input_format);
 
     for (u32 y = 0; y < output_height; ++y) {
         for (u32 x = 0; x < output_width; ++x) {
@@ -251,8 +449,6 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
                 output_y = y;
             }
 
-            const u32 dst_bytes_per_pixel = BytesPerPixel(config.output_format);
-            const u32 src_bytes_per_pixel = BytesPerPixel(config.input_format);
             u32 src_offset;
             u32 dst_offset;
 

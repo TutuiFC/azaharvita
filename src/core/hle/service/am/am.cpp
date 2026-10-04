@@ -1349,9 +1349,15 @@ std::string GetMediaTitlePath(Service::FS::MediaType media_type) {
                            SYSTEM_ID);
 
     if (media_type == Service::FS::MediaType::SDMC)
+#ifdef __PSVITA__
+        // Aplanado: ver SDMC_TITLE_DIR en fs/archive.h.
+        return fmt::format("{}{}", FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir),
+                           SDMC_TITLE_DIR);
+#else
         return fmt::format("{}Nintendo 3DS/{}/{}/title/",
                            FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir), SYSTEM_ID,
                            SDCARD_ID);
+#endif
 
     if (media_type == Service::FS::MediaType::GameCard) {
         // TODO(B3N30): check if TID matchess

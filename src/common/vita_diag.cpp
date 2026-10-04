@@ -20,6 +20,8 @@ namespace Common {
 
 namespace {
 constexpr char kCrashLog[] = "ux0:/data/azahar/crash.txt";
+/// El crash.txt del juego en curso (0.1.9.7), o vacio. Ver SetVitaGameLog.
+char g_game_log[160] = {};
 
 /// "fichero.cpp:1234" del ultimo fallo fatal. Estatico a proposito: no reserva
 /// memoria, que cuando esto se llena puede que no quede.
@@ -92,11 +94,31 @@ void VitaNote(const char* title, const char* detail) {
     sceIoMkdir("ux0:/data", 0777);
     sceIoMkdir("ux0:/data/azahar", 0777);
     const SceUID fd = sceIoOpen(kCrashLog, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-    if (fd < 0) {
+    if (fd >= 0) {
+        sceIoWrite(fd, line, n);
+        sceIoClose(fd);
+    }
+    if (g_game_log[0] != '\0') {
+        const SceUID game_fd =
+            sceIoOpen(g_game_log, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (game_fd >= 0) {
+            sceIoWrite(game_fd, line, n);
+            sceIoClose(game_fd);
+        }
+    }
+}
+
+void SetVitaGameLog(const char* path) {
+    if (path == nullptr) {
+        g_game_log[0] = '\0';
         return;
     }
-    sceIoWrite(fd, line, n);
-    sceIoClose(fd);
+    std::strncpy(g_game_log, path, sizeof(g_game_log) - 1);
+    g_game_log[sizeof(g_game_log) - 1] = '\0';
+}
+
+const char* VitaGameLog() {
+    return g_game_log;
 }
 
 const char* LastFatalMessage() {
@@ -125,6 +147,26 @@ void VitaAssertFail(const char* file, int line) noexcept {
     // parar. std::terminate en vez de sceKernelExitProcess para que el
     // manejador del frontend llegue a pintar el aviso en pantalla.
     std::terminate();
+}
+
+void VitaSetThreadPriority(int priority, const char* role) {
+    const int before = sceKernelGetThreadCurrentPriority();
+    const int rc = sceKernelChangeThreadPriority(sceKernelGetThreadId(), priority);
+    char buffer[128];
+    std::size_t n = 0;
+    const auto append = [&](const char* text) {
+        for (std::size_t i = 0; text[i] != 0 && n < 96; i++) {
+            buffer[n++] = text[i];
+        }
+    };
+    append(role != nullptr ? role : "?");
+    append(" ");
+    n += AppendUInt(buffer + n, static_cast<unsigned int>(before));
+    append(" -> ");
+    n += AppendUInt(buffer + n, static_cast<unsigned int>(priority));
+    append(rc >= 0 ? ", ok" : ", ERROR");
+    buffer[n] = 0;
+    VitaNote("prioridad", buffer);
 }
 
 void VitaPinThreadToUserCore(unsigned int index, const char* role) {
@@ -177,13 +219,16 @@ void VitaPinThreadToUserCore(unsigned int index, const char* role) {
     }
     n += AppendUInt(buffer + n, static_cast<unsigned int>(actual_core));
 
-    // rc distinto de 0 significa que el kernel rechazo la peticion: sin esto,
-    // una afinidad que no se aplica no se distingue de una que si.
-    const char* result = rc == 0 ? ", ok" : ", ERROR rc ";
+    // Solo un rc NEGATIVO es un error. Si sale bien, la llamada devuelve la
+    // mascara ANTERIOR: 0 en un hilo recien creado, pero 0x70000 ("cualquier
+    // nucleo de usuario") en el hilo principal. Hasta 0.1.0.43 esto comparaba
+    // con 0 y anotaba ese 458752 (0x70000) como "ERROR" en el hilo de
+    // emulacion, cuando la afinidad SI se habia aplicado ("real 0").
+    const char* result = rc >= 0 ? ", ok" : ", ERROR rc ";
     for (std::size_t i = 0; result[i] != 0; i++) {
         buffer[n++] = result[i];
     }
-    if (rc != 0) {
+    if (rc < 0) {
         n += AppendUInt(buffer + n, static_cast<unsigned int>(rc));
     }
     buffer[n] = 0;

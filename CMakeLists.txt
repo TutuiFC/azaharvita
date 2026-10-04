@@ -34,9 +34,9 @@ set(CMAKE_C_STANDARD 11)
 # ---------------------------------------------------------------------------
 # Identidad de la app Vita
 # ---------------------------------------------------------------------------
-set(VITA_APP_NAME "Azahar 0.1.0.25")
-set(VITA_TITLEID  "AZHR00025")
-set(VITA_VERSION  "03.25")
+set(VITA_APP_NAME "Azahar")
+set(VITA_TITLEID  "AZHR00001")
+set(VITA_VERSION  "00.10")
 
 # ---------------------------------------------------------------------------
 # Recorte de funcionalidad para Vita
@@ -131,7 +131,19 @@ set(CITRA_WARNINGS_AS_ERRORS      OFF)
 # (vaciados por falta de sitio) sigue siendo la unica prueba de si se queda
 # corta, y hasta hoy ha salido 0 en todas las medidas. Ampliarla "porque ahora
 # cabe" seria gastar presupuesto sin un numero que lo pida.
-set(AZAHAR_HEAP_MB "216" CACHE STRING "Tamano del heap de la aplicacion en MB")
+#
+# 0.1.8.0: EL REPARTO DEFINITIVO, CON EL NUMERO DE LA CONSOLA. crash.txt de la
+# consola del usuario, en todas las sesiones desde 0.1.6.x: "memoria: usuario
+# 344 MB totales / 128 MB libres, heap 216 MB, ... modo ampliado SI". Y la
+# entrada al 3D de Zafiro Alfa (0.1.7.8 y 0.1.7.9) muere con bad_alloc DENTRO
+# del compilador de shaders: falta heap, no presupuesto. Se pasan 48 de esos
+# 128 MB libres al heap (216 -> 264) y quedan ~80 MB para GXM, vita2d, el JIT y
+# el sistema, que se reservan despues de medir esa linea.
+#
+# PRECIO: 264 MB ya NO caben en el presupuesto normal de ~256 MB. Si algun dia
+# este VPK no arranca (pantalla negra y vuelta a la LiveArea), es que el modo
+# ampliado no se ha concedido: se vuelve a 216 con -DAZAHAR_HEAP_MB=216.
+set(AZAHAR_HEAP_MB "264" CACHE STRING "Tamano del heap de la aplicacion en MB")
 set(AZAHAR_TRANS_CACHE_MB "8" CACHE STRING "Cache de traduccion del interprete en MB")
 
 add_compile_definitions(
@@ -141,18 +153,28 @@ add_compile_definitions(
     __PSVITA__=1
     NDEBUG
 
-    # La libc de la Vita tiene off_t de 4 bytes y no trae fseeko64/ftello64
-    # (comprobado en libc.a), asi que stdio no puede pasar de 2 GB y stat
-    # trunca st_size. Con esto, IOFile usa sceIo (SceOff/SceIoStat de 64 bits)
-    # SOLO para ficheros que no caben en 2 GB; el resto sigue con stdio, que
-    # trae buffer de lectura. Implementacion y razonamiento en
-    # src/common/file_util.h (m_vita_fd).
-    AZAHAR_VITA_NATIVE_IO
-
     # Tiene que ser identico en todo el proyecto: trans_cache_buf se declara
     # extern con este tamano, y si dos ficheros no coinciden el array queda
     # descuadrado y la memoria se corrompe.
     AZAHAR_TRANS_CACHE_MB=${AZAHAR_TRANS_CACHE_MB}
+
+    # E/S de ficheros sobre sceIo en vez de stdio. SIN ESTO NO ABREN LOS ROM DE
+    # MAS DE 2 GB, y el codigo que lo resuelve ya estaba escrito: file_util.cpp
+    # y file_util.h llevan un camino completo bajo este nombre que nadie
+    # encendia, asi que se compilaba fuera entero.
+    #
+    # El motivo esta en la cabecera de IOFile::m_vita_fd: en esta libc off_t son
+    # 4 bytes, no hay fseeko64, y stat::st_size es del mismo tipo. Un ROM de 4
+    # GB justos mide 0x100000000, que truncado a 32 bits da CERO: el emulador
+    # cree que el fichero esta vacio, falla al leer la cabecera y lo reporta
+    # como "Failed to determine system mode", culpando a algo sin relacion.
+    # SceOff y SceIoStat::st_size si son de 64 bits.
+    #
+    # VA AQUI Y NO EN UN TARGET, y esto no es opcional: la macro anade un campo
+    # (m_vita_fd) a IOFile. Si un fichero la ve y otro no, sizeof(IOFile) no
+    # coincide entre unidades de traduccion y la memoria se corrompe sin avisar,
+    # igual que con AZAHAR_TRANS_CACHE_MB de arriba.
+    AZAHAR_VITA_NATIVE_IO=1
 )
 
 # ---------------------------------------------------------------------------

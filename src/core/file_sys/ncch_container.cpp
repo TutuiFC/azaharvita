@@ -207,11 +207,8 @@ Loader::ResultStatus NCCHContainer::LoadHeader() {
             ASSERT(FileUtil::MakeMagic('N', 'C', 'S', 'D') == ncsd_header.magic);
             ASSERT(partition < 8);
 
-            // u64: en ARM de 32 bits (Vita) 'size_t' se desborda a los 4 GB, y
-            // el tamano de una particion grande se quedaria en cero.
-            u64 ncch_offset =
-                static_cast<u64>(ncsd_header.partitions[partition].offset) * kBlockSize;
-            u64 ncch_size = static_cast<u64>(ncsd_header.partitions[partition].size) * kBlockSize;
+            size_t ncch_offset = ncsd_header.partitions[partition].offset * kBlockSize;
+            size_t ncch_size = ncsd_header.partitions[partition].size * kBlockSize;
 
             file = std::make_unique<FileUtil::SubIOFile>(std::move(file), ncch_offset, ncch_size);
 
@@ -334,8 +331,8 @@ Loader::ResultStatus NCCHContainer::Load() {
 
         // DLC can have an ExeFS and a RomFS but no extended header
         if (ncch_header.exefs_size) {
-            u64 exefs_offset = static_cast<u64>(ncch_header.exefs_offset) * block_size;
-            u64 exefs_size = static_cast<u64>(ncch_header.exefs_size) * block_size;
+            u32 exefs_offset = ncch_header.exefs_offset * block_size;
+            u32 exefs_size = ncch_header.exefs_size * block_size;
 
             LOG_DEBUG(Service_FS, "ExeFS offset:                0x{:08X}", exefs_offset);
             LOG_DEBUG(Service_FS, "ExeFS size:                  0x{:08X}", exefs_size);
@@ -607,11 +604,8 @@ Loader::ResultStatus NCCHContainer::ReadRomFS(std::shared_ptr<RomFSReader>& romf
     if (!file || !file->IsOpen())
         return Loader::ResultStatus::Error;
 
-    // u64: en ARM de 32 bits (Vita) estos productos se desbordan a los 4 GB y
-    // el offset/tamano del romfs se quedaria en cero en un juego grande.
-    const u64 romfs_offset =
-        static_cast<u64>(ncch_header.romfs_offset) * block_size + 0x1000;
-    const u64 romfs_size = static_cast<u64>(ncch_header.romfs_size) * block_size - 0x1000;
+    u32 romfs_offset = (ncch_header.romfs_offset * block_size) + 0x1000;
+    u32 romfs_size = (ncch_header.romfs_size * block_size) - 0x1000;
 
     LOG_DEBUG(Service_FS, "RomFS offset:           0x{:08X}", romfs_offset);
     LOG_DEBUG(Service_FS, "RomFS size:             0x{:08X}", romfs_size);

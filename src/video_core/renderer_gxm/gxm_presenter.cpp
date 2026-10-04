@@ -4,15 +4,57 @@
 
 #include "video_core/renderer_gxm/gxm_presenter.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
+#include <arm_neon.h>
 #include <psp2/kernel/modulemgr.h>
 #include "common/logging/log.h"
 #include "common/vita_diag.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
+#include "video_core/renderer_gxm/rasterizer_gxm.h"
 
 namespace Gxm {
+
+/**
+ * Shader de vertices: solo coloca y pasa la coordenada de textura.
+ *
+ * Las posiciones llegan ya en coordenadas de recorte (NDC) calculadas en la
+ * CPU, asi que no hace falta matriz por uniform: son cuatro vertices por
+ * pantalla, y la transformada de pixel a NDC son dos restas y dos divisiones.
+ * Evitar el uniform evita tambien reservarlo y rellenarlo por fotograma.
+ *
+ * El nombre de los parametros importa: Init busca "position" y "texcoord" en
+ * el GXP compilado para ligar los atributos del stream.
+ */
+const char kBlitVertexSource[] = R"(
+void main(float4 position : POSITION,
+          float2 texcoord : TEXCOORD0,
+          out float4 gl_Position : POSITION,
+          out float2 gl_TexCoord : TEXCOORD0)
+{
+    gl_Position = position;
+    gl_TexCoord = texcoord;
+}
+)";
+
+/**
+ * Shader de fragmentos: muestra la textura tal cual.
+ *
+ * La textura que se enlaza puede ser la pantalla del juego o el texel de 1x1
+ * que se usa para el relleno de color, asi que este unico programa cubre los
+ * dos casos. El canal alfa se respeta tal cual viene del framebuffer del 3DS,
+ * que es lo que hace el rasterizador de software.
+ */
+const char kBlitFragmentSource[] = R"(
+uniform sampler2D tex;
+void main(float2 texcoord : TEXCOORD0,
+          out float4 gl_FragColor : COLOR)
+{
+    gl_FragColor = tex2D(tex, texcoord);
+}
+)";
 
 namespace {
 
@@ -57,45 +99,6 @@ void* ShaccCgAlloc(unsigned int size) {
 void ShaccCgFree(void* pointer) {
     std::free(pointer);
 }
-
-/**
- * Shader de vertices: solo coloca y pasa la coordenada de textura.
- *
- * Las posiciones llegan ya en coordenadas de recorte (NDC) calculadas en la
- * CPU, asi que no hace falta matriz por uniform: son cuatro vertices por
- * pantalla, y la transformada de pixel a NDC son dos restas y dos divisiones.
- * Evitar el uniform evita tambien reservarlo y rellenarlo por fotograma.
- *
- * El nombre de los parametros importa: Init busca "position" y "texcoord" en
- * el GXP compilado para ligar los atributos del stream.
- */
-constexpr const char kVertexSource[] = R"(
-void main(float4 position : POSITION,
-          float2 texcoord : TEXCOORD0,
-          out float4 gl_Position : POSITION,
-          out float2 gl_TexCoord : TEXCOORD0)
-{
-    gl_Position = position;
-    gl_TexCoord = texcoord;
-}
-)";
-
-/**
- * Shader de fragmentos: muestra la textura tal cual.
- *
- * La textura que se enlaza puede ser la pantalla del juego o el texel de 1x1
- * que se usa para el relleno de color, asi que este unico programa cubre los
- * dos casos. El canal alfa se respeta tal cual viene del framebuffer del 3DS,
- * que es lo que hace el rasterizador de software.
- */
-constexpr const char kFragmentSource[] = R"(
-uniform sampler2D tex;
-void main(float2 texcoord : TEXCOORD0,
-          out float4 gl_FragColor : COLOR)
-{
-    gl_FragColor = tex2D(tex, texcoord);
-}
-)";
 
 /// Formato de vertice del quad: posicion float4 + coordenada float2. Se
 /// declaran cuatro componentes aunque z y w sean constantes para que el
@@ -153,8 +156,8 @@ bool ScreenPresenter::Init() {
     }
 
     // 3. Los dos programas.
-    vertex_output = CompileShader(SCE_SHACCCG_PROFILE_VP, "azahar_blit_v.cg", kVertexSource);
-    fragment_output = CompileShader(SCE_SHACCCG_PROFILE_FP, "azahar_blit_f.cg", kFragmentSource);
+    vertex_output = CompileShader(SCE_SHACCCG_PROFILE_VP, "azahar_blit_v.cg", kBlitVertexSource);
+    fragment_output = CompileShader(SCE_SHACCCG_PROFILE_FP, "azahar_blit_f.cg", kBlitFragmentSource);
     if (vertex_output == nullptr || fragment_output == nullptr) {
         status = "vita2d (error de shader)";
         return fail("no se han podido compilar los shaders de presentacion", 0);
@@ -291,11 +294,11 @@ void ScreenPresenter::Release() {
         }
     }
     if (vertex_output != nullptr) {
-        sceShaccCgDestroyCompileOutput(vertex_output);
+        ReleaseCgOutput(vertex_output);
         vertex_output = nullptr;
     }
     if (fragment_output != nullptr) {
-        sceShaccCgDestroyCompileOutput(fragment_output);
+        ReleaseCgOutput(fragment_output);
         fragment_output = nullptr;
     }
     // El modulo del compilador NO se descarga aqui: es estado global del
@@ -324,12 +327,139 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
         return Source::Fill;
     }
 
-    if (!info.valid || info.pixels.empty() || info.width == 0 || info.height == 0 ||
+    // 'source' apunta al framebuffer dentro de la memoria del invitado y no a
+    // una copia: la copia intermedia que habia se quito (ver ScreenInfo::source
+    // en renderer_software.h). Aqui abajo es la unica vez que estos bytes se
+    // mueven en todo el fotograma.
+    if (!info.valid || info.source == nullptr || info.width == 0 || info.height == 0 ||
         info.stride == 0) {
         return Source::Nothing;
     }
 
-    const u32 bpp = BytesPerPixelFor(info.format);
+    /**
+     * Camino directo desde la superficie de GXM (0.1.5.2, 4.6).
+     *
+     * Si hay una Surface dibujada por la GPU para ESA direccion fisica y no
+     * esta detras del invitado (needs_reload), la textura se apunta a su
+     * color_buffer: se ahorra WriteBack (lineal -> tiles del invitado) y la
+     * subida de mas abajo (invitado -> textura). Son las dos copias de la
+     * imagen completa que describe el encargo. Si no hay superficie, o si el
+     * interruptor esta apagado, se sigue por el camino de siempre.
+     *
+     * Las medidas y el formato salen de la SUPERFICIE, no del ScreenInfo: la
+     * superficie puede ser de 32 bits aunque el invitado sea RGB8 (no existe
+     * color surface de 24), y el stride es el de GXM, no el del juego.
+     */
+    {
+        const auto direct = RasterizerGXM::QueryDirectPresent(info.source_address);
+        if (direct.data != nullptr) {
+            const u32 needed = direct.stride_bytes * direct.height;
+            const bool same_place =
+                screen.points_at_gxm_surface && screen.width == direct.width &&
+                screen.height == direct.height && screen.stride == direct.stride_bytes;
+            if (!same_place) {
+                const int rc = sceGxmTextureInitLinearStrided(
+                    &screen.texture, const_cast<u8*>(direct.data),
+                    static_cast<SceGxmTextureFormat>(direct.gxm_texture_format), direct.width,
+                    direct.height, direct.stride_bytes);
+                if (rc < 0) {
+                    static bool noted_direct_error = false;
+                    if (!noted_direct_error) {
+                        noted_direct_error = true;
+                        LOG_ERROR(Render, "GXM: textura directa no valida ({:#010x}) {}x{} stride {}",
+                                  static_cast<u32>(rc), direct.width, direct.height,
+                                  direct.stride_bytes);
+                    }
+                    // Se cae al camino normal de abajo. Resetear la marca: si
+                    // points_at_gxm_surface seguia en true, la textura quedaria
+                    // apuntando a un buffer GXM obsoleto.
+                    screen.points_at_gxm_surface = false;
+                    screen.width = 0;
+                    screen.height = 0;
+                    screen.stride = 0;
+                } else {
+                    // Escalada (resolucion x2): lineal, o al reducirla al
+                    // tamano de la pantalla se perderian filas enteras.
+                    const SceGxmTextureFilter filter = direct.scale != 2
+                                                           ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                                                           : SCE_GXM_TEXTURE_FILTER_POINT;
+                    sceGxmTextureSetMinFilter(&screen.texture, filter);
+                    sceGxmTextureSetMagFilter(&screen.texture, filter);
+                    sceGxmTextureSetUAddrMode(&screen.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+                    sceGxmTextureSetVAddrMode(&screen.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+                    screen.width = direct.width;
+                    screen.height = direct.height;
+                    screen.stride = direct.stride_bytes;
+                    screen.points_at_gxm_surface = true;
+                    (void)needed;
+                    return Source::Texture;
+                }
+            } else {
+                // Mismas medidas: la textura ya apunta al buffer de GXM que toca
+                // (o a otro con la misma geometria; el puntero no cambia entre
+                // fotogramas para la misma direccion). Si cambio de direccion
+                // con las mismas medidas, points_at_gxm_surface sigue true y el
+                // puntero de la textura podria ser viejo: por eso solo se confia
+                // cuando ademas la Surface sigue siendo la de esta direccion.
+                // QueryDirectPresent ya ha comprobado eso; aun asi se rehace la
+                // textura si el buffer de la superficie es distinto del ultimo
+                // que se apunto. La forma barata: rehacer siempre que se entre
+                // aqui con points y no se sepa -- para no arriesgar, se rehace.
+                const int rc = sceGxmTextureInitLinearStrided(
+                    &screen.texture, const_cast<u8*>(direct.data),
+                    static_cast<SceGxmTextureFormat>(direct.gxm_texture_format), direct.width,
+                    direct.height, direct.stride_bytes);
+                if (rc >= 0) {
+                    const SceGxmTextureFilter filter = direct.scale != 2
+                                                           ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                                                           : SCE_GXM_TEXTURE_FILTER_POINT;
+                    sceGxmTextureSetMinFilter(&screen.texture, filter);
+                    sceGxmTextureSetMagFilter(&screen.texture, filter);
+                    sceGxmTextureSetUAddrMode(&screen.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+                    sceGxmTextureSetVAddrMode(&screen.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+                    return Source::Texture;
+                }
+                // rc < 0: la textura no se pudo rehacer. Resetear la marca
+                // para que el camino normal la reconstruya desde cero.
+                screen.points_at_gxm_surface = false;
+                screen.width = 0;
+                screen.height = 0;
+                screen.stride = 0;
+            }
+        } else if (screen.points_at_gxm_surface) {
+            // Volvemos al camino normal: hay que rehacer la textura sobre
+            // 'buffer' mas abajo, o quedaria apuntando a una Surface vieja.
+            screen.points_at_gxm_surface = false;
+            screen.width = 0;
+            screen.height = 0;
+            screen.stride = 0;
+        }
+    }
+
+    /**
+     * RGB8 SE EXPANDE A 32 BITS AL SUBIRLO, Y ES POR LO QUE HABIA PANTALLA
+     * NEGRA.
+     *
+     * El 3DS admite framebuffers de 24 bits y GXM NO tiene ninguna textura de
+     * tres bytes que sirva: SCE_GXM_TEXTURE_FORMAT_U8U8U8_RGB existe como
+     * constante, pero sceGxmTextureInitLinearStrided lo rechaza con
+     * SCE_GXM_ERROR_UNSUPPORTED (0x805b0009). Cuando eso pasaba, PrepareScreen
+     * devolvia "nada que dibujar" y esa pantalla se quedaba en NEGRO, que es
+     * justo lo que se veia arriba en las capturas.
+     *
+     * Medido en consola: "textura de pantalla no valida (0x805b0009) 240x400
+     * stride 720 fmt 1", y 720 = 240 * 3, o sea RGB8.
+     *
+     * La conversion es barata y sin perdida: el invitado guarda B,G,R y se le
+     * anade un byte de alfa a 255. Con eso el orden en memoria queda B,G,R,A,
+     * que es lo que describe el nombre ARGB de GXM (los nombres listan los
+     * canales del mas significativo al menos) -- la misma correspondencia que
+     * ya usa el rasterizador para sus superficies RGB8.
+     */
+    const bool expand_rgb8 = info.format == Pica::PixelFormat::RGB8;
+    const u32 src_bpp = BytesPerPixelFor(info.format);
+    const u32 bpp = expand_rgb8 ? 4u : src_bpp;
+    const u32 src_row_bytes = info.width * src_bpp;
     const u32 row_bytes = info.width * bpp;
     // El salto de fila que se le da a la textura tiene que ser multiplo de 16
     // para el hardware: se aprieta la imagen a ese salto en vez de reutilizar
@@ -363,10 +493,47 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
     // Copia por filas. En el caso normal (el juego usa un salto igual al
     // apretado) es una sola copia de bloque; si no, una por fila, que sigue
     // siendo memoria a memoria sin tocar un pixel.
+    // Si venimos del camino directo, 'buffer' puede estar sin asignar o con
+    // medidas viejas: needed de arriba ya lo ha reasignado si hacía falta.
     u8* dest = static_cast<u8*>(screen.buffer.Data());
-    const u8* src = info.pixels.data();
-    if (info.stride == tight_stride) {
-        std::memcpy(dest, src, needed);
+    const u8* src = info.source;
+    if (expand_rgb8) {
+        // Tres bytes a cuatro, fila a fila. Se escribe la palabra entera de una
+        // vez en vez de byte a byte: son ~96.000 pixeles por pantalla y por
+        // fotograma, y esto corre en el hilo que emula la CPU.
+        for (u32 y = 0; y < info.height; y++) {
+            const std::size_t src_offset = static_cast<std::size_t>(y) * info.stride;
+            if (src_offset + src_row_bytes > info.source_size) {
+                // Nunca se lee mas alla del framebuffer del invitado: 'source'
+                // apunta a su memoria, no a una copia nuestra.
+                break;
+            }
+            const u8* src_row = src + src_offset;
+            u8* dst_row = dest + static_cast<std::size_t>(y) * tight_stride;
+            // 0.1.7.6: 16 pixeles por vuelta con NEON (VLD3 separa B, G y R,
+            // VST4 los vuelve a juntar con el alfa). Mismos bytes en el mismo
+            // orden que el bucle de abajo, que se queda para la cola de la fila.
+            u32 x = 0;
+            const uint8x16_t opaque = vdupq_n_u8(0xFF);
+            for (; x + 16 <= info.width; x += 16) {
+                const uint8x16x3_t bgr = vld3q_u8(src_row + x * 3);
+                const uint8x16x4_t bgra = {{bgr.val[0], bgr.val[1], bgr.val[2], opaque}};
+                vst4q_u8(dst_row + x * 4, bgra);
+            }
+            for (; x < info.width; x++) {
+                const u8* pixel = src_row + x * 3;
+                const u32 word = static_cast<u32>(pixel[0]) |
+                                 (static_cast<u32>(pixel[1]) << 8) |
+                                 (static_cast<u32>(pixel[2]) << 16) | 0xFF000000u;
+                std::memcpy(dst_row + x * 4, &word, sizeof(word));
+            }
+        }
+    } else if (info.stride == tight_stride) {
+        // Con los dos saltos iguales, 'needed' y 'source_size' valen lo mismo.
+        // Se toma el menor de los dos de todas formas: ahora se lee de la
+        // memoria del invitado y no de un vector propio, asi que pasarse de
+        // largo aqui seria leer fuera del framebuffer del juego.
+        std::memcpy(dest, src, std::min<std::size_t>(needed, info.source_size));
     } else {
         for (u32 y = 0; y < info.height; y++) {
             std::memcpy(dest + static_cast<std::size_t>(y) * tight_stride,
@@ -378,10 +545,24 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
 
     if (reallocated || screen.width != info.width || screen.height != info.height ||
         screen.stride != tight_stride || screen.format != info.format) {
-        const int rc = sceGxmTextureInitLinearStrided(&screen.texture, dest, FormatFor(info.format),
+        const SceGxmTextureFormat texture_format =
+            expand_rgb8 ? SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ARGB : FormatFor(info.format);
+        const int rc = sceGxmTextureInitLinearStrided(&screen.texture, dest, texture_format,
                                                       info.width, info.height, tight_stride);
         if (rc < 0) {
-            LOG_ERROR(Render, "GXM: textura de pantalla no valida ({:#x})", static_cast<u32>(rc));
+            // Una vez y no por fotograma: esto fallaba dos veces en cada uno,
+            // y son dos escrituras al registro por fotograma para repetir
+            // siempre lo mismo. El dato interesante -- el formato y las medidas
+            // con las que falla -- va en la misma linea, que es lo que hace
+            // falta para arreglarlo.
+            static bool noted_texture_error = false;
+            if (!noted_texture_error) {
+                noted_texture_error = true;
+                LOG_ERROR(Render,
+                          "GXM: textura de pantalla no valida ({:#010x}) {}x{} stride {} fmt {}",
+                          static_cast<u32>(rc), info.width, info.height, tight_stride,
+                          static_cast<u32>(info.format));
+            }
             return Source::Nothing;
         }
         // Sin filtrado: la correspondencia es 1:1 y cualquier interpolacion

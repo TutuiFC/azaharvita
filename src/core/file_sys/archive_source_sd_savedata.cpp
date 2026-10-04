@@ -18,20 +18,60 @@ namespace FileSys {
 
 namespace {
 
+/**
+ * EN VITA LA RUTA DE GUARDADO VA APLANADA, Y ES POR UN LIMITE DEL SISTEMA DE
+ * FICHEROS DE LA CONSOLA.
+ *
+ * La estructura del 3DS deja el guardado once niveles por debajo de la raiz:
+ *
+ *   ux0:/data/azahar/sdmc/Nintendo 3DS/<ID0>/<ID1>/title/<alto>/<bajo>/data/
+ *   00000001/
+ *
+ * y sceIoMkdir NO CREA carpetas a esa profundidad: devuelve EINVAL
+ * (0x80010016). Medido en consola con el rastro completo de niveles: el padre
+ * (profundidad 10) se crea con exito y el hijo (profundidad 11) falla. Se probo
+ * antes acortando los nombres -- los dos identificadores de 32 caracteres a uno
+ * --, y la ruta paso de 138 a 76 caracteres SIN cambiar el resultado: el limite
+ * es de anidamiento, no de longitud.
+ *
+ * Sin poder crear esa carpeta el juego no abre su archivo de guardado y se
+ * queda a medio cargar o muestra la pantalla de error del 3DS.
+ *
+ * Aqui se colapsan los cuatro niveles del contenedor en uno ("s") y los cuatro
+ * del titulo en uno solo con el ID completo, asi que el guardado queda a
+ * profundidad 5. El margen importa: los juegos crean SUS PROPIAS carpetas
+ * dentro del guardado, y con la ruta al borde del limite la primera que
+ * intentaran crear volveria a fallar.
+ *
+ * Nada de esto viaja al juego: son nombres de carpetas del anfitrion. En
+ * escritorio se conserva la estructura original.
+ */
 std::string GetSaveDataContainerPath(const std::string& sdmc_directory) {
+#ifdef __PSVITA__
+    return fmt::format("{}s/", sdmc_directory);
+#else
     return fmt::format("{}Nintendo 3DS/{}/{}/title/", sdmc_directory, SYSTEM_ID, SDCARD_ID);
+#endif
 }
 
 std::string GetSaveDataPath(const std::string& mount_location, u64 program_id) {
     u32 high = static_cast<u32>(program_id >> 32);
     u32 low = static_cast<u32>(program_id & 0xFFFFFFFF);
+#ifdef __PSVITA__
+    return fmt::format("{}{:08x}{:08x}/", mount_location, high, low);
+#else
     return fmt::format("{}{:08x}/{:08x}/data/00000001/", mount_location, high, low);
+#endif
 }
 
 std::string GetSaveDataMetadataPath(const std::string& mount_location, u64 program_id) {
     u32 high = static_cast<u32>(program_id >> 32);
     u32 low = static_cast<u32>(program_id & 0xFFFFFFFF);
+#ifdef __PSVITA__
+    return fmt::format("{}{:08x}{:08x}.metadata", mount_location, high, low);
+#else
     return fmt::format("{}{:08x}/{:08x}/data/00000001.metadata", mount_location, high, low);
+#endif
 }
 
 } // namespace

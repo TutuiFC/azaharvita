@@ -37,29 +37,43 @@ struct FramebufferSignature {
     bool seen;
 };
 
-FramebufferSignature last_signature[3]{};
+/**
+ * VARIAS firmas recordadas por pantalla, no solo la ultima.
+ *
+ * Aqui se guardaba UNA, y eso convertia el deduplicado en inutil: los juegos
+ * usan DOBLE BUFFER, asi que la direccion del framebuffer alterna entre dos
+ * valores en fotogramas consecutivos y la comparacion contra "la ultima" no
+ * acierta jamas. Resultado: una linea de crash.txt por pantalla y por
+ * fotograma, para siempre.
+ *
+ * Y VitaNote no es barato: cada llamada hace dos sceIoMkdir, un sceIoOpen con
+ * O_APPEND, un sceIoWrite y un sceIoClose contra la tarjeta de memoria. Medido
+ * en consola, esas dos lineas por fotograma eran los 29,5 ms que el overlay
+ * atribuia a "conv" -- el 16% del fotograma -- y encima corrian en el hilo
+ * principal, el mismo que emula el ARM11. En una sesion de ocho minutos
+ * dejaron 4.834 lineas escritas.
+ *
+ * Con cuatro huecos por pantalla entran de sobra los dos del doble buffer y
+ * los cambios de formato normales. Al llenarse se deja de anotar esa pantalla:
+ * un juego que rote por muchos framebuffers no puede volver a convertir esto
+ * en un bucle de escritura a disco.
+ */
+constexpr u32 kSignatureSlots = 4;
+FramebufferSignature last_signature[3][kSignatureSlots]{};
+u32 signature_count[3]{};
 
 void NoteFramebuffer(int i, PAddr address, u32 stride, u32 height, u32 format, u32 color_fill) {
-    FramebufferSignature& last = last_signature[i];
-    const bool same_state =
-        last.seen && last.stride == stride && last.height == height && last.format == format &&
-        last.color_fill == color_fill;
-    /**
-     * La direccion alterna entre los dos buffers del juego en cada fotograma.
-     * Anotarla cada vez son dos escrituras a disco por fotograma (y el registro
-     * es sincrono). Lo que interesa de verdad es el formato, el stride y el
-     * alto, asi que los cambios de direccion se anotan solo las primeras veces.
-     */
-    static int address_notes = 0;
-    if (same_state) {
-        if (last.address == address || address_notes >= 8) {
+    for (u32 slot = 0; slot < signature_count[i]; slot++) {
+        const FramebufferSignature& seen = last_signature[i][slot];
+        if (seen.address == address && seen.stride == stride && seen.height == height &&
+            seen.format == format && seen.color_fill == color_fill) {
             return;
         }
-        address_notes++;
-    } else {
-        address_notes = 0;
     }
-    last = {address, stride, height, format, color_fill, true};
+    if (signature_count[i] >= kSignatureSlots) {
+        return;
+    }
+    last_signature[i][signature_count[i]++] = {address, stride, height, format, color_fill, true};
 
     char buffer[160];
     const auto result = fmt::format_to_n(
@@ -165,7 +179,9 @@ static void BlankScreenInfo(ScreenInfo& info, bool is_bottom) {
     // Sin imagen valida: el frontend pinta negro y no sube ninguna textura.
     info.valid = false;
     info.fill_enabled = false;
-    info.pixels.clear();
+    info.source = nullptr;
+    info.source_size = 0;
+    info.source_address = 0;
 #else
     info.pixels.assign(static_cast<std::size_t>(info.width) * info.height * 4, 0);
 #endif
@@ -272,16 +288,22 @@ void RendererSoftware::LoadFBToScreenInfo(int i, const Pica::ColorFill& color_fi
         info.fill_r = static_cast<u8>(color_fill.color_r);
         info.fill_g = static_cast<u8>(color_fill.color_g);
         info.fill_b = static_cast<u8>(color_fill.color_b);
-        info.pixels.clear();
+        info.source = nullptr;
+        info.source_size = 0;
+        info.source_address = 0;
         return;
     }
     info.fill_enabled = false;
 
-    {
-        const std::size_t total = static_cast<std::size_t>(framebuffer.stride) * height;
-        info.pixels.resize(total);
-        std::memcpy(info.pixels.data(), framebuffer_data, total);
-    }
+    // Se APUNTA al framebuffer del invitado en vez de copiarlo (ver ScreenInfo::
+    // source en renderer_software.h). La copia que habia aqui era la primera de
+    // dos seguidas sobre los mismos bytes, y la hacia el hilo que emula el ARM11.
+    //
+    // El tramo ya esta comprobado mapeado y contiguo mas arriba: 'framebuffer_data'
+    // es no nulo y llega entero hasta el ultimo pixel.
+    info.source = framebuffer_data;
+    info.source_size = static_cast<std::size_t>(framebuffer.stride) * height;
+    info.source_address = framebuffer_addr;
     return;
 #endif
 

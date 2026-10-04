@@ -5,8 +5,11 @@
 // Punto de entrada de Azahar en PS Vita.
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -14,6 +17,7 @@
 #include <pthread.h>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <typeinfo>
 #include <vector>
 
@@ -38,11 +42,20 @@
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "common/vita_diag.h"
+#include "core/arm/dyncom/arm_dyncom_jit.h"
 #include "core/arm/dyncom/arm_dyncom_trans.h"
 #include "core/core.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/image_interface.h"
+#include "core/hle/service/cfg/cfg.h"
 #include "core/hle/service/service.h"
+#include "core/loader/loader.h"
+#include "video_core/gpu.h"
+#include "video_core/pica/pica_core.h"
+#include "video_core/renderer_gxm/gxm_cg.h"
+#include "video_core/renderer_gxm/rasterizer_gxm.h"
+#include "video_core/shader/generator/cg_vs_shader_gen.h"
+#include "video_core/renderer_software/sw_rasterizer.h"
 
 #ifndef AZAHAR_HEAP_MB
 #define AZAHAR_HEAP_MB 192
@@ -87,23 +100,7 @@ namespace {
 /// Version del port, visible en el menu y en la pantalla de arranque. Se define
 /// en vita_version.h, que es el unico sitio donde se escribe (el overlay del
 /// juego usa la misma constante).
-using VitaFrontend::kBuildInfo;
 using VitaFrontend::kVersion;
-
-/// Version + sello de compilacion en una linea ("version X | fecha | hash").
-///
-/// El sello lo regenera build.sh en CADA compilacion, asi que la linea cambia
-/// siempre, aunque alguien olvide subir kVersion: es lo que permite saber si el
-/// VPK que corre la consola es el ultimo.
-const char* VersionLine() {
-    static char line[128];
-    if (line[0] == '\0') {
-        const auto written =
-            fmt::format_to_n(line, sizeof(line) - 1, "{}  |  {}", kVersion, kBuildInfo);
-        *written.out = '\0';
-    }
-    return line;
-}
 
 constexpr char kUserDir[] = "ux0:/data/azahar/";
 constexpr char kRomDir[] = "ux0:/data/azahar/roms";
@@ -179,7 +176,10 @@ void ConfigureSettings() {
     // ARMv7. Se usa el interprete dyncom.
     Settings::values.use_cpu_jit = false;
     Settings::values.use_shader_jit = false;
-    Settings::values.use_hw_shader = false;
+    // Shader de vertices en la GPU (0.1.4.6): PicaCore le pregunta a
+    // RasterizerGXM::AccelerateDrawBatch antes de ejecutar el interprete. Lo que
+    // no se pueda acelerar sigue por la CPU lote a lote.
+    Settings::values.use_hw_shader = true;
     Settings::values.use_disk_shader_cache = false;
     Settings::values.async_shader_compilation = false;
 
@@ -217,11 +217,23 @@ void ConfigureSettings() {
     // limite. Emulando a pocos fotogramas por segundo el sonido no se entiende
     // igualmente, asi que primero que vaya la imagen. Para recuperarlo basta
     // con poner SinkType::Vita aqui.
-    Settings::values.output_type = AudioCore::SinkType::Null;
-    // El estirado de audio intenta casar el sonido con la velocidad real de
-    // emulacion. Yendo muy por debajo del 100% eso destroza el sonido y ademas
-    // cuesta CPU, asi que se deja crudo.
-    Settings::values.enable_audio_stretching = false;
+    /**
+     * SONIDO ENCENDIDO (0.1.4.9, lo pidio el usuario).
+     *
+     * Hasta aqui la salida era Null: el DSP se emulaba igual (el juego lo
+     * necesita para avanzar) pero nadie escuchaba. VitaSink (vita_sink.cpp)
+     * abre el puerto principal de audio a 48 kHz y un hilo propio que pide
+     * bloques de ~21 ms y los entrega a sceAudioOutOutput, que marca el ritmo.
+     *
+     * CON EL ESTIRADO DE AUDIO. A la velocidad actual (un 5-10 % de la real)
+     * el emulador produce una decima parte del sonido que el altavoz consume.
+     * Con el estirado (SoundTouch, en el hilo de audio, no en el de emulacion)
+     * se oye continuo pero muy lento y grave; sin el, se oye a su tono pero a
+     * trozos, con silencios. SELECT + IZQUIERDA cambia entre los dos en
+     * marcha (vita_window.cpp).
+     */
+    Settings::values.output_type = AudioCore::SinkType::Vita;
+    Settings::values.enable_audio_stretching = true;
 
     Settings::values.use_virtual_sd = true;
 
@@ -271,8 +283,516 @@ void ConfigureSettings() {
     Settings::values.camera_flip = {};
 }
 
+// ---------------------------------------------------------------------------
+// Ajustes del usuario (0.1.5.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * VENTANA DE AJUSTES. Se abre manteniendo START dos segundos en la lista de
+ * juegos (START a secas no hace nada en el menu, y exigir que se mantenga
+ * evita abrirla sin querer). Tres ajustes:
+ *
+ *   - Volumen: Settings::values.volume, que DspInterface::OutputFrame aplica a
+ *     cada bloque de salida (con curva cubica, como el deslizador de
+ *     escritorio). Vale al momento, tambien en partida.
+ *   - Idioma del sistema emulado: el bloque de idioma del config del 3DS, que
+ *     es lo que leen los juegos para elegir idioma. Se aplica al cargar el
+ *     siguiente juego (ver Service::CFG::g_vita_system_language).
+ *   - Resolucion 1x o 0.5x: FrameSkip::half_resolution. En 0.5x el
+ *     rasterizador por software sombrea un pixel de cada bloque de 2x2 y lo
+ *     copia a los otros tres. Los lotes que dibuja la GPU de la Vita (GXM) no
+ *     cambian: ya van a la resolucion nativa del 3DS y no son el cuello de
+ *     botella. Vale al momento, y en partida lo cambia tambien L+R.
+ *
+ * Se guardan en ux0:/data/azahar/ajustes.txt al cerrar la ventana y se leen
+ * al arrancar, para no tener que repetirlos cada vez.
+ */
+void WriteCrashLog(const char* title, const char* detail); // definida mas abajo
+
+constexpr char kSettingsFile[] = "ux0:/data/azahar/ajustes.txt";
+constexpr SceUInt64 kSettingsHoldUs = 2'000'000;
+
+struct LanguageOption {
+    int value; ///< Service::CFG::SystemLanguage, o -1 = no tocar
+    const char* name;
+};
+
+constexpr LanguageOption kLanguages[] = {
+    {-1, "Automatico (el de la consola emulada)"},
+    {Service::CFG::LANGUAGE_ES, "Espanol"},
+    {Service::CFG::LANGUAGE_EN, "Ingles"},
+    {Service::CFG::LANGUAGE_FR, "Frances"},
+    {Service::CFG::LANGUAGE_DE, "Aleman"},
+    {Service::CFG::LANGUAGE_IT, "Italiano"},
+    {Service::CFG::LANGUAGE_PT, "Portugues"},
+    {Service::CFG::LANGUAGE_NL, "Neerlandes"},
+    {Service::CFG::LANGUAGE_RU, "Ruso"},
+    {Service::CFG::LANGUAGE_JP, "Japones"},
+    {Service::CFG::LANGUAGE_ZH, "Chino simplificado"},
+    {Service::CFG::LANGUAGE_TW, "Chino tradicional"},
+    {Service::CFG::LANGUAGE_KO, "Coreano"},
+};
+constexpr int kLanguageCount = static_cast<int>(sizeof(kLanguages) / sizeof(kLanguages[0]));
+
+struct UserSettings {
+    int volume_percent = 100;
+    int language = -1;
+    bool half_resolution = false;
+    /// 4.3: cache de registros del JIT. Encendida por defecto (0.1.5.2).
+    bool jit_reg_cache = true;
+    /// VFP en el JIT (datos 0.1.5.2, aritmetica 0.1.6.1, nativa 0.1.7.0). ON.
+    bool jit_vfp_data = true;
+    /// 4.5: diferir sceGxmFinish hasta WriteBack/Reload. ON por defecto.
+    bool gxm_no_finish = true;
+    /// 4.6: presentar desde color_buffer de GXM sin WriteBack+subida. ON.
+    bool gxm_present_direct = true;
+    /// 4.8: enlazado directo entre bloques en el codigo generado. ON.
+    bool jit_direct_link = true;
+    /// 0.1.6.0: saltos VS con escape a la GPU (ver g_allow_vs_escapes). ON
+    /// desde 0.1.7.3: el shader que rompia el compilador ya no deja la GPU sin
+    /// shaders (se recarga, se prueba otra variante y se aparta el codigo que
+    /// lo rompe). Sin esto, el shader de piel de Rubi Omega va a la CPU.
+    bool vs_escapes = true;
+    /// 0.1.6.1: sombrear cada indice una vez por lote. ON por defecto.
+    bool full_vertex_dedup = true;
+    /// 0.1.7.1: sonido. Apagado = salida nula (se aplica al arrancar el juego).
+    bool sound = true;
+    /// 0.1.7.1: disposicion de las pantallas (VitaFrontend::g_screen_layout).
+    int screen_layout = 0;
+    /// 0.1.7.1: no volver a presentar una imagen que no ha cambiado.
+    bool skip_repeated = true;
+    /// Programas de vertices especializados por booleanos (0.1.7.4). OFF en
+    /// 0.1.8.1 (agotaban la memoria del compilador al entrar al 3D de Zafiro
+    /// Alfa), y la partida bajo a 2.5 FPS con los vertices de piel en la CPU.
+    /// ON otra vez en 0.1.8.3, con el compilador descargado tras cada shader de
+    /// vertices y sin compilar si no hay 85 MB libres (ver gxm_cg.cpp). Clave
+    /// nueva: el ajustes.txt de 0.1.8.2 trae vs_especializar=0.
+    bool vs_specialize = true;
+    /// 0.1.8.6: copia de pantalla en la GPU (RasterizerGXM::transfer_on_gpu).
+    bool gpu_screen_copy = true;
+    /// 0.2.0.0: la GPU emulada en otro nucleo (VideoCore::GPU::async_enabled).
+    /// OFF hasta probarlo en consola con varios juegos.
+    bool gpu_thread = false;
+    /// 0.2.0.3: sin esperar al refresco al presentar (VitaFrontend::g_unlimited_speed).
+    bool unlimited_speed = false;
+    /// Resolucion de la GPU en mitades: 1 = 0.5x, 2 = 1x, 4 = 2x
+    /// (RasterizerGXM::resolution_scale).
+    int gpu_scale = 2;
+    /// 0.2.1.1: saltar el lote mientras compila su shader de vertices
+    /// (RasterizerGXM::async_vs). ON.
+    bool async_shaders = true;
+};
+UserSettings g_user;
+
+constexpr const char* kLayoutNames[VitaFrontend::kScreenLayoutCount] = {
+    "Normal (1:1)", "Superior grande + inferior", "Lado a lado", "Solo superior x2",
+    "Solo superior, pantalla completa"};
+
+int LanguageIndex(int value) {
+    for (int i = 0; i < kLanguageCount; i++) {
+        if (kLanguages[i].value == value) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+void ApplyUserSettings() {
+    Settings::values.volume = static_cast<float>(g_user.volume_percent) / 100.0f;
+    Service::CFG::g_vita_system_language = g_user.language;
+    SwRenderer::FrameSkip::half_resolution.store(g_user.half_resolution,
+                                                 std::memory_order_relaxed);
+    // 4.3 (0.1.5.2): al cambiar el interruptor hay que tirar los bloques ya
+    // compilados, o los viejos seguirian con el mapa de cache del momento de
+    // compilarlos y el interruptor no apagaria nada.
+    const u32 want_cache = g_user.jit_reg_cache ? 1u : 0u;
+    if (Core::ArmJit::reg_cache.exchange(want_cache, std::memory_order_relaxed) != want_cache) {
+        Core::ArmJit::Reset();
+    }
+    // 4.4 (0.1.5.2): igual con VFP datos: recompilar, o los bloques viejos
+    // seguirian rechazando o aceptando VFP segun el momento de compilarlos.
+    const u32 want_vfp = g_user.jit_vfp_data ? 1u : 0u;
+    if (Core::ArmJit::vfp_data.exchange(want_vfp, std::memory_order_relaxed) != want_vfp) {
+        Core::ArmJit::Reset();
+    }
+    // 4.5 (0.1.5.2): no hace falta recompilar nada; es solo cuando se espera.
+    Gxm::RasterizerGXM::no_finish_wait.store(g_user.gxm_no_finish ? 1u : 0u,
+                                             std::memory_order_relaxed);
+    // 4.6 (0.1.5.2): solo cambia de donde lee la textura el presentador.
+    Gxm::RasterizerGXM::present_direct.store(g_user.gxm_present_direct ? 1u : 0u,
+                                             std::memory_order_relaxed);
+    // 4.8 (0.1.5.2): al cambiar hay que tirar los bloques: los viejos llevan
+    // (o no) el enlace ya parcheado en su codigo.
+    const u32 want_link = g_user.jit_direct_link ? 1u : 0u;
+    if (Core::ArmJit::direct_link.exchange(want_link, std::memory_order_relaxed) != want_link) {
+        Core::ArmJit::Reset();
+    }
+    // 0.1.6.0: solo cambia que shaders se traducen a partir de ahora.
+    Pica::Shader::Generator::GXM::g_allow_vs_escapes.store(g_user.vs_escapes,
+                                                            std::memory_order_relaxed);
+    Pica::g_full_vertex_dedup.store(g_user.full_vertex_dedup, std::memory_order_relaxed);
+    /**
+     * Sonido (0.1.7.1). Apagado: salida nula y sin estirado. El DSP del 3DS se
+     * sigue emulando (los juegos esperan a que termine sus bloques), pero se
+     * ahorra el estirado de SoundTouch y el envio a la Vita. Se aplica al
+     * arrancar el siguiente juego, que es cuando se crea la salida de audio.
+     */
+    Settings::values.output_type =
+        g_user.sound ? AudioCore::SinkType::Vita : AudioCore::SinkType::Null;
+    Settings::values.enable_audio_stretching = g_user.sound;
+    VitaFrontend::g_screen_layout.store(
+        std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1),
+        std::memory_order_relaxed);
+    VitaFrontend::g_skip_repeated_frames.store(g_user.skip_repeated, std::memory_order_relaxed);
+    Gxm::RasterizerGXM::specialize_vs.store(g_user.vs_specialize ? 1u : 0u,
+                                            std::memory_order_relaxed);
+    Gxm::RasterizerGXM::transfer_on_gpu.store(g_user.gpu_screen_copy ? 1u : 0u,
+                                              std::memory_order_relaxed);
+    VideoCore::GPU::async_enabled.store(g_user.gpu_thread, std::memory_order_relaxed);
+    VitaFrontend::g_unlimited_speed.store(g_user.unlimited_speed, std::memory_order_relaxed);
+    Gxm::RasterizerGXM::resolution_scale.store(static_cast<u32>(g_user.gpu_scale),
+                                               std::memory_order_relaxed);
+    Gxm::RasterizerGXM::async_vs.store(g_user.async_shaders ? 1u : 0u, std::memory_order_relaxed);
+}
+
+/// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
+/// por defecto de ese ajuste: un fichero roto no puede impedir arrancar.
+void LoadUserSettings() {
+    const SceUID fd = sceIoOpen(kSettingsFile, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return;
+    }
+    char buffer[512] = {};
+    const int read = sceIoRead(fd, buffer, sizeof(buffer) - 1);
+    sceIoClose(fd);
+    if (read <= 0) {
+        return;
+    }
+    buffer[read] = '\0';
+    const char* p = std::strstr(buffer, "volumen=");
+    int value = 0;
+    if (p != nullptr && std::sscanf(p + std::strlen("volumen="), "%d", &value) == 1) {
+        g_user.volume_percent = std::clamp(value, 0, 100);
+    }
+    // Solo el volumen se lee del fichero: el resto de ajustes es fijo.
+}
+
+/// El contenido de ajustes.txt, una clave por linea.
+int FormatUserSettings(char* buffer, std::size_t size) {
+    return std::snprintf(
+        buffer, size,
+        "volumen=%d\nidioma=%d\nresolucion_media=%d\njit_cache_reg=%d\n"
+        "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
+        "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
+        "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
+        "resolucion_gpu2=%d\nshaders_asinc=%d\n",
+        g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
+        g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
+        g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
+        g_user.vs_escapes ? 1 : 0, g_user.full_vertex_dedup ? 1 : 0, g_user.sound ? 1 : 0,
+        g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0,
+        g_user.gpu_screen_copy ? 1 : 0, g_user.gpu_thread ? 1 : 0,
+        g_user.unlimited_speed ? 1 : 0, g_user.gpu_scale, g_user.async_shaders ? 1 : 0);
+}
+
+/// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
+/// esto no se sabe si una partida lenta llevaba algo apagado en ajustes.txt.
+void NoteUserSettings() {
+    char buffer[512];
+    const int length = FormatUserSettings(buffer, sizeof(buffer));
+    for (int i = 0; i < length && i < static_cast<int>(sizeof(buffer)) - 1; i++) {
+        if (buffer[i] == '\n') {
+            buffer[i] = ' ';
+        }
+    }
+    WriteCrashLog("ajustes", buffer);
+}
+
+void SaveUserSettings() {
+    char buffer[512];
+    const int length = FormatUserSettings(buffer, sizeof(buffer));
+    const SceUID fd = sceIoOpen(kSettingsFile, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0) {
+        WriteCrashLog("ajustes", "no se pudo guardar ajustes.txt");
+        return;
+    }
+    sceIoWrite(fd, buffer, static_cast<SceSize>(length));
+    sceIoClose(fd);
+}
+
+constexpr int kSettingsRows = 19;
+
+void DrawSettings(vita2d_pgf* font, int row) {
+    constexpr int kFirstY = 100;
+    // 16 desde la fila 19 (0.2.1.1): con mas la ultima pisaba la ayuda.
+    constexpr int kRowStep = 16;
+    constexpr int kValueX = 330;
+
+    vita2d_start_drawing();
+    vita2d_clear_screen();
+    vita2d_pgf_draw_text(font, 40, 45, kColorAccent, 1.4f, "Ajustes");
+    vita2d_pgf_draw_text(font, 40, 72, kColorDim, 0.85f,
+                         "Se guardan en ux0:/data/azahar/ajustes.txt. Las cifras de FPS son "
+                         "aproximadas y dependen del juego.");
+
+    const char* labels[kSettingsRows] = {"Volumen",
+                                         "Idioma del sistema",
+                                         "Resolucion (software)",
+                                         "Cache registros JIT",
+                                         "Coma flotante en JIT",
+                                         "Sin espera a la GPU",
+                                         "Presentar directo",
+                                         "Enlace directo JIT",
+                                         "Vertices con saltos a GPU",
+                                         "Cache de vertices completa",
+                                         "Sonido",
+                                         "Pantallas",
+                                         "Omitir imagenes repetidas",
+                                         "Vertices especializados a GPU",
+                                         "Copia y borrado en GPU",
+                                         "GPU en otro nucleo",
+                                         "Limite de velocidad",
+                                         "Resolucion GPU",
+                                         "Shaders asincronos"};
+    char volume_text[16];
+    std::snprintf(volume_text, sizeof(volume_text), "%d %%", g_user.volume_percent);
+    const char* values[kSettingsRows] = {
+        volume_text,
+        kLanguages[LanguageIndex(g_user.language)].name,
+        g_user.half_resolution ? "0.5x" : "1x",
+        g_user.jit_reg_cache ? "ON" : "OFF",
+        g_user.jit_vfp_data ? "ON" : "OFF",
+        g_user.gxm_no_finish ? "ON" : "OFF",
+        g_user.gxm_present_direct ? "ON" : "OFF",
+        g_user.jit_direct_link ? "ON" : "OFF",
+        g_user.vs_escapes ? "ON" : "OFF",
+        g_user.full_vertex_dedup ? "ON" : "OFF",
+        g_user.sound ? "ON" : "OFF",
+        kLayoutNames[std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1)],
+        g_user.skip_repeated ? "ON" : "OFF",
+        g_user.vs_specialize ? "ON" : "OFF",
+        g_user.gpu_screen_copy ? "ON" : "OFF",
+        g_user.gpu_thread ? "ON" : "OFF",
+        g_user.unlimited_speed ? "Sin limite" : "100% (refresco)",
+        g_user.gpu_scale == 4 ? "2x (experimental)" : g_user.gpu_scale == 1 ? "0.5x" : "1x",
+        g_user.async_shaders ? "ON" : "OFF"};
+
+    for (int i = 0; i < kSettingsRows; i++) {
+        const int y = kFirstY + i * kRowStep;
+        const bool selected = i == row;
+        if (selected) {
+            vita2d_draw_rectangle(30, static_cast<float>(y - 18), 900, 23, 0xFF402810);
+        }
+        const unsigned int color = selected ? kColorAccent : kColorText;
+        vita2d_pgf_draw_text(font, 44, y, color, 0.95f, labels[i]);
+        vita2d_pgf_draw_textf(font, kValueX, y, color, 0.95f, selected ? "<  %s  >" : "   %s",
+                              values[i]);
+    }
+
+    // Barra del volumen, a la derecha de su fila.
+    const float bar_width = 250.0f;
+    vita2d_draw_rectangle(kValueX + 200, kFirstY - 8, bar_width, 6, 0xFF404040);
+    vita2d_draw_rectangle(kValueX + 200, kFirstY - 8,
+                          bar_width * static_cast<float>(g_user.volume_percent) / 100.0f, 6,
+                          kColorAccent);
+
+    /**
+     * Que hace cada ajuste: que ganas (FPS, mas o menos) y que pierdes. Las
+     * cifras son estimaciones de lo medido en Pokemon Rubi Omega; en otros
+     * juegos cambian.
+     */
+    static const char* const help[kSettingsRows][3] = {
+        {"Volumen del juego. Se aplica al momento.", "No cambia los FPS.", ""},
+        {"El idioma que ve el juego. Se aplica al arrancar el juego.", "No cambia los FPS.",
+         "Si el juego no trae ese idioma, usa el primero de su region."},
+        {"0.5x: la CPU dibuja 1 de cada 4 pixeles y copia el resto.",
+         "Mas FPS SOLO en juegos que dibujan por software (no los 3D normales).",
+         "Contra: imagen mas pixelada. En partida, L+R cambia lo mismo."},
+        {"ON: los registros del juego se quedan en el procesador de la Vita.",
+         "Ganancia: CPU del juego ~10-20% mas rapida (varios FPS en juegos pesados).",
+         "Contra: ninguno conocido. Apagar solo si un juego se cuelga."},
+        {"ON: la coma flotante del juego va por el hardware de la Vita.",
+         "Ganancia: la mayor del JIT en juegos 3D (del orden de +10-25% de FPS).",
+         "Contra: si un juego calcula cosas raras (fisicas, animaciones), apagar."},
+        {"ON: no para la CPU a esperar a la GPU al cerrar cada escena.",
+         "Ganancia: ~3-7% de FPS en 3D.", "Contra: si la imagen se congela o parpadea, apagar."},
+        {"ON: la imagen dibujada por la GPU se muestra sin copiarla dos veces.",
+         "Ganancia: ~2-5% de FPS cuando el juego lo permite.",
+         "Contra: si la imagen sale girada o con colores raros, apagar."},
+        {"ON: la CPU emulada salta de bloque en bloque sin volver al emulador.",
+         "Ganancia: ~5-15% de FPS.",
+         "Contra: ninguno conocido. Apagar si hay cuelgues sin explicacion."},
+        {"ON: los shaders de vertices con saltos complicados van a la GPU.",
+         "Ganancia: la mayor en 3D (+30% o mas si el compilador los acepta).",
+         "Contra: la 1a vez tarda mas en cargar la escena. Si el 3D sale roto, apagar."},
+        {"ON: cada vertice repetido se calcula una sola vez por dibujo.",
+         "Ganancia: 0-15% en 3D, segun el juego.",
+         "Contra: si un modelo 3D sale con picos o deformado, apagar."},
+        {"OFF: sin sonido. Se ahorra el estirado y el envio del audio.",
+         "Ganancia: ~2-5% de FPS. Se aplica al arrancar el juego.", "Contra: no hay sonido."},
+        {"Como se colocan las pantallas. La escala la hace la GPU de la Vita.",
+         "No cambia los FPS. Con solo la superior no se ve la tactil ni se puede tocar.",
+         "Se aplica al momento, tambien en partida."},
+        {"ON: si el juego no ha dibujado nada nuevo, no se vuelve a mostrar.",
+         "Ganancia: ~5-10% de FPS en juegos a 30 FPS o menos.",
+         "Contra: si un juego deja la imagen congelada, apagar."},
+        {"ON: los shaders con saltos se compilan una vez por combinacion de opciones.",
+         "Ganancia: la mayor en 3D (Zafiro Alfa: de ~2.5 FPS con OFF a varias veces mas).",
+         "Contra: la 1a vez que sale cada uno, la escena se para unos segundos. Si crashea, apagar."},
+        {"ON: copia de pantalla y borrados en la GPU, sin bajar a la CPU y volver a subir.",
+         "Ganancia: el 2D de Zafiro Alfa paso de 11 a 22 FPS; en 3D, varios ms por fotograma.",
+         "Contra: si ves imagenes viejas, colores raros o parpadeos, apagar."},
+        {"ON: la GPU emulada y la imagen van en el nucleo 1; el juego, solo en el 0.",
+         "Ganancia: lo que tarde la GPU por fotograma (calculo: +20-50% donde pesa). Al arrancar juego.",
+         "Contra: nuevo. Si un juego se cuelga, va a saltos o se ve raro, apagar."},
+        {"Sin limite: no espera al refresco de la pantalla; puede pasar del 100% de velocidad.",
+         "Ganancia: menus y escenas ligeras van mas rapido que en la consola.",
+         "Contra: el juego puede ir acelerado y el sonido estirado. Se aplica al momento."},
+        {"0.5x: la GPU dibuja la mitad por eje (menos nitido). 2x: el doble (mas nitido).",
+         "0.5x alivia la GPU de la Vita; 2x cuesta GPU y memoria de video. Al arrancar el juego.",
+         "Contra: experimental. Lo que vaya por software sigue a 1x. Si va lento o raro, 1x."},
+        {"ON: mientras se compila el shader de vertices de un modelo, ese modelo no se dibuja.",
+         "Ganancia: la 1a vez que se entra a una escena 3D va fluida en vez de a 2-3 FPS.",
+         "Contra: los modelos aparecen unos segundos despues. OFF: se ven ya, pero a saltos."},
+    };
+    vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
+    vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);
+    vita2d_pgf_draw_text(font, 40, 462, kColorDim, 0.9f, help[row][2]);
+
+    vita2d_pgf_draw_text(font, 40, 504, kColorDim, 0.9f,
+                         "ARRIBA/ABAJO: ver   IZQ/DER: cambiar el volumen   CIRCULO o START: guardar y volver");
+    vita2d_pgf_draw_text(font, 40, 528, kColorDim, 0.85f, kVersion);
+    vita2d_end_drawing();
+    vita2d_swap_buffers();
+}
+
+/// La ventana de ajustes. Vuelve al cerrarla, con los ajustes aplicados y
+/// guardados.
+void RunSettingsMenu(vita2d_pgf* font) {
+    // L+R en partida cambia la resolucion sin pasar por aqui: partir del valor
+    // real, no del ultimo que se guardo.
+    g_user.half_resolution =
+        SwRenderer::FrameSkip::half_resolution.load(std::memory_order_relaxed);
+    g_user.jit_reg_cache = Core::ArmJit::reg_cache.load(std::memory_order_relaxed) != 0;
+    g_user.jit_vfp_data = Core::ArmJit::vfp_data.load(std::memory_order_relaxed) != 0;
+    g_user.gxm_no_finish = Gxm::RasterizerGXM::no_finish_wait.load(std::memory_order_relaxed) != 0;
+    g_user.gxm_present_direct =
+        Gxm::RasterizerGXM::present_direct.load(std::memory_order_relaxed) != 0;
+    g_user.jit_direct_link = Core::ArmJit::direct_link.load(std::memory_order_relaxed) != 0;
+    g_user.vs_escapes =
+        Pica::Shader::Generator::GXM::g_allow_vs_escapes.load(std::memory_order_relaxed);
+    g_user.full_vertex_dedup = Pica::g_full_vertex_dedup.load(std::memory_order_relaxed);
+    g_user.vs_specialize =
+        Gxm::RasterizerGXM::specialize_vs.load(std::memory_order_relaxed) != 0;
+    g_user.gpu_screen_copy =
+        Gxm::RasterizerGXM::transfer_on_gpu.load(std::memory_order_relaxed) != 0;
+    g_user.gpu_thread = VideoCore::GPU::async_enabled.load(std::memory_order_relaxed);
+    g_user.unlimited_speed = VitaFrontend::g_unlimited_speed.load(std::memory_order_relaxed);
+    g_user.gpu_scale =
+        static_cast<int>(Gxm::RasterizerGXM::resolution_scale.load(std::memory_order_relaxed));
+    g_user.async_shaders = Gxm::RasterizerGXM::async_vs.load(std::memory_order_relaxed) != 0;
+
+    int row = 0;
+    // Todo lo que ya este pulsado al entrar (el START que la abrio) cuenta como
+    // mantenido, no como pulsacion nueva: si no, se cerraria en el acto.
+    unsigned int previous_buttons = ~0u;
+    while (true) {
+        SceCtrlData pad{};
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        const unsigned int pressed = pad.buttons & ~previous_buttons;
+        previous_buttons = pad.buttons;
+
+        if (pressed & (SCE_CTRL_CIRCLE | SCE_CTRL_START)) {
+            break;
+        }
+        if (pressed & SCE_CTRL_DOWN) {
+            row = (row + 1) % kSettingsRows;
+        }
+        if (pressed & SCE_CTRL_UP) {
+            row = (row + kSettingsRows - 1) % kSettingsRows;
+        }
+        const int step = (pressed & SCE_CTRL_RIGHT) ? 1 : (pressed & SCE_CTRL_LEFT) ? -1 : 0;
+        // Solo el volumen (fila 0) se puede cambiar; el resto es de solo lectura.
+        if (step != 0 && row == 0) {
+            switch (row) {
+            case 0:
+                g_user.volume_percent = std::clamp(g_user.volume_percent + step * 10, 0, 100);
+                break;
+            case 1: {
+                const int index =
+                    (LanguageIndex(g_user.language) + step + kLanguageCount) % kLanguageCount;
+                g_user.language = kLanguages[index].value;
+                break;
+            }
+            case 2:
+                g_user.half_resolution = !g_user.half_resolution;
+                break;
+            case 3:
+                g_user.jit_reg_cache = !g_user.jit_reg_cache;
+                break;
+            case 4:
+                g_user.jit_vfp_data = !g_user.jit_vfp_data;
+                break;
+            case 5:
+                g_user.gxm_no_finish = !g_user.gxm_no_finish;
+                break;
+            case 6:
+                g_user.gxm_present_direct = !g_user.gxm_present_direct;
+                break;
+            case 7:
+                g_user.jit_direct_link = !g_user.jit_direct_link;
+                break;
+            case 8:
+                g_user.vs_escapes = !g_user.vs_escapes;
+                break;
+            case 9:
+                g_user.full_vertex_dedup = !g_user.full_vertex_dedup;
+                break;
+            case 10:
+                g_user.sound = !g_user.sound;
+                break;
+            case 11:
+                g_user.screen_layout =
+                    (g_user.screen_layout + step + VitaFrontend::kScreenLayoutCount) %
+                    VitaFrontend::kScreenLayoutCount;
+                break;
+            case 12:
+                g_user.skip_repeated = !g_user.skip_repeated;
+                break;
+            case 13:
+                g_user.vs_specialize = !g_user.vs_specialize;
+                break;
+            case 14:
+                g_user.gpu_screen_copy = !g_user.gpu_screen_copy;
+                break;
+            case 15:
+                g_user.gpu_thread = !g_user.gpu_thread;
+                break;
+            case 16:
+                g_user.unlimited_speed = !g_user.unlimited_speed;
+                break;
+            case 18:
+                g_user.async_shaders = !g_user.async_shaders;
+                break;
+            default:
+                // 0.5x -> 1x -> 2x con DERECHA, al reves con IZQUIERDA.
+                g_user.gpu_scale = step > 0 ? (g_user.gpu_scale == 1 ? 2 : g_user.gpu_scale == 2 ? 4 : 1)
+                                            : (g_user.gpu_scale == 4 ? 2 : g_user.gpu_scale == 2 ? 1 : 4);
+                break;
+            }
+            ApplyUserSettings();
+        }
+        DrawSettings(font, row);
+    }
+    ApplyUserSettings();
+    SaveUserSettings();
+    NoteUserSettings();
+}
+
 /// Dibuja una pantalla de texto simple centrada (menu y mensajes).
-void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected, int scroll) {
+/// 'settings_hold' va de 0 a 1 mientras se mantiene START para abrir los ajustes.
+void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected, int scroll,
+              float settings_hold) {
     constexpr int kVisibleRows = 14;
     constexpr int kRowHeight = 28;
     constexpr int kListTop = 120;
@@ -281,9 +801,9 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
     vita2d_clear_screen();
 
     vita2d_pgf_draw_text(font, 40, 50, kColorAccent, 1.4f, "Azahar  -  PS Vita");
-    vita2d_pgf_draw_text(font, 40, 524, kColorDim, 0.85f, VersionLine());
+    vita2d_pgf_draw_text(font, 40, 524, kColorDim, 0.85f, kVersion);
     vita2d_pgf_draw_text(font, 40, 80, kColorDim, 0.9f,
-                         "Emulador de Nintendo 3DS  |  interprete + renderizado por software");
+                         "Emulador de Nintendo 3DS  |  JIT ARM + renderizado GXM");
 
     if (roms.empty()) {
         vita2d_pgf_draw_text(font, 40, kListTop + 20, kColorText, 1.0f,
@@ -311,19 +831,48 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
                               "CRUZ: jugar   CIRCULO: salir   (%d/%d)", selected + 1,
                               static_cast<int>(roms.size()));
 
-        // El motor grafico se elige aqui y se aplica al siguiente juego: cada
-        // partida construye su renderer desde cero en RunGame, asi que no hace
-        // falta recrear nada en caliente (y el menu se dibuja a 60 fps, fuera
-        // del bucle de emulacion).
         if (Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::GXM) {
             vita2d_pgf_draw_text(font, 40, 470, kColorDim, 0.9f,
-                                 "SELECT: motor grafico  (GXM)");
+                                 "Motor grafico: GXM");
         } else {
             vita2d_pgf_draw_text(font, 40, 470, kColorDim, 0.9f,
-                                 "SELECT: motor grafico  (software)");
+                                 "Motor grafico: software");
         }
     }
 
+    // Ajustes: la pista siempre, y mientras se mantiene START, la barra que se
+    // llena en los dos segundos que hacen falta.
+    vita2d_pgf_draw_text(font, 40, 440, kColorDim, 0.9f,
+                         "Manten START 2 s: ajustes (solo se puede cambiar el volumen)");
+    if (settings_hold > 0.0f) {
+        vita2d_draw_rectangle(560, 430, 300, 10, 0xFF404040);
+        vita2d_draw_rectangle(560, 430, 300.0f * std::min(settings_hold, 1.0f), 10, kColorAccent);
+    }
+
+    vita2d_end_drawing();
+    vita2d_swap_buffers();
+}
+
+/// "Cargando shaders" con barra de progreso, antes de empezar el juego (0.2.0.4).
+void DrawShaderLoading(vita2d_pgf* font, u32 done, u32 total) {
+    vita2d_start_drawing();
+    vita2d_clear_screen();
+    vita2d_pgf_draw_text(font, 40, 200, kColorAccent, 1.3f, "Cargando shaders...");
+    constexpr float kBarX = 40.0f;
+    constexpr float kBarY = 240.0f;
+    constexpr float kBarWidth = 880.0f;
+    vita2d_draw_rectangle(kBarX, kBarY, kBarWidth, 18.0f, 0xFF404040);
+    if (total > 0) {
+        vita2d_draw_rectangle(kBarX, kBarY,
+                              kBarWidth * static_cast<float>(done) / static_cast<float>(total),
+                              18.0f, kColorAccent);
+        vita2d_pgf_draw_textf(font, 40, 300, kColorText, 1.0f, "%u / %u shaders", done, total);
+    } else {
+        vita2d_pgf_draw_text(font, 40, 300, kColorDim, 1.0f,
+                             "No hay shaders guardados de este juego todavia: se iran");
+        vita2d_pgf_draw_text(font, 40, 330, kColorDim, 1.0f,
+                             "guardando al jugar y la proxima vez cargaran aqui.");
+    }
     vita2d_end_drawing();
     vita2d_swap_buffers();
 }
@@ -387,17 +936,54 @@ constexpr char kCrashLog[] = "ux0:/data/azahar/crash.txt";
 void WriteCrashLog(const char* title, const char* detail) {
     sceIoMkdir("ux0:/data", 0777);
     sceIoMkdir("ux0:/data/azahar", 0777);
-    const SceUID fd = sceIoOpen(kCrashLog, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-    if (fd < 0) {
-        return;
+    const char* game_log = Common::VitaGameLog();
+    for (const char* file : {static_cast<const char*>(kCrashLog), game_log}) {
+        if (file[0] == '\0') {
+            continue;
+        }
+        const SceUID fd = sceIoOpen(file, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd < 0) {
+            continue;
+        }
+        sceIoWrite(fd, title, std::strlen(title));
+        sceIoWrite(fd, ": ", 2);
+        if (detail != nullptr) {
+            sceIoWrite(fd, detail, std::strlen(detail));
+        }
+        sceIoWrite(fd, "\n", 1);
+        sceIoClose(fd);
     }
-    sceIoWrite(fd, title, std::strlen(title));
-    sceIoWrite(fd, ": ", 2);
-    if (detail != nullptr) {
-        sceIoWrite(fd, detail, std::strlen(detail));
+}
+
+/**
+ * El crash.txt de este juego (0.1.9.7): ux0:/data/azahar/crash_<nombre del
+ * fichero de la ROM>.txt, con lo que no sea letra o numero cambiado por '_'.
+ * Empieza de cero en cada partida con la version y los ajustes; el de la
+ * partida anterior de ese juego queda como crash_<nombre>_anterior.txt.
+ */
+void StartGameLog(const std::string& rom_path) {
+    std::string name = rom_path.substr(rom_path.find_last_of("/:") + 1);
+    const std::size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos) {
+        name.resize(dot);
     }
-    sceIoWrite(fd, "\n", 1);
-    sceIoClose(fd);
+    for (char& c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c))) {
+            c = '_';
+        }
+    }
+    if (name.size() > 60) {
+        name.resize(60);
+    }
+    const std::string base = "ux0:/data/azahar/crash_" + name;
+    const std::string path = base + ".txt";
+    const std::string previous = base + "_anterior.txt";
+    Common::SetVitaGameLog(nullptr);
+    sceIoRemove(previous.c_str());
+    sceIoRename(path.c_str(), previous.c_str());
+    Common::SetVitaGameLog(path.c_str());
+    WriteCrashLog("version", kVersion);
+    NoteUserSettings();
 }
 
 /// Extrae tipo y mensaje de la excepcion que esta provocando el terminate.
@@ -826,6 +1412,7 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
 
     // Las rutas que use el emulador quedan anotadas: si algo peta recorriendo
     // directorios, saber cual estaba mirando es media respuesta.
+    StartGameLog(path);
     WriteCrashLog("carga", path.c_str());
     WriteCrashLog("ruta user", FileUtil::GetUserPath(FileUtil::UserPath::UserDir).c_str());
     WriteCrashLog("ruta sdmc", FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir).c_str());
@@ -872,6 +1459,20 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
     }
 
     LOG_INFO(Frontend, "Juego cargado (memoria libre: {} KB)", FreeMemoryKB());
+    if (Settings::GetWorkingGraphicsAPI() == Settings::GraphicsAPI::GXM) {
+        // Los shaders que este juego uso en partidas anteriores, a memoria antes
+        // de empezar (ver PreloadCgCache). Aun no hay emulacion: vita2d es solo
+        // de este hilo.
+        u64 program_id = 0;
+        system.GetAppLoader().ReadProgramId(program_id);
+        DrawShaderLoading(font, 0, 0);
+        const u32 loaded = Gxm::PreloadCgCache(
+            program_id, [font](u32 done, u32 total) { DrawShaderLoading(font, done, total); });
+        if (loaded == 0) {
+            // Primera partida de este juego: que se lea el aviso.
+            sceKernelDelayThread(800 * 1000);
+        }
+    }
     WriteCrashLog("carga", "System::Load OK, entrando al bucle de emulacion");
     system.RegisterCoreLoopThreadId();
 
@@ -885,6 +1486,38 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
     // los argumentos, lee basura y acaba saltando a una direccion invalida.
     // Es el mismo fallo que tenia sscanf con %zd.
     unsigned int loops = 0;
+    /**
+     * VIGILANTE DE CONGELACIONES (0.1.9.0). En 0.1.8.9, al pulsar A en el
+     * titulo de Zafiro Alfa el emulador se quedaba parado sin crashear y sin
+     * escribir nada mas en crash.txt. Este hilo mira si el bucle avanza; si
+     * pasan 6 segundos (y otra vez a los 30) sin una vuelta, anota en que paso
+     * esta el hilo de emulacion (Common::vita_stage) y los PC de los ARM11.
+     */
+    std::atomic<unsigned int> heartbeat{0};
+    std::atomic<bool> watchdog_stop{false};
+    std::thread watchdog([&heartbeat, &watchdog_stop, &system] {
+        unsigned int last = ~0u;
+        unsigned int still = 0;
+        while (!watchdog_stop.load(std::memory_order_relaxed)) {
+            sceKernelDelayThread(1000 * 1000);
+            const unsigned int now = heartbeat.load(std::memory_order_relaxed);
+            if (now != last) {
+                last = now;
+                still = 0;
+                continue;
+            }
+            still++;
+            if (still == 6 || still == 30) {
+                const std::string text = fmt::format(
+                    "{} s sin avanzar, en '{}' (ciclo {}), pc0 {:#010x} pc1 {:#010x}, hilo de "
+                    "la gpu en '{}'",
+                    still, Common::vita_stage.load(std::memory_order_relaxed), now,
+                    system.GetCore(0).GetPC(), system.GetCore(1).GetPC(),
+                    Common::vita_gpu_stage.load(std::memory_order_relaxed));
+                WriteCrashLog("congelado", text.c_str());
+            }
+        }
+    });
 
     bool user_quit = false;
 
@@ -901,7 +1534,13 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
                 }
             }
 
-            if (window->FramesPresented() == 0 && (loops % 64) == 0) {
+            const bool loading_screen = window->FramesPresented() == 0 && (loops % 64) == 0;
+            if (loading_screen) {
+                // vita2d desde este hilo solo con el de la GPU parado: con la GPU
+                // en otro nucleo, la primera presentacion puede estar en marcha.
+                system.GPU().Sync();
+            }
+            if (loading_screen && window->FramesPresented() == 0) {
                 const unsigned int seconds =
                     static_cast<unsigned int>((sceKernelGetProcessTimeWide() - start_us) / 1000000);
                 vita2d_start_drawing();
@@ -967,13 +1606,16 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
                 WriteCrashLog("avance", mark);
             }
             loops++;
+            heartbeat.store(loops, std::memory_order_relaxed);
 
+            Common::vita_stage.store("emulando", std::memory_order_relaxed);
             const Core::System::ResultStatus result = system.RunLoop();
             if (result != Core::System::ResultStatus::Success &&
                 result != Core::System::ResultStatus::ShutdownRequested) {
                 LOG_ERROR(Frontend, "RunLoop devolvio {}: {}", static_cast<int>(result),
                           system.GetStatusDetails());
                 WriteCrashLog("RunLoop error", system.GetStatusDetails().c_str());
+                system.GPU().StopThread();
                 DrawFatalError(font, "Error durante la emulacion", system.GetStatusDetails());
                 break;
             }
@@ -986,18 +1628,23 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
         // usuario cierra antes de leerla, el fichero no.
         WriteCrashLog("emulacion", "bad_alloc: sin memoria durante la emulacion");
         LOG_ERROR(Frontend, "Sin memoria durante la emulacion");
+        system.GPU().StopThread();
         DrawFatalError(font, "Sin memoria durante la emulacion",
                        "El juego cargo pero se agoto la memoria al ejecutarlo.");
     } catch (const std::exception& e) {
         std::string detail = std::string("[") + typeid(e).name() + "] " + e.what();
         WriteCrashLog("emulacion", detail.c_str());
         LOG_ERROR(Frontend, "Excepcion durante la emulacion: {}", e.what());
+        system.GPU().StopThread();
         DrawFatalError(font, "Error durante la emulacion", detail);
     } catch (...) {
         WriteCrashLog("emulacion", "excepcion de tipo no estandar");
+        system.GPU().StopThread();
         DrawFatalError(font, "Error durante la emulacion",
                        "Excepcion de un tipo no estandar.");
     }
+    watchdog_stop.store(true, std::memory_order_relaxed);
+    watchdog.join();
 
     // Resumen de la cache de traduccion al cerrar la partida (salga como salga:
     // el usuario cerro, o algo de lo de arriba lo corto). Sirve para decidir si
@@ -1021,6 +1668,8 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
     }
 
     system.Shutdown();
+    // El menu se dibuja con la espera al refresco, aunque la partida fuera sin limite.
+    vita2d_set_vblank_wait(1);
 }
 
 /**
@@ -1080,7 +1729,7 @@ void DrawStep(vita2d_pgf* font, const char* step) {
     vita2d_start_drawing();
     vita2d_clear_screen();
     vita2d_pgf_draw_text(font, 40, 60, kColorAccent, 1.3f, "Azahar  -  PS Vita");
-    vita2d_pgf_draw_text(font, 40, 90, kColorDim, 0.85f, VersionLine());
+    vita2d_pgf_draw_text(font, 40, 90, kColorDim, 0.85f, kVersion);
     vita2d_pgf_draw_text(font, 40, 140, kColorText, 1.0f, "Iniciando...");
     vita2d_pgf_draw_text(font, 40, 180, kColorDim, 1.0f, step);
 
@@ -1114,10 +1763,17 @@ void Run(vita2d_pgf* font) {
     Common::Log::Initialize();
     Common::Log::SetGlobalFilter(Common::Log::Filter(Common::Log::Level::Info));
     Common::Log::Start();
-    LOG_INFO(Frontend, "Azahar para PS Vita iniciando");
+    // La version va en la PRIMERA linea del log a proposito: con varios ciclos
+    // de compilar, instalar y mirar, la duda "¿pero que build es esta?" se
+    // resuelve abriendo el fichero, sin tener que cruzar fechas.
+    LOG_INFO(Frontend, "Azahar para PS Vita iniciando ({})", kVersion);
 
     DrawStep(font, "3/7 aplicando ajustes");
     ConfigureSettings();
+    // Encima, lo que el usuario eligio en la ventana de ajustes la ultima vez.
+    LoadUserSettings();
+    ApplyUserSettings();
+    NoteUserSettings();
 
     DrawStep(font, "4/7 configurando mandos");
     VitaFrontend::Input::Init();
@@ -1152,12 +1808,39 @@ void Run(vita2d_pgf* font) {
     // Estado anterior de los botones: sin esto un solo toque de la cruceta
     // recorreria la lista entera, porque el menu se dibuja a 60 fps.
     unsigned int previous_buttons = 0;
+    // Cuando empezo a mantenerse START (0 = no se esta manteniendo). Solo
+    // cuenta una pulsacion NUEVA: el START que viene mantenido de salir de un
+    // juego (START+SELECT) o de cerrar los ajustes no abre nada.
+    SceUInt64 start_hold_begin = 0;
 
     while (running) {
         SceCtrlData pad{};
         sceCtrlPeekBufferPositive(0, &pad, 1);
         const unsigned int pressed = pad.buttons & ~previous_buttons;
         previous_buttons = pad.buttons;
+
+        float settings_hold = 0.0f;
+        const bool start_alone =
+            (pad.buttons & SCE_CTRL_START) != 0 && (pad.buttons & SCE_CTRL_SELECT) == 0;
+        if (!start_alone) {
+            start_hold_begin = 0;
+        } else {
+            const SceUInt64 now = sceKernelGetProcessTimeWide();
+            if (pressed & SCE_CTRL_START) {
+                start_hold_begin = now;
+            }
+            if (start_hold_begin != 0) {
+                const SceUInt64 held = now - start_hold_begin;
+                settings_hold = static_cast<float>(held) / static_cast<float>(kSettingsHoldUs);
+                if (held >= kSettingsHoldUs) {
+                    RunSettingsMenu(font);
+                    start_hold_begin = 0;
+                    settings_hold = 0.0f;
+                    previous_buttons = ~0u;
+                    continue;
+                }
+            }
+        }
 
         if (pressed & SCE_CTRL_DOWN) {
             selected = std::min(selected + 1, static_cast<int>(roms.size()) - 1);
@@ -1167,14 +1850,6 @@ void Run(vita2d_pgf* font) {
         }
         if (pressed & SCE_CTRL_CIRCLE) {
             running = false;
-        }
-        if (pressed & SCE_CTRL_SELECT) {
-            // Alterna el motor grafico del siguiente juego. El renderer se
-            // construye en System::Load, con estos ajustes ya puestos.
-            const bool gxm =
-                Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::GXM;
-            Settings::values.graphics_api =
-                gxm ? Settings::GraphicsAPI::Software : Settings::GraphicsAPI::GXM;
         }
         if ((pressed & SCE_CTRL_CROSS) && !roms.empty()) {
             RunGame(font, roms[selected].path);
@@ -1191,7 +1866,7 @@ void Run(vita2d_pgf* font) {
             scroll = selected - 13;
         }
 
-        DrawMenu(font, roms, selected, scroll);
+        DrawMenu(font, roms, selected, scroll, settings_hold);
     }
 
     VitaFrontend::Input::Shutdown();
@@ -1221,8 +1896,19 @@ int main(int argc, char** argv) {
     //
     // build.sh guarda ahora una copia del ELF por version. Con esta linea se
     // sabe cual hay que usar.
+    //
+    // UN crash.txt POR SESION (0.1.7.3). El fichero crecia sin fin (6 MB con
+    // sesiones desde 0.1.4), y el que llegaba para analizar era a menudo el de
+    // una version vieja sin que se notara. Ahora cada arranque empieza uno
+    // nuevo y el de la sesion anterior queda en crash_anterior.txt.
+    sceIoMkdir("ux0:/data", 0777);
+    sceIoMkdir("ux0:/data/azahar", 0777);
+    sceIoRemove("ux0:/data/azahar/crash_anterior.txt");
+    sceIoRename(kCrashLog, "ux0:/data/azahar/crash_anterior.txt");
+    // Lo mismo con los shaders que no compilan: solo los de esta sesion.
+    sceIoRemove("ux0:/data/azahar/cg_error_anterior.txt");
+    sceIoRename("ux0:/data/azahar/cg_error.txt", "ux0:/data/azahar/cg_error_anterior.txt");
     WriteCrashLog("version", kVersion);
-    WriteCrashLog("build", kBuildInfo);
     WriteCrashLog("main", "entrando (inicializadores estaticos superados)");
 
     scePowerSetArmClockFrequency(444);
@@ -1248,6 +1934,20 @@ int main(int argc, char** argv) {
             scePowerGetGpuClockFrequency());
         *result.out = 0;
         WriteCrashLog("relojes", buffer);
+    }
+    {
+        // Lo que cuesta leer el reloj (0.2.1.0): los desgloses lo leen miles de
+        // veces por fotograma, y en la Vita es una llamada al kernel.
+        const unsigned long long begin = Common::VitaMicros();
+        for (int i = 0; i < 1000; i++) {
+            (void)Common::VitaMicros();
+        }
+        const unsigned long long elapsed = Common::VitaMicros() - begin;
+        char buffer[64];
+        const auto result =
+            fmt::format_to_n(buffer, sizeof(buffer) - 1, "1000 lecturas en {} us", elapsed);
+        *result.out = 0;
+        WriteCrashLog("reloj", buffer);
     }
 
     // El presupuesto de memoria, anotado ANTES de reservar nada.

@@ -13,6 +13,12 @@
 
 namespace Gxm {
 
+/// Los dos shaders del quad texturizado del presentador. La copia de pantalla
+/// del rasterizador (0.1.8.7) usa los mismos: con el mismo texto, la cache de
+/// shaders de la tarjeta los sirve sin compilar.
+extern const char kBlitVertexSource[];
+extern const char kBlitFragmentSource[];
+
 /**
  * Presenta las dos pantallas del 3DS con el chip grafico de la consola.
  *
@@ -115,6 +121,13 @@ private:
         u32 height = 0;
         u32 stride = 0;
         Pica::PixelFormat format = Pica::PixelFormat::RGBA8;
+        /**
+         * La textura apunta AL color_buffer de una Surface de GXM (4.6), no a
+         * 'buffer'. En ese caso 'buffer' puede estar vacio y no se copia nada:
+         * hay que rehacer la textura cuando se vuelva al camino normal o cuando
+         * cambien las medidas.
+         */
+        bool points_at_gxm_surface = false;
     };
 
     /// Que hay que dibujar en una pantalla este fotograma.

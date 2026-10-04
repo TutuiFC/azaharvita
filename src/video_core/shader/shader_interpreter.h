@@ -12,10 +12,21 @@ namespace Pica {
 struct ShaderRegs;
 }
 
+#ifdef __PSVITA__
+#include <memory>
+#include <unordered_map>
+namespace Pica::Shader::Fast {
+struct Program;
+}
+#endif
+
 namespace Pica::Shader {
 
 class InterpreterEngine final : public ShaderEngine {
 public:
+    InterpreterEngine();
+    ~InterpreterEngine() override;
+
     void SetupBatch(ShaderSetup& setup, u32 entry_point) override;
     void Run(const ShaderSetup& setup, ShaderUnit& state) const override;
 
@@ -28,6 +39,14 @@ public:
      */
     DebugData<true> ProduceDebugInfo(const ShaderSetup& setup, const AttributeBuffer& input,
                                      const ShaderRegs& config) const;
+
+#ifdef __PSVITA__
+private:
+    /// Programas pre-decodificados por (codigo, swizzles, entrada). Ver
+    /// shader_interpreter_fast.h. Solo se toca en SetupBatch, desde el hilo de
+    /// emulacion; los nucleos que sombrean solo LEEN el programa ya hecho.
+    std::unordered_map<u64, std::unique_ptr<Fast::Program>> fast_programs;
+#endif
 };
 
 } // namespace Pica::Shader

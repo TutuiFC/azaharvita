@@ -31,16 +31,29 @@
 
 namespace Service::FS {
 
+namespace {
+/// Prefijo con el que empiezan las rutas de titulos instalados en la tarjeta.
+/// Tiene que ser el MISMO que usa am.cpp para construirlas; de ahi que los dos
+/// salgan de SDMC_TITLE_DIR en Vita (ver fs/archive.h).
+std::string SdmcTitlePrefix() {
+#ifdef __PSVITA__
+    return FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir) + SDMC_TITLE_DIR;
+#else
+    return FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir) + "Nintendo 3DS";
+#endif
+}
+} // Anonymous namespace
+
 bool IsInstalledApplication(std::string_view path) {
     return path.rfind(FileUtil::GetUserPath(FileUtil::UserPath::NANDDir) + "title", 0) == 0 ||
-           path.rfind(FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir) + "Nintendo 3DS", 0) == 0;
+           path.rfind(SdmcTitlePrefix(), 0) == 0;
 }
 
 MediaType GetMediaTypeFromPath(std::string_view path) {
     if (path.rfind(FileUtil::GetUserPath(FileUtil::UserPath::NANDDir) + "title", 0) == 0) {
         return MediaType::NAND;
     }
-    if (path.rfind(FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir) + "Nintendo 3DS", 0) == 0) {
+    if (path.rfind(SdmcTitlePrefix(), 0) == 0) {
         return MediaType::SDMC;
     }
     return MediaType::GameCard;

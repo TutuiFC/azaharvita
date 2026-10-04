@@ -24,7 +24,10 @@ public:
 
     template <typename T>
     void LoadAttribute(PAddr source_addr, u32 attrib, AttributeBuffer& out) const {
-        const T* data = reinterpret_cast<const T*>(memory.GetPhysicalPointer(source_addr));
+        // La version segura entre hilos: esto lo llaman a la vez los tres
+        // nucleos que sombrean vertices. Ver GetPhysicalPointerThreadSafe.
+        const T* data =
+            reinterpret_cast<const T*>(memory.GetPhysicalPointerThreadSafe(source_addr));
         for (u32 comp = 0; comp < vertex_attribute_elements[attrib]; ++comp) {
             out[attrib][comp] = f24::FromFloat32(data[comp]);
         }

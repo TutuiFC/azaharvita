@@ -22,8 +22,8 @@ SubIOFile::SubIOFile() {
     Child() = std::make_unique<NullIOFile>();
 }
 
-SubIOFile::SubIOFile(const std::string& filename, const char openmode[], u64 sub_file_offset,
-                     u64 sub_file_size, int flags)
+SubIOFile::SubIOFile(const std::string& filename, const char openmode[],
+                     std::size_t sub_file_offset, std::size_t sub_file_size, int flags)
     : m_sub_file_offset(sub_file_offset), m_sub_file_capacity(sub_file_size),
       m_sub_file_size(sub_file_size) {
     if (!IsReplaceOpenMode(openmode)) {
@@ -40,8 +40,8 @@ SubIOFile::SubIOFile(const std::string& filename, const char openmode[], u64 sub
     }
 }
 
-SubIOFile::SubIOFile(std::unique_ptr<IOFileBase>&& child_file, u64 sub_file_offset,
-                     u64 sub_file_size)
+SubIOFile::SubIOFile(std::unique_ptr<IOFileBase>&& child_file, std::size_t sub_file_offset,
+                     std::size_t sub_file_size)
     : m_sub_file_offset(sub_file_offset), m_sub_file_capacity(sub_file_size),
       m_sub_file_size(sub_file_size) {
     Child() = std::move(child_file);
@@ -182,8 +182,8 @@ std::unique_ptr<IOFileBase> SubIOFile::OpenCopy() const {
     return ret;
 }
 
-u64 SubIOFile::BytesRemaining() const {
-    const u64 pos = Tell();
+std::size_t SubIOFile::BytesRemaining() const {
+    const std::size_t pos = Tell();
     return pos >= m_sub_file_size ? 0 : (m_sub_file_size - pos);
 }
 
@@ -191,13 +191,12 @@ std::size_t SubIOFile::ReadImpl(void* data, std::size_t length, std::size_t elem
     if (!IsOpen() || elem_size == 0) {
         return 0;
     }
-    const u64 requested_bytes = static_cast<u64>(length) * elem_size;
-    const u64 bytes_to_read = std::min(requested_bytes, BytesRemaining());
+    const std::size_t requested_bytes = length * elem_size;
+    const std::size_t bytes_to_read = std::min(requested_bytes, BytesRemaining());
     if (bytes_to_read == 0) {
         return 0;
     }
-    const std::span<char> byte_span(reinterpret_cast<char*>(data),
-                                    static_cast<std::size_t>(bytes_to_read));
+    const std::span<char> byte_span(reinterpret_cast<char*>(data), bytes_to_read);
     const std::size_t bytes_read = Child()->ReadSpan(byte_span);
     return bytes_read / elem_size;
 }
@@ -206,28 +205,25 @@ std::size_t SubIOFile::ReadAtImpl(void* data, std::size_t byte_count, std::size_
     if (!IsOpen() || offset >= m_sub_file_size) {
         return 0;
     }
-    const u64 available = m_sub_file_size - offset;
-    const u64 bytes_to_read = std::min<u64>(byte_count, available);
+    const std::size_t available = m_sub_file_size - offset;
+    const std::size_t bytes_to_read = std::min(byte_count, available);
     if (bytes_to_read == 0) {
         return 0;
     }
-    const u64 absolute_offset = m_sub_file_offset + offset;
-    return Child()->ReadAtArray(reinterpret_cast<char*>(data),
-                                static_cast<std::size_t>(bytes_to_read),
-                                static_cast<std::size_t>(absolute_offset));
+    const std::size_t absolute_offset = m_sub_file_offset + offset;
+    return Child()->ReadAtArray(reinterpret_cast<char*>(data), bytes_to_read, absolute_offset);
 }
 
 std::size_t SubIOFile::WriteImpl(const void* data, std::size_t length, std::size_t elem_size) {
     if (!IsOpen() || elem_size == 0) {
         return 0;
     }
-    const u64 requested_bytes = static_cast<u64>(length) * elem_size;
-    const u64 bytes_to_write = std::min(requested_bytes, BytesRemaining());
+    const std::size_t requested_bytes = length * elem_size;
+    const std::size_t bytes_to_write = std::min(requested_bytes, BytesRemaining());
     if (bytes_to_write == 0) {
         return 0;
     }
-    const std::span<const char> byte_span(reinterpret_cast<const char*>(data),
-                                          static_cast<std::size_t>(bytes_to_write));
+    const std::span<const char> byte_span(reinterpret_cast<const char*>(data), bytes_to_write);
     const std::size_t bytes_written = Child()->WriteSpan(byte_span);
     return bytes_written / elem_size;
 }

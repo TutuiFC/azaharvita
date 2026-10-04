@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <string_view>
+
 namespace VitaFrontend {
 
 /**
@@ -27,17 +29,36 @@ namespace VitaFrontend {
  * por GXM identica al camino de software) y se abre la Fase 3 con el generador
  * de shaders Cg.
  */
-constexpr char kVersion[] = "version 0.1.0.25";
+/*
+ * NUMERACION DESDE 0.1.4.5 (peticion del usuario, 22/09/2026): cada cifra va
+ * de 0 a 9 y al pasar de 9 se suma uno a la de su izquierda, como un
+ * cuentakilometros. La que habria sido 0.1.0.45 es 0.1.4.5; despues de 0.1.4.9
+ * viene 0.1.5.0. Las versiones anteriores (0.1.0.1 a 0.1.0.44) se quedan con
+ * su nombre en elf/, y ninguna choca con las nuevas.
+ */
+constexpr char kVersion[] = "version 0.1B";
 
-/// La misma version con el nombre delante, para el overlay ("Azahar 0.1.0.25").
-constexpr char kOverlayBuild[] = "Azahar 0.1.0.25";
+/// La misma version con el nombre delante, para el overlay ("Azahar 0.1B").
+constexpr char kOverlayBuild[] = "Azahar 0.1B";
 
 /**
- * Sello de compilacion ("fecha | hash de git"). Lo genera build.sh en cada
- * compilacion (vita_build_info.inc, no versionado), asi que cambia SIEMPRE,
- * aunque se olvide subir kVersion. Con esto se sabe de un vistazo si el VPK
- * que corre la consola es el ultimo build o uno viejo.
+ * Y AHORA EL COMPILADOR VIGILA QUE LAS DOS DIGAN LO MISMO.
+ *
+ * Este fichero nacio para que la version viviera en UN solo sitio, porque
+ * main.cpp y vita_window.cpp la repetian a mano y se desincronizaron. Dentro
+ * del propio fichero se volvio a repetir, y volvio a pasar exactamente lo
+ * mismo: el overlay estuvo anunciando 0.1.0.15 durante seis versiones, con una
+ * captura de pantalla de por medio que costo una vuelta entera de diagnostico
+ * ("¿pero que build es esa?").
+ *
+ * Las dos cadenas no se pueden fundir en una sola sin romper el grep de
+ * build.sh, que es lo que archiva el ELF con la version en el nombre. Asi que
+ * se quedan separadas y se comparan aqui: "Azahar " son 7 caracteres y
+ * "version " son 8, de modo que a partir de ahi tienen que ser identicas. Si
+ * alguien cambia una y olvida la otra, no compila.
  */
-extern const char kBuildInfo[];
+static_assert(std::string_view{kOverlayBuild}.substr(7) ==
+                  std::string_view{kVersion}.substr(8),
+              "kOverlayBuild y kVersion se han desincronizado: actualiza las dos");
 
 } // namespace VitaFrontend

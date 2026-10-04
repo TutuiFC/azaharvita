@@ -3,6 +3,8 @@
 Port del emulador de Nintendo 3DS [Azahar](https://github.com/azahar-emu/azahar)
 a PS Vita real (ARMv7, Cortex-A9).
 
+**Versión actual: 0.1B.**
+
 ---
 
 ## Cómo instalarlo
@@ -36,9 +38,13 @@ Los botones se mapean por posición, no por nombre: el botón de confirmar del
 ZL/ZR del New 3DS se quedan sin asignar: a la Vita se le acaban los botones y
 robárselos a algo que los juegos sí usan sería peor.
 
-En el menú de ROMs, **SELECT** alterna el motor gráfico entre la presentación
-por GXM y el renderer de software completo, y la elección se aplica al
-siguiente juego que se cargue.
+Manteniendo **START** dos segundos en el menú de ROMs se abre la ventana de
+**Ajustes**. Muestra la configuración con la que se juega, pero **el único
+ajuste que se puede cambiar es el volumen**; el resto es de solo lectura (y
+`ajustes.txt` solo se lee para el volumen).
+
+En partida, un pequeño indicador arriba a la izquierda muestra la versión, los
+FPS y el porcentaje de velocidad.
 
 ---
 
@@ -46,13 +52,12 @@ siguiente juego que se cargue.
 
 **Va a ir muy lento.** No es un defecto del port, es aritmética:
 
-- La Vita **no usa JIT**. El recompilador de Azahar (dynarmic) solo tiene
-  backends para x86-64 y ARM64; la Vita es ARMv7 de 32 bits y no existe backend
-  para ella. Se usa el intérprete `dyncom`, que ejecuta las instrucciones del
-  ARM11 una a una: entre 10 y 50 veces más lento que un JIT. (Ejecutar el ARM11
-  *nativamente* sobre el Cortex-A9 con un plugin en modo kernel es posible — el
-  ARM11 es ARMv6K y el Cortex-A9 ARMv7-A —, pero es un proyecto aparte que no
-  está hecho.)
+- El recompilador de Azahar (dynarmic) solo tiene backends para x86-64 y
+  ARM64, y no existe backend para ARMv7. Este port lleva un **JIT propio e
+  híbrido** (`core/arm/dyncom/arm_dyncom_jit.*`): como el ARM11 del 3DS y el
+  Cortex-A9 son los dos ARM, los bloques de instrucciones soportados se emiten
+  con la misma codificación y el resto se queda en el intérprete `dyncom`, que
+  ejecuta las instrucciones del ARM11 una a una.
 - La PICA200 **se sigue rasterizando en la CPU**. Azahar necesita OpenGL 4.3 o
   Vulkan 1.1 para rasterizar por hardware, y la Vita da OpenGL ES 2.0 vía GXM.
   Lo que sí hace ya este port es **presentar con el chip gráfico** (backend
@@ -96,8 +101,9 @@ export VITASDK=/ruta/al/vitasdk
 ./build.sh clean            # borra build/
 ```
 
-`build.sh` tiene las rutas de este equipo cableadas arriba; cámbialas si
-mueves el proyecto.
+`build.sh` toma el SDK de la variable `VITASDK` y `cmake`/`ninja` del `PATH`.
+Clona el proyecto en una ruta **sin espacios**: el empaquetado del VPK
+(`vita-pack-vpk`) no entrecomilla las rutas y falla si las hay.
 
 ### Si no arranca en la consola
 
