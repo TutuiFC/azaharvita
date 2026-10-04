@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <fmt/format.h>
 #include <psp2/kernel/modulemgr.h>
@@ -226,6 +227,30 @@ std::string CachePath(u64 hash_city, SceShaccCgTargetProfile profile) {
     return fmt::format("{}/{:016x}_{}.gxp", kCacheDir, hash_city, static_cast<u32>(profile));
 }
 
+/// Ficheros de la cache precargados en memoria (PreloadCgCache), por ruta, y
+/// la lista de los que ha usado el juego actual. g_preload_mutex protege los
+/// tres: los usan el hilo de la GPU y el de compilacion.
+std::mutex g_preload_mutex;
+std::unordered_map<std::string, std::vector<u8>> g_preloaded;
+std::unordered_set<std::string> g_game_list;
+std::string g_game_list_path;
+
+/// Apunta el fichero en la lista del juego, una vez.
+void RememberForGame(const std::string& path) {
+    const std::lock_guard lock{g_preload_mutex};
+    if (g_game_list_path.empty() || !g_game_list.insert(path).second) {
+        return;
+    }
+    const SceUID fd =
+        sceIoOpen(g_game_list_path.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    if (fd < 0) {
+        return;
+    }
+    const std::string line = path + "\n";
+    sceIoWrite(fd, line.data(), static_cast<SceSize>(line.size()));
+    sceIoClose(fd);
+}
+
 void NoteCache(const std::string& text) {
     // Solo las primeras: crash.txt no es sitio para una linea por shader.
     if (g_cache_notes < 6) {
@@ -234,7 +259,60 @@ void NoteCache(const std::string& text) {
     }
 }
 
+/// Lo mismo que LoadCached, desde una copia del fichero en memoria.
+const SceShaccCgCompileOutput* FromPreloaded(const CacheHeader& want,
+                                             const std::vector<u8>& file) {
+    CacheHeader have{};
+    if (file.size() < sizeof(have)) {
+        return nullptr;
+    }
+    std::memcpy(&have, file.data(), sizeof(have));
+    if (have.magic != want.magic || have.version != want.version ||
+        have.profile != want.profile || have.source_size != want.source_size ||
+        have.hash_city != want.hash_city || have.hash_fnv != want.hash_fnv ||
+        have.program_size == 0 || file.size() != sizeof(have) + have.program_size) {
+        return nullptr;
+    }
+    void* memory = std::malloc(sizeof(SceShaccCgCompileOutput) + have.program_size);
+    if (memory == nullptr) {
+        return nullptr;
+    }
+    u8* program = static_cast<u8*>(memory) + sizeof(SceShaccCgCompileOutput);
+    std::memcpy(program, file.data() + sizeof(have), have.program_size);
+    auto* output = static_cast<SceShaccCgCompileOutput*>(memory);
+    output->programData = program;
+    output->programSize = have.program_size;
+    output->diagnosticCount = 0;
+    output->diagnostics = nullptr;
+    {
+        const std::lock_guard lock{g_outputs_mutex};
+        g_cached_outputs.insert(output);
+    }
+    return output;
+}
+
+const SceShaccCgCompileOutput* LoadCachedFromCard(const CacheHeader& want,
+                                                  const std::string& path);
+
 const SceShaccCgCompileOutput* LoadCached(const CacheHeader& want, const std::string& path) {
+    {
+        const std::lock_guard lock{g_preload_mutex};
+        const auto it = g_preloaded.find(path);
+        if (it != g_preloaded.end()) {
+            if (const SceShaccCgCompileOutput* output = FromPreloaded(want, it->second)) {
+                return output;
+            }
+        }
+    }
+    const SceShaccCgCompileOutput* output = LoadCachedFromCard(want, path);
+    if (output != nullptr) {
+        RememberForGame(path);
+    }
+    return output;
+}
+
+const SceShaccCgCompileOutput* LoadCachedFromCard(const CacheHeader& want,
+                                                  const std::string& path) {
     const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
     if (fd < 0) {
         return nullptr;
@@ -367,7 +445,9 @@ void StoreCached(CacheHeader header, const std::string& path,
     if (!ok) {
         // A medias no sirve: que la proxima vez se compile.
         sceIoRemove(path.c_str());
+        return;
     }
+    RememberForGame(path);
 }
 
 /**
@@ -605,6 +685,85 @@ bool CgHeapLow() {
     const std::size_t total = _newlib_heap_size_user;
     const std::size_t reserve = static_cast<std::size_t>(kCgHeapReserveMB) * 1024u * 1024u;
     return HeapInUse() + reserve > total;
+}
+
+u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress) {
+    // Nada de lo anterior sirve para otro juego.
+    std::vector<std::string> paths;
+    {
+        const std::lock_guard lock{g_preload_mutex};
+        g_preloaded.clear();
+        g_game_list.clear();
+        g_game_list_path = fmt::format("{}/juego_{:016x}.lst", kCacheDir, program_id);
+    }
+    sceIoMkdir(kCacheDir, 0777);
+    const SceUID list_fd = sceIoOpen(g_game_list_path.c_str(), SCE_O_RDONLY, 0);
+    if (list_fd >= 0) {
+        std::string text;
+        char chunk[4096];
+        int read = 0;
+        while ((read = sceIoRead(list_fd, chunk, sizeof(chunk))) > 0) {
+            text.append(chunk, static_cast<std::size_t>(read));
+        }
+        sceIoClose(list_fd);
+        std::size_t start = 0;
+        while (start < text.size()) {
+            std::size_t end = text.find('\n', start);
+            if (end == std::string::npos) {
+                end = text.size();
+            }
+            if (end > start) {
+                paths.emplace_back(text.substr(start, end - start));
+            }
+            start = end + 1;
+        }
+    }
+    /**
+     * Tope de memoria: los programas de un juego pesan de unos KB a decenas de
+     * KB cada uno, pero la lista crece con cada partida. Lo que no quepa se
+     * lee de la tarjeta como antes.
+     */
+    constexpr std::size_t kMaxPreloadBytes = 24u * 1024u * 1024u;
+    std::size_t total_bytes = 0;
+    u32 loaded = 0;
+    const u32 total = static_cast<u32>(paths.size());
+    for (u32 i = 0; i < total; i++) {
+        if (progress && (i % 8) == 0) {
+            progress(i, total);
+        }
+        const std::string& path = paths[i];
+        const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+        if (fd < 0) {
+            continue;
+        }
+        const SceOff size = sceIoLseek(fd, 0, SCE_SEEK_END);
+        sceIoLseek(fd, 0, SCE_SEEK_SET);
+        bool ok = size > static_cast<SceOff>(sizeof(CacheHeader)) &&
+                  size < 4 * 1024 * 1024 &&
+                  total_bytes + static_cast<std::size_t>(size) <= kMaxPreloadBytes;
+        std::vector<u8> file;
+        if (ok) {
+            file.resize(static_cast<std::size_t>(size));
+            ok = sceIoRead(fd, file.data(), static_cast<SceSize>(file.size())) ==
+                 static_cast<int>(file.size());
+        }
+        sceIoClose(fd);
+        if (!ok) {
+            continue;
+        }
+        total_bytes += file.size();
+        loaded++;
+        const std::lock_guard lock{g_preload_mutex};
+        g_game_list.insert(path);
+        g_preloaded.emplace(path, std::move(file));
+    }
+    if (progress) {
+        progress(total, total);
+    }
+    Common::VitaNote("gxm cache", fmt::format("precarga: {} de {} shaders, {} KB", loaded, total,
+                                              total_bytes / 1024)
+                                      .c_str());
+    return loaded;
 }
 
 const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, const char* name,

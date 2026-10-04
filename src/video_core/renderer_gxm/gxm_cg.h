@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -71,6 +72,17 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
                                          const char* source);
 
 void ReleaseCgOutput(const SceShaccCgCompileOutput* output);
+
+/**
+ * PRECARGA DE LA CACHE DE SHADERS (0.2.0.3). Cada shader que se lee o se
+ * guarda en la cache de la tarjeta queda apuntado en una lista por juego
+ * (shadercache/juego_<id>.lst). Al arrancar ese juego otra vez, esto lee a
+ * memoria todos los de su lista, y durante la partida se sirven de ahi en vez
+ * de abrir un fichero en la tarjeta por shader: en una transicion al 3D eran
+ * decenas de lecturas de varios ms cada una en mitad del juego. 'progress'
+ * recibe (leidos, total). Devuelve cuantos se precargaron.
+ */
+u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress);
 
 /**
  * COMPILACION EN SEGUNDO PLANO (0.1.9.6).
