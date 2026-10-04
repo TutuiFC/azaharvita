@@ -280,6 +280,17 @@ public:
     /// Lotes que no pudieron, y el ultimo motivo (texto literal). Ver HwVsReject.
     static std::atomic<u32> hw_vs_rejects;
     static std::atomic<const char*> hw_vs_last_reject;
+    /**
+     * Cuantas veces cada motivo (0.2.1.1): el ultimo solo no decia que lotes
+     * van a la CPU en una escena 3D. Lo escribe el hilo de la GPU; los mas
+     * frecuentes del intervalo los saca TakeRejectSummary para crash.txt.
+     */
+    struct RejectCount {
+        std::atomic<const char*> reason{nullptr};
+        std::atomic<u32> count{0};
+    };
+    static std::array<RejectCount, 12> reject_counts;
+    [[nodiscard]] static std::string TakeRejectSummary();
 
     /**
      * 4.5 (0.1.5.2): NO esperar a sceGxmFinish al cerrar cada escena.

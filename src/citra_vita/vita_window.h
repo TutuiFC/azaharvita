@@ -301,6 +301,8 @@ private:
     double stats_shade_ms = 0.0;
     double stats_finish_ms = 0.0;
     double stats_texdecode_ms = 0.0;
+    double stats_texrehash_ms = 0.0;
+    double stats_texrehash_kb = 0.0;
     unsigned int stats_texdecodes = 0;
     /// Vaciados de la cache de traduccion del ARM en el ultimo intervalo, y los
     /// totales en la lectura anterior para poder restar. Ver el calculo.

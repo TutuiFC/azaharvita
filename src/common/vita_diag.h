@@ -119,6 +119,9 @@ inline std::atomic<unsigned long long> texture_decode_us{0};
 inline std::atomic<unsigned int> texture_reuses{0};
 inline std::atomic<unsigned int> texture_changed{0};
 inline std::atomic<unsigned int> texture_evictions{0};
+/// Lo que cuesta revisar las sospechosas (0.2.1.1): el hash de sus bytes.
+inline std::atomic<unsigned long long> texture_rehash_us{0};
+inline std::atomic<unsigned long long> texture_rehash_bytes{0};
 /**
  * Ruta rapida del interprete de shaders (0.1.0.44, ver
  * shader_interpreter_fast.h). programs = programas pre-decodificados desde el
@@ -202,6 +205,8 @@ inline void Reset() {
     shade_us.store(0, std::memory_order_relaxed);
     finish_us.store(0, std::memory_order_relaxed);
     texture_decode_us.store(0, std::memory_order_relaxed);
+    texture_rehash_us.store(0, std::memory_order_relaxed);
+    texture_rehash_bytes.store(0, std::memory_order_relaxed);
     shade_busy_us.store(0, std::memory_order_relaxed);
     overlay_us.store(0, std::memory_order_relaxed);
     dsp_us.store(0, std::memory_order_relaxed);

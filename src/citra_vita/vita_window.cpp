@@ -898,6 +898,10 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             }
             stats_finish_ms = per_frame_ms(Common::FrameStats::finish_us);
             stats_texdecode_ms = per_frame_ms(Common::FrameStats::texture_decode_us);
+            stats_texrehash_ms = per_frame_ms(Common::FrameStats::texture_rehash_us);
+            stats_texrehash_kb = static_cast<double>(Common::FrameStats::texture_rehash_bytes.load(
+                                     std::memory_order_relaxed)) /
+                                 n / 1024.0;
             stats_texdecodes =
                 Common::FrameStats::texture_decodes.exchange(0, std::memory_order_relaxed);
             stats_texreuses =
@@ -1284,7 +1288,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 "sinc soft {} | saltados por compilar {}",
                                 stats_triangles_per_frame, stats_tri_gpu, stats_tri_sw,
                                 stats_gpu_batches, stats_hw_vs_batches, stats_hw_vs_rejects,
-                                stats_hw_vs_reason != nullptr ? stats_hw_vs_reason : "-",
+                                Gxm::RasterizerGXM::TakeRejectSummary(),
                                 stats_vertices_shaded, stats_gpu_scenes, stats_gpu_writebacks,
                                 stats_gx_cmdlist, stats_gx_fill, stats_gx_transfer,
                                 stats_shade_occupancy, stats_instrs_per_vertex, stats_fast_percent,
@@ -1304,11 +1308,13 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 Common::VitaNote(
                     "texturas",
                     fmt::format("decodificadas {} ({:.1f} ms/fot) | revisadas iguales {} "
-                                "cambiadas {} expulsadas {} | escenas cerradas por vertices {} "
-                                "por tablas de luz {} | espera a la gpu {:.1f} ms/fot",
+                                "cambiadas {} expulsadas {} (hash {:.1f} ms y {:.0f} KB por fot) "
+                                "| escenas cerradas por vertices {} por tablas de luz {} | "
+                                "espera a la gpu {:.1f} ms/fot",
                                 stats_texdecodes, stats_texdecode_ms, stats_texreuses,
-                                stats_texchanged, stats_texevictions, stats_close_full,
-                                stats_close_lut, stats_finish_ms)
+                                stats_texchanged, stats_texevictions, stats_texrehash_ms,
+                                stats_texrehash_kb, stats_close_full, stats_close_lut,
+                                stats_finish_ms)
                         .c_str());
                 Common::VitaNote(
                     "gpu hilo",

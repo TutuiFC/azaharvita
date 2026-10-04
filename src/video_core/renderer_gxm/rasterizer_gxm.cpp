@@ -48,6 +48,7 @@ std::atomic<u32> RasterizerGXM::scene_close_lut{0};
 std::atomic<u32> RasterizerGXM::hw_vs_batches{0};
 std::atomic<u32> RasterizerGXM::hw_vs_rejects{0};
 std::atomic<const char*> RasterizerGXM::hw_vs_last_reject{"-"};
+std::array<RasterizerGXM::RejectCount, 12> RasterizerGXM::reject_counts{};
 std::atomic<u32> RasterizerGXM::Ablation::mode{0};
 std::atomic<u32> RasterizerGXM::no_finish_wait{1};
 std::atomic<u32> RasterizerGXM::present_direct{1};
@@ -4975,6 +4976,18 @@ void RasterizerGXM::ClearAll(bool flush) {
 static bool HwVsReject(const char* why) {
     RasterizerGXM::hw_vs_last_reject.store(why, std::memory_order_relaxed);
     RasterizerGXM::hw_vs_rejects.fetch_add(1, std::memory_order_relaxed);
+    // Solo lo llama el hilo de la GPU: el hueco libre no se lo disputa nadie.
+    for (auto& slot : RasterizerGXM::reject_counts) {
+        const char* reason = slot.reason.load(std::memory_order_relaxed);
+        if (reason == nullptr) {
+            slot.reason.store(why, std::memory_order_relaxed);
+            reason = why;
+        }
+        if (reason == why) {
+            slot.count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
     return false;
 }
 
@@ -5765,6 +5778,36 @@ std::array<unsigned long long, RasterizerGXM::kBatchPhases> RasterizerGXM::batch
 u32 RasterizerGXM::batch_phase_samples = 0;
 unsigned long long RasterizerGXM::state_scene_us = 0;
 unsigned long long RasterizerGXM::state_texture_us = 0;
+
+std::string RasterizerGXM::TakeRejectSummary() {
+    // El mismo texto puede venir de dos ficheros con punteros distintos: se
+    // juntan por contenido.
+    std::vector<std::pair<std::string, u32>> totals;
+    for (auto& slot : reject_counts) {
+        const char* reason = slot.reason.load(std::memory_order_relaxed);
+        const u32 count = slot.count.exchange(0, std::memory_order_relaxed);
+        if (reason == nullptr || count == 0) {
+            continue;
+        }
+        const auto it = std::find_if(totals.begin(), totals.end(),
+                                     [reason](const auto& total) { return total.first == reason; });
+        if (it != totals.end()) {
+            it->second += count;
+        } else {
+            totals.emplace_back(reason, count);
+        }
+    }
+    if (totals.empty()) {
+        return "-";
+    }
+    std::sort(totals.begin(), totals.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string text;
+    for (std::size_t i = 0; i < totals.size() && i < 3; i++) {
+        text += fmt::format("{}{} {}", i == 0 ? "" : ", ", totals[i].first, totals[i].second);
+    }
+    return text;
+}
 
 std::string RasterizerGXM::TakeBatchProfile() {
     const u32 samples = batch_phase_samples;

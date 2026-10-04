@@ -471,8 +471,15 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
             const u8* last =
                 bytes != nullptr ? memory.GetPhysicalPointer(entry.address + entry.span - 1)
                                  : nullptr;
-            if (bytes != nullptr && last == bytes + entry.span - 1 &&
-                Common::ComputeHash64(bytes, entry.span) == entry.source_hash) {
+            bool same = false;
+            if (bytes != nullptr && last == bytes + entry.span - 1) {
+                const unsigned long long rehash_begin = Common::VitaMicros();
+                same = Common::ComputeHash64(bytes, entry.span) == entry.source_hash;
+                Common::FrameStats::Add(Common::FrameStats::texture_rehash_us, rehash_begin);
+                Common::FrameStats::texture_rehash_bytes.fetch_add(entry.span,
+                                                                   std::memory_order_relaxed);
+            }
+            if (same) {
                 entry.stale = false;
                 Common::FrameStats::texture_reuses.fetch_add(1, std::memory_order_relaxed);
             } else {
