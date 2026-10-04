@@ -58,13 +58,13 @@ public:
 
     /// True cuando el usuario ha pedido salir de la emulacion.
     bool ShouldExit() const {
-        return should_exit;
+        return should_exit.load(std::memory_order_relaxed);
     }
 
     /// Fotogramas presentados desde que arranco el juego. Sirve para distinguir
     /// "va lento pero avanza" de "esta colgado".
     u64 FramesPresented() const {
-        return frames_presented;
+        return frames_presented.load(std::memory_order_relaxed);
     }
 
     /// Fuente para el overlay de FPS/velocidad. Sin ella, PresentScreens() no
@@ -137,7 +137,9 @@ private:
     /// de esa linea.
     bool presenter_uses_gxm = false;
 
-    bool should_exit = false;
+    /// Atomicos desde 0.2.0.0: con la GPU en otro nucleo, la presentacion (que
+    /// los escribe) y el bucle de main.cpp (que los lee) van en hilos distintos.
+    std::atomic<bool> should_exit{false};
     bool is_touching = false;
     /// Evita que mantener SELECT+gatillo recorra todo el rango de golpe.
     bool frameskip_combo_held = false;
@@ -183,7 +185,7 @@ private:
     unsigned int stats_jit_rejected = 0;
     unsigned int stats_jit_checks = 0;
     unsigned int stats_jit_mismatches = 0;
-    u64 frames_presented = 0;
+    std::atomic<u64> frames_presented{0};
 
     // Overlay de FPS y velocidad de emulacion.
     //
@@ -351,6 +353,16 @@ private:
     double stats_draw_ms = 0.0;
     /// Espera al intercambio de buffers: consola parada, no trabajo.
     double stats_swapwait_ms = 0.0;
+    /// GPU en otro nucleo (0.2.0.0): parte del intervalo que ha trabajado su
+    /// hilo y parte que el de emulacion ha estado parado esperandola, mas las
+    /// esperas por motivo. Ver VideoCore::GxStats.
+    double stats_gpu_busy_percent = 0.0;
+    double stats_gpu_wait_percent = 0.0;
+    unsigned int stats_gpu_irq_waits = 0;
+    unsigned int stats_gpu_syncs = 0;
+    unsigned int stats_gpu_present_waits = 0;
+    unsigned int stats_gpu_queue_max = 0;
+    SceUInt64 stats_gpu_last_us = 0;
     /// Reparto de unidades de textura por formato, ya formateado ("fmt a8 3 ...").
     char stats_format_line[56] = "fmt -";
     SceUInt64 stats_next_update_us = 0;

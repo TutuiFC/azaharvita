@@ -589,7 +589,7 @@ void EmuWindow_Vita::PresentScreens() {
     // Casi todo lo que se mida aqui es la consola PARADA, no trabajo: por eso va
     // en su propio contador y el overlay lo pinta aparte.
     const unsigned long long swap_begin = Common::VitaMicros();
-    Common::vita_stage.store("presentar: swap", std::memory_order_relaxed);
+    Common::VitaStageSlot().store("presentar: swap", std::memory_order_relaxed);
     vita2d_swap_buffers();
     Common::FrameStats::Add(Common::FrameStats::swap_us, swap_begin);
 
@@ -702,6 +702,24 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             }
             stats_game_fps = total > 0.0 ? frames / total : stats.game_fps;
         }
+        {
+            const double interval_us =
+                stats_gpu_last_us != 0 ? static_cast<double>(now_us - stats_gpu_last_us) : 0.0;
+            stats_gpu_last_us = now_us;
+            const double busy = static_cast<double>(
+                VideoCore::GxStats::thread_busy_us.exchange(0, std::memory_order_relaxed));
+            const double wait = static_cast<double>(
+                VideoCore::GxStats::emu_wait_us.exchange(0, std::memory_order_relaxed));
+            stats_gpu_busy_percent = interval_us > 0.0 ? busy / interval_us * 100.0 : 0.0;
+            stats_gpu_wait_percent = interval_us > 0.0 ? wait / interval_us * 100.0 : 0.0;
+            stats_gpu_irq_waits =
+                VideoCore::GxStats::irq_waits.exchange(0, std::memory_order_relaxed);
+            stats_gpu_syncs = VideoCore::GxStats::syncs.exchange(0, std::memory_order_relaxed);
+            stats_gpu_present_waits =
+                VideoCore::GxStats::present_waits.exchange(0, std::memory_order_relaxed);
+            stats_gpu_queue_max =
+                VideoCore::GxStats::queue_max.exchange(0, std::memory_order_relaxed);
+        }
         stats_speed_percent = stats.emulation_speed * 100.0;
 
         // Reparto del tiempo dentro de cada fotograma. time_vblank_interval es
@@ -781,12 +799,12 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 }
                 {
                     // Cada 10 s a crash.txt: los datos llegan aunque no haya
-                    // captura (0.1.6.3). Nueve veces desde 0.1.8.3: con tres
-                    // solo salian los primeros 30 s, que son la carga y no el
-                    // juego (crash.txt de 0.1.8.2).
+                    // captura (0.1.6.3). Treinta veces desde 0.2.0.0 (eran
+                    // nueve): las escenas 3D que se prueban llegan despues de
+                    // las intros, y con nueve se quedaban fuera.
                     static u32 arm_ticks = 0;
                     static u32 arm_notes = 0;
-                    if (++arm_ticks % 10 == 0 && arm_notes < 9) {
+                    if (++arm_ticks % 10 == 0 && arm_notes < 30) {
                         arm_notes++;
                         Common::VitaNote(
                             "arm desglose",
@@ -1232,15 +1250,15 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         }
         {
             /**
-             * EL OVERLAY EN crash.txt (0.1.8.1): cada 10 s, seis veces por
-             * sesion, las lineas que dicen donde se va el fotograma. Sin esto
-             * cada prueba en consola necesitaba una captura de pantalla, y
-             * crash.txt es lo unico que llega siempre. Seis notas son seis
-             * escrituras en la tarjeta en toda la partida.
+             * EL OVERLAY EN crash.txt (0.1.8.1): cada 10 s las lineas que
+             * dicen donde se va el fotograma. Sin esto cada prueba en consola
+             * necesitaba una captura de pantalla, y crash.txt es lo unico que
+             * llega siempre. Treinta veces (5 minutos) desde 0.2.0.0: con
+             * seis solo salia el primer minuto, que suele ser la intro.
              */
             static u32 frame_ticks = 0;
             static u32 frame_notes = 0;
-            if (++frame_ticks % 10 == 0 && frame_notes < 6) {
+            if (++frame_ticks % 10 == 0 && frame_notes < 30) {
                 frame_notes++;
                 Common::VitaNote(
                     "fotograma",
@@ -1275,6 +1293,20 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                     0, std::memory_order_relaxed),
                                 Gxm::RasterizerGXM::skipped_batches.exchange(
                                     0, std::memory_order_relaxed))
+                        .c_str());
+                Common::VitaNote(
+                    "gpu hilo",
+                    fmt::format("{} | ocupado {:.0f}% ({:.1f} ms/fot) | juego esperando {:.0f}% "
+                                "({:.1f} ms/fot) | esperas irq {} sinc {} pres {} | cola max {}",
+                                VideoCore::GPU::async_enabled.load(std::memory_order_relaxed)
+                                    ? "ON"
+                                    : "off",
+                                stats_gpu_busy_percent,
+                                stats_gpu_busy_percent * stats_frame_ms / 100.0,
+                                stats_gpu_wait_percent,
+                                stats_gpu_wait_percent * stats_frame_ms / 100.0,
+                                stats_gpu_irq_waits, stats_gpu_syncs, stats_gpu_present_waits,
+                                stats_gpu_queue_max)
                         .c_str());
                 Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
                 Common::VitaNote("jit otro", Core::ArmJit::TakeRejectWords().c_str());
@@ -1380,6 +1412,19 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         const char* ovl_tag = "  ovl ON";
         for (std::size_t i = 0; ovl_tag[i] != '\0' && vn + 1 < sizeof(version_line); i++) {
             version_line[vn++] = ovl_tag[i];
+        }
+        // g1 = GPU en el nucleo 1: % ocupada / % del tiempo que el juego la espera.
+        if (VideoCore::GPU::async_enabled.load(std::memory_order_relaxed) &&
+            vn + 16 < sizeof(version_line)) {
+            const char* gpu_tag = "  g1 ";
+            for (std::size_t i = 0; gpu_tag[i] != '\0'; i++) {
+                version_line[vn++] = gpu_tag[i];
+            }
+            vn += AppendUInt(version_line + vn,
+                             static_cast<unsigned int>(std::min(stats_gpu_busy_percent, 999.0)));
+            version_line[vn++] = '/';
+            vn += AppendUInt(version_line + vn,
+                             static_cast<unsigned int>(std::min(stats_gpu_wait_percent, 999.0)));
         }
         version_line[vn] = '\0';
     }

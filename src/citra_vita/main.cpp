@@ -49,6 +49,7 @@
 #include "core/frontend/image_interface.h"
 #include "core/hle/service/cfg/cfg.h"
 #include "core/hle/service/service.h"
+#include "video_core/gpu.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_gxm/rasterizer_gxm.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
@@ -367,6 +368,9 @@ struct UserSettings {
     bool vs_specialize = true;
     /// 0.1.8.6: copia de pantalla en la GPU (RasterizerGXM::transfer_on_gpu).
     bool gpu_screen_copy = true;
+    /// 0.2.0.0: la GPU emulada en otro nucleo (VideoCore::GPU::async_enabled).
+    /// OFF hasta probarlo en consola con varios juegos.
+    bool gpu_thread = false;
 };
 UserSettings g_user;
 
@@ -434,6 +438,7 @@ void ApplyUserSettings() {
                                             std::memory_order_relaxed);
     Gxm::RasterizerGXM::transfer_on_gpu.store(g_user.gpu_screen_copy ? 1u : 0u,
                                               std::memory_order_relaxed);
+    VideoCore::GPU::async_enabled.store(g_user.gpu_thread, std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -489,6 +494,7 @@ void LoadUserSettings() {
     read_bool("omitir_repetidas=", g_user.skip_repeated);
     read_bool("vs_especializar2=", g_user.vs_specialize);
     read_bool("copia_gpu=", g_user.gpu_screen_copy);
+    read_bool("gpu_hilo=", g_user.gpu_thread);
 }
 
 /// El contenido de ajustes.txt, una clave por linea.
@@ -498,13 +504,13 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "volumen=%d\nidioma=%d\nresolucion_media=%d\njit_cache_reg=%d\n"
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
-        "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\n",
+        "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
         g_user.vs_escapes ? 1 : 0, g_user.full_vertex_dedup ? 1 : 0, g_user.sound ? 1 : 0,
         g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0,
-        g_user.gpu_screen_copy ? 1 : 0);
+        g_user.gpu_screen_copy ? 1 : 0, g_user.gpu_thread ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
@@ -532,11 +538,12 @@ void SaveUserSettings() {
     sceIoClose(fd);
 }
 
-constexpr int kSettingsRows = 15;
+constexpr int kSettingsRows = 16;
 
 void DrawSettings(vita2d_pgf* font, int row) {
     constexpr int kFirstY = 100;
-    constexpr int kRowStep = 20;
+    // 19 y no 20 desde la fila 16 (0.2.0.0): con 20 la ultima pisaba la ayuda.
+    constexpr int kRowStep = 19;
     constexpr int kValueX = 330;
 
     vita2d_start_drawing();
@@ -560,7 +567,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
                                          "Pantallas",
                                          "Omitir imagenes repetidas",
                                          "Vertices especializados a GPU",
-                                         "Copia y borrado en GPU"};
+                                         "Copia y borrado en GPU",
+                                         "GPU en otro nucleo"};
     char volume_text[16];
     std::snprintf(volume_text, sizeof(volume_text), "%d %%", g_user.volume_percent);
     const char* values[kSettingsRows] = {
@@ -578,7 +586,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
         kLayoutNames[std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1)],
         g_user.skip_repeated ? "ON" : "OFF",
         g_user.vs_specialize ? "ON" : "OFF",
-        g_user.gpu_screen_copy ? "ON" : "OFF"};
+        g_user.gpu_screen_copy ? "ON" : "OFF",
+        g_user.gpu_thread ? "ON" : "OFF"};
 
     for (int i = 0; i < kSettingsRows; i++) {
         const int y = kFirstY + i * kRowStep;
@@ -645,6 +654,9 @@ void DrawSettings(vita2d_pgf* font, int row) {
         {"ON: copia de pantalla y borrados en la GPU, sin bajar a la CPU y volver a subir.",
          "Ganancia: el 2D de Zafiro Alfa paso de 11 a 22 FPS; en 3D, varios ms por fotograma.",
          "Contra: si ves imagenes viejas, colores raros o parpadeos, apagar."},
+        {"ON: la GPU emulada y la imagen van en el nucleo 1; el juego, solo en el 0.",
+         "Ganancia: lo que tarde la GPU por fotograma (calculo: +20-50% donde pesa). Al arrancar juego.",
+         "Contra: nuevo. Si un juego se cuelga, va a saltos o se ve raro, apagar."},
     };
     vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
     vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);
@@ -677,6 +689,7 @@ void RunSettingsMenu(vita2d_pgf* font) {
         Gxm::RasterizerGXM::specialize_vs.load(std::memory_order_relaxed) != 0;
     g_user.gpu_screen_copy =
         Gxm::RasterizerGXM::transfer_on_gpu.load(std::memory_order_relaxed) != 0;
+    g_user.gpu_thread = VideoCore::GPU::async_enabled.load(std::memory_order_relaxed);
 
     int row = 0;
     // Todo lo que ya este pulsado al entrar (el START que la abrio) cuenta como
@@ -747,8 +760,11 @@ void RunSettingsMenu(vita2d_pgf* font) {
             case 13:
                 g_user.vs_specialize = !g_user.vs_specialize;
                 break;
-            default:
+            case 14:
                 g_user.gpu_screen_copy = !g_user.gpu_screen_copy;
+                break;
+            default:
+                g_user.gpu_thread = !g_user.gpu_thread;
                 break;
             }
             ApplyUserSettings();
@@ -1446,9 +1462,11 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
             still++;
             if (still == 6 || still == 30) {
                 const std::string text = fmt::format(
-                    "{} s sin avanzar, en '{}' (ciclo {}), pc0 {:#010x} pc1 {:#010x}", still,
-                    Common::vita_stage.load(std::memory_order_relaxed), now,
-                    system.GetCore(0).GetPC(), system.GetCore(1).GetPC());
+                    "{} s sin avanzar, en '{}' (ciclo {}), pc0 {:#010x} pc1 {:#010x}, hilo de "
+                    "la gpu en '{}'",
+                    still, Common::vita_stage.load(std::memory_order_relaxed), now,
+                    system.GetCore(0).GetPC(), system.GetCore(1).GetPC(),
+                    Common::vita_gpu_stage.load(std::memory_order_relaxed));
                 WriteCrashLog("congelado", text.c_str());
             }
         }
@@ -1469,7 +1487,13 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
                 }
             }
 
-            if (window->FramesPresented() == 0 && (loops % 64) == 0) {
+            const bool loading_screen = window->FramesPresented() == 0 && (loops % 64) == 0;
+            if (loading_screen) {
+                // vita2d desde este hilo solo con el de la GPU parado: con la GPU
+                // en otro nucleo, la primera presentacion puede estar en marcha.
+                system.GPU().Sync();
+            }
+            if (loading_screen && window->FramesPresented() == 0) {
                 const unsigned int seconds =
                     static_cast<unsigned int>((sceKernelGetProcessTimeWide() - start_us) / 1000000);
                 vita2d_start_drawing();
@@ -1544,6 +1568,7 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
                 LOG_ERROR(Frontend, "RunLoop devolvio {}: {}", static_cast<int>(result),
                           system.GetStatusDetails());
                 WriteCrashLog("RunLoop error", system.GetStatusDetails().c_str());
+                system.GPU().StopThread();
                 DrawFatalError(font, "Error durante la emulacion", system.GetStatusDetails());
                 break;
             }
@@ -1556,15 +1581,18 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
         // usuario cierra antes de leerla, el fichero no.
         WriteCrashLog("emulacion", "bad_alloc: sin memoria durante la emulacion");
         LOG_ERROR(Frontend, "Sin memoria durante la emulacion");
+        system.GPU().StopThread();
         DrawFatalError(font, "Sin memoria durante la emulacion",
                        "El juego cargo pero se agoto la memoria al ejecutarlo.");
     } catch (const std::exception& e) {
         std::string detail = std::string("[") + typeid(e).name() + "] " + e.what();
         WriteCrashLog("emulacion", detail.c_str());
         LOG_ERROR(Frontend, "Excepcion durante la emulacion: {}", e.what());
+        system.GPU().StopThread();
         DrawFatalError(font, "Error durante la emulacion", detail);
     } catch (...) {
         WriteCrashLog("emulacion", "excepcion de tipo no estandar");
+        system.GPU().StopThread();
         DrawFatalError(font, "Error durante la emulacion",
                        "Excepcion de un tipo no estandar.");
     }
