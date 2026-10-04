@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <boost/serialization/access.hpp>
@@ -18,6 +19,10 @@ struct FrameBufferInfo;
 
 namespace Core {
 class System;
+}
+
+namespace Kernel {
+class Process;
 }
 
 namespace Pica {
@@ -72,6 +77,20 @@ inline std::atomic<u64> cmdlist_count{0};
  * tiene que volver a subirla ni dibujarla. Ver EmuWindow_Vita::PresentScreens.
  */
 inline std::atomic<u64> frame_work{0};
+/**
+ * GPU en otro nucleo (0.2.0.0, ver GPU::async_enabled). Por intervalo: lo que
+ * ha trabajado el hilo de la GPU, lo que el de emulacion ha estado parado
+ * esperandola (y cuantas veces: por interrupciones con la CPU emulada sin
+ * nada que hacer, por sincronizar para leer o escribir su estado, por tener
+ * ya dos presentaciones en cola), y lo mas larga que ha llegado a estar la
+ * cola. Las lee y las pone a cero el overlay.
+ */
+inline std::atomic<u64> thread_busy_us{0};
+inline std::atomic<u64> emu_wait_us{0};
+inline std::atomic<u32> irq_waits{0};
+inline std::atomic<u32> syncs{0};
+inline std::atomic<u32> present_waits{0};
+inline std::atomic<u32> queue_max{0};
 
 inline void Reset() {
     cmdlist_ns.store(0, std::memory_order_relaxed);
@@ -151,6 +170,54 @@ public:
     /// Releases the renderer (for GL context destroy in libretro)
     void ReleaseRenderer();
 
+    /**
+     * LA GPU EMULADA EN OTRO NUCLEO (0.2.0.0, ajuste "GPU en otro nucleo").
+     *
+     * Sin esto, el hilo de emulacion hace las dos cosas por turnos: la CPU del
+     * 3DS y, dentro de cada llamada a GSP, todo el trabajo de la GPU (listas de
+     * comandos, rellenos, copias), mas la presentacion en cada VBlank. Con
+     * esto, las ordenes de GSP y la presentacion van a una cola que vacia un
+     * hilo en el nucleo 1, y el juego sigue mientras tanto en el 0.
+     *
+     * El juego no ve nada fuera de orden: las ordenes se ejecutan en el orden
+     * en que llegan, y sus interrupciones (P3D, PPF, PSC, DMA) se le dan en el
+     * hilo de emulacion cuando la GPU ha terminado de verdad (ver
+     * DeliverInterrupts). Lo que necesite el estado de la GPU al momento (leer
+     * sus registros, volcar superficies a memoria) espera antes a que la cola
+     * se vacie (ver Sync).
+     *
+     * Se lee al crear la GPU: un cambio vale para el siguiente juego.
+     */
+    static inline std::atomic<bool> async_enabled{false};
+
+    /// Da a GSP, en el hilo de emulacion, las interrupciones que el hilo de la
+    /// GPU ha levantado. Lanza si ese hilo murio por una excepcion.
+    void DeliverInterrupts();
+
+    /// Hay ordenes en cola (o ejecutandose) que pueden acabar en interrupcion.
+    [[nodiscard]] bool HasInterruptWork() const;
+
+    /**
+     * Para cuando la CPU emulada no tiene ningun hilo que ejecutar: espera a
+     * que la GPU levante una interrupcion o se quede sin ordenes que puedan
+     * levantarla. Sin esto, el tiempo emulado correria hasta el siguiente
+     * evento mientras el juego espera a la GPU, y el juego veria una GPU mucho
+     * mas lenta que con todo en un hilo.
+     */
+    void WaitForInterrupts();
+
+    /// Espera a que el hilo de la GPU acabe todo lo encolado. No hace nada sin
+    /// ese hilo ni llamada desde el.
+    void Sync();
+
+    /// Para el hilo de la GPU tirando lo que quede en la cola. Va antes de
+    /// destruir nada de lo que ese hilo usa.
+    void StopThread();
+
+    /// Tiempo emulado del VBlank que se presenta: el limitador de velocidad y
+    /// las estadisticas no pueden leer el reloj emulado desde otro hilo.
+    [[nodiscard]] std::chrono::microseconds PresentTimeUs() const;
+
 private:
     void SubmitCmdList(u32 index);
 
@@ -160,6 +227,23 @@ private:
     void MemoryTransfer();
 
     void VBlankCallback(uintptr_t user_data, s64 cycles_late);
+
+    void ExecuteCommand(const Service::GSP::Command& command,
+                        const std::shared_ptr<Kernel::Process>& dma_process);
+
+    void ApplyBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
+
+    struct AsyncWorker;
+    std::unique_ptr<AsyncWorker> async;
+
+    [[nodiscard]] bool Async() const;
+    [[nodiscard]] bool OnGpuThread() const;
+    void StartThread();
+    void AsyncLoop();
+    void RouteInterrupt(Service::GSP::InterruptId interrupt_id, u64 wait_delay_ns);
+    void QueueCommand(const Service::GSP::Command& command);
+    void QueueBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
+    void QueuePresent();
 
     friend class boost::serialization::access;
     template <class Archive>

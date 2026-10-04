@@ -18,6 +18,7 @@
 #include "core/hle/service/apt/ns.h"
 #include "core/hle/service/cfg/cfg.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
+#include "video_core/gpu.h"
 #include "video_core/utils.h"
 
 SERVICE_CONSTRUCT_IMPL(Service::APT::AppletManager)
@@ -1693,6 +1694,9 @@ void AppletManager::CaptureFrameBuffers() {
 
 void AppletManager::TransferCapturedFramebuffers() {
     constexpr u32 VRAM_TRANSFER_OFFSET = 0x500000;
+
+    // Escribe en VRAM antes de avisar al rasterizador (ver ClearFramebuffer).
+    system.GPU().Sync();
 
     const VAddr dst_vaddr = Memory::VRAM_VADDR + VRAM_TRANSFER_OFFSET;
     auto dst_ptr = system.Memory().GetPointer(dst_vaddr);

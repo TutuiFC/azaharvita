@@ -29,6 +29,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 
 namespace Common {
 
@@ -240,17 +241,42 @@ const char* VitaGameLog();
  */
 inline std::atomic<const char*> vita_stage{"-"};
 
+/**
+ * Lo mismo para el hilo de la GPU (0.2.0.0, ver VideoCore::GPU::async_enabled).
+ * Con la GPU en otro nucleo, lo que se marque en ese hilo va aqui y vita_stage
+ * queda para el de emulacion: si no, el vigilante diria que el juego esta
+ * "abriendo una escena" cuando el que esta parado es el otro hilo.
+ *
+ * El hilo se reconoce por su pila (vita_gpu_stack_lo/hi, que pone el propio
+ * hilo al arrancar): sin TLS nativo en este toolchain, preguntar al sistema
+ * por el hilo actual en cada etapa costaria una llamada al kernel.
+ */
+inline std::atomic<const char*> vita_gpu_stage{"-"};
+inline std::atomic<std::uintptr_t> vita_gpu_stack_lo{0};
+inline std::atomic<std::uintptr_t> vita_gpu_stack_hi{0};
+
+inline std::atomic<const char*>& VitaStageSlot() {
+    volatile char marker = 0;
+    const auto here = reinterpret_cast<std::uintptr_t>(&marker);
+    if (here >= vita_gpu_stack_lo.load(std::memory_order_relaxed) &&
+        here < vita_gpu_stack_hi.load(std::memory_order_relaxed)) {
+        return vita_gpu_stage;
+    }
+    return vita_stage;
+}
+
 class ScopedVitaStage {
 public:
     explicit ScopedVitaStage(const char* stage)
-        : previous{vita_stage.exchange(stage, std::memory_order_relaxed)} {}
+        : slot{VitaStageSlot()}, previous{slot.exchange(stage, std::memory_order_relaxed)} {}
     ~ScopedVitaStage() {
-        vita_stage.store(previous, std::memory_order_relaxed);
+        slot.store(previous, std::memory_order_relaxed);
     }
     ScopedVitaStage(const ScopedVitaStage&) = delete;
     ScopedVitaStage& operator=(const ScopedVitaStage&) = delete;
 
 private:
+    std::atomic<const char*>& slot;
     const char* previous;
 };
 

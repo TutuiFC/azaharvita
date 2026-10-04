@@ -3,6 +3,17 @@
 // Refer to the license.txt file included.
 
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+#ifdef __PSVITA__
+#include <pthread.h>
+#endif
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
@@ -87,6 +98,78 @@ public:
     }
 };
 
+/**
+ * El hilo de la GPU (0.2.0.0). Ver GPU::async_enabled en gpu.h.
+ */
+struct GPU::AsyncWorker {
+    enum class Type : u8 {
+        Command,
+        BufferSwap,
+        Present,
+    };
+    struct Item {
+        Type type = Type::Command;
+        u32 screen_id = 0;
+        Service::GSP::Command command{};
+        Service::GSP::FrameBufferInfo info{};
+        /// RequestDma copia con la tabla de paginas del proceso que la pidio,
+        /// que se toma al encolar: el nucleo emulado no se lee desde este hilo.
+        std::shared_ptr<Kernel::Process> process;
+        std::chrono::microseconds time_us{};
+    };
+
+    /// Pila explicita, para saber que direcciones son de este hilo (ver
+    /// OnGpuThread). 1 MB, como el compilador de shaders: aqui corre todo el
+    /// video_core, y nunca se ha medido cuanta pila gasta en el hilo principal.
+    static constexpr std::size_t kStackSize = 1024 * 1024;
+    /// Presentaciones en cola como mucho. Con mas, la imagen iria cada vez mas
+    /// atrasada respecto al juego: el hilo de emulacion espera.
+    static constexpr u32 kMaxPresents = 2;
+
+    std::mutex mutex;
+    /// Lo espera el hilo de la GPU: hay algo en la cola (o hay que parar).
+    std::condition_variable work_ready;
+    /// Lo espera el de emulacion: la GPU acabo algo o levanto una interrupcion.
+    std::condition_variable progress;
+    std::deque<Item> queue;
+    /// Ordenes de GSP en cola o ejecutandose, las unicas que levantan
+    /// interrupciones. Atomico para mirarlo sin el cerrojo en cada RunLoop.
+    std::atomic<u32> command_work{0};
+    u32 presents = 0;
+    bool executing = false;
+    bool stop = false;
+    bool failed = false;
+    std::string error;
+
+    /// Interrupciones levantadas en el hilo de la GPU y aun sin dar a GSP, y
+    /// las que se estan dando (se intercambian para no reservar memoria).
+    std::vector<std::pair<Service::GSP::InterruptId, u64>> interrupts;
+    std::vector<std::pair<Service::GSP::InterruptId, u64>> delivering;
+    std::atomic<bool> interrupts_ready{false};
+    /// El de GSP. Solo se llama desde el hilo de emulacion.
+    Service::GSP::InterruptHandler handler;
+
+    std::atomic<std::uintptr_t> stack_lo{0};
+    std::atomic<std::uintptr_t> stack_hi{0};
+    std::chrono::microseconds present_time_us{};
+#ifdef __PSVITA__
+    pthread_t thread{};
+#endif
+    bool running = false;
+};
+
+namespace {
+u64 NowUs() {
+#ifdef __PSVITA__
+    return Common::VitaMicros();
+#else
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+#endif
+}
+} // Anonymous namespace
+
 MICROPROFILE_DEFINE(GPU_DisplayTransfer, "GPU", "DisplayTransfer", MP_RGB(100, 100, 255));
 MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(100, 255, 100));
 
@@ -101,9 +184,15 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
+
+    if (async_enabled.load(std::memory_order_relaxed)) {
+        StartThread();
+    }
 }
 
-GPU::~GPU() = default;
+GPU::~GPU() {
+    StopThread();
+}
 
 PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
     if (addr == 0) {
@@ -130,19 +219,32 @@ PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
 }
 
 void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
+    if (async != nullptr) {
+        async->handler = std::move(handler);
+        Service::GSP::InterruptHandler routed = [this](Service::GSP::InterruptId interrupt_id,
+                                                       u64 wait_delay_ns) {
+            RouteInterrupt(interrupt_id, wait_delay_ns);
+        };
+        impl->signal_interrupt = routed;
+        impl->pica.SetInterruptHandler(routed);
+        return;
+    }
     impl->signal_interrupt = handler;
     impl->pica.SetInterruptHandler(handler);
 }
 
 void GPU::FlushRegion(PAddr addr, u32 size) {
+    Sync();
     impl->rasterizer->FlushRegion(addr, size);
 }
 
 void GPU::InvalidateRegion(PAddr addr, u32 size) {
+    Sync();
     impl->rasterizer->InvalidateRegion(addr, size);
 }
 
 void GPU::ClearAll(bool flush) {
+    Sync();
     impl->rasterizer->ClearAll(flush);
 }
 
@@ -167,6 +269,15 @@ private:
 } // Anonymous namespace
 
 void GPU::Execute(const Service::GSP::Command& command) {
+    if (Async()) {
+        QueueCommand(command);
+        return;
+    }
+    ExecuteCommand(command, nullptr);
+}
+
+void GPU::ExecuteCommand(const Service::GSP::Command& command,
+                         const std::shared_ptr<Kernel::Process>& dma_process) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
 
@@ -182,7 +293,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
 
         // TODO(Subv): These memory accesses should not go through the application's memory mapping.
         // They should go through the GSP module's memory mapping.
-        const auto process = impl->system.Kernel().GetCurrentProcess();
+        const auto process =
+            dma_process != nullptr ? dma_process : impl->system.Kernel().GetCurrentProcess();
         impl->memory.CopyBlock(*process, command.dma_request.dest_address,
                                command.dma_request.source_address, command.dma_request.size);
 
@@ -295,6 +407,14 @@ void GPU::Execute(const Service::GSP::Command& command) {
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
+    if (Async() && !OnGpuThread()) {
+        QueueBufferSwap(screen_id, info);
+        return;
+    }
+    ApplyBufferSwap(screen_id, info);
+}
+
+void GPU::ApplyBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
     const PAddr phys_address_left = VirtualToPhysicalAddress(info.address_left);
     const PAddr phys_address_right = VirtualToPhysicalAddress(info.address_right);
 
@@ -325,11 +445,13 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
 }
 
 void GPU::SetColorFill(const Pica::ColorFill& fill) {
+    Sync();
     impl->pica.regs_lcd.color_fill_top = fill;
     impl->pica.regs_lcd.color_fill_bottom = fill;
 }
 
 u32 GPU::ReadReg(VAddr addr) {
+    Sync();
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -352,6 +474,9 @@ u32 GPU::ReadReg(VAddr addr) {
 }
 
 void GPU::WriteReg(VAddr addr, u32 data) {
+    // Una escritura puede lanzar un relleno, una copia o una lista: se ejecuta
+    // aqui, con el hilo de la GPU parado, despues de todo lo encolado.
+    Sync();
 #ifdef __PSVITA__
     // 0.1.5.2 (4.7): cuanto del "resto de gx" es decodificar escrituras de
     // registro PICA. El timer es RAII para que tambien cuente los returns
@@ -442,6 +567,7 @@ GraphicsDebugger& GPU::Debugger() {
 }
 
 void GPU::ApplyPerProgramSettings(u64 program_ID) {
+    Sync();
     auto hack = Common::Hacks::hack_manager.GetHack(
         Common::Hacks::HackType::ACCURATE_MULTIPLICATION, program_ID);
     bool use_accurate_mul = Settings::values.shaders_accurate_mul.GetValue();
@@ -585,7 +711,11 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 #endif
 
     // Present renderered frame.
-    impl->renderer->SwapBuffers();
+    if (Async()) {
+        QueuePresent();
+    } else {
+        impl->renderer->SwapBuffers();
+    }
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
@@ -636,6 +766,291 @@ void GPU::ReleaseRenderer() {
     impl->renderer.reset();
     impl->sw_blitter.reset();
     LOG_INFO(HW_GPU, "Renderer released for context destroy");
+}
+
+bool GPU::Async() const {
+    return async != nullptr && async->running;
+}
+
+bool GPU::OnGpuThread() const {
+    if (async == nullptr) {
+        return false;
+    }
+    volatile char marker = 0;
+    const auto here = reinterpret_cast<std::uintptr_t>(&marker);
+    return here >= async->stack_lo.load(std::memory_order_relaxed) &&
+           here < async->stack_hi.load(std::memory_order_relaxed);
+}
+
+void GPU::StartThread() {
+#ifdef __PSVITA__
+    async = std::make_unique<AsyncWorker>();
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, AsyncWorker::kStackSize);
+    const int rc = pthread_create(
+        &async->thread, &attr,
+        [](void* gpu) -> void* {
+            static_cast<GPU*>(gpu)->AsyncLoop();
+            return nullptr;
+        },
+        this);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        Common::VitaNote("gpu", "no se pudo crear el hilo de la GPU: va en el de emulacion");
+        async.reset();
+        return;
+    }
+    async->running = true;
+#endif
+}
+
+void GPU::StopThread() {
+#ifdef __PSVITA__
+    if (!Async()) {
+        return;
+    }
+    {
+        std::lock_guard lock{async->mutex};
+        async->stop = true;
+        async->queue.clear();
+        async->command_work.store(0, std::memory_order_relaxed);
+        async->presents = 0;
+    }
+    async->work_ready.notify_all();
+    pthread_join(async->thread, nullptr);
+    async->running = false;
+    // Su pila ya no existe y otro hilo puede recibir esa memoria.
+    async->stack_lo.store(0, std::memory_order_relaxed);
+    async->stack_hi.store(0, std::memory_order_relaxed);
+    Common::vita_gpu_stack_lo.store(0, std::memory_order_relaxed);
+    Common::vita_gpu_stack_hi.store(0, std::memory_order_relaxed);
+#endif
+}
+
+void GPU::AsyncLoop() {
+    AsyncWorker& worker = *async;
+    {
+        // Lo que este por debajo es la pila de este hilo (crece hacia abajo).
+        // Los margenes dejan fuera los bordes, que puede compartir con otra.
+        volatile char marker = 0;
+        const auto top = reinterpret_cast<std::uintptr_t>(&marker);
+        const std::uintptr_t lo = top - AsyncWorker::kStackSize + 4096;
+        const std::uintptr_t hi = top + 512;
+        worker.stack_lo.store(lo, std::memory_order_relaxed);
+        worker.stack_hi.store(hi, std::memory_order_relaxed);
+#ifdef __PSVITA__
+        Common::vita_gpu_stack_lo.store(lo, std::memory_order_relaxed);
+        Common::vita_gpu_stack_hi.store(hi, std::memory_order_relaxed);
+#endif
+    }
+#ifdef __PSVITA__
+    // El FPSCR es por hilo: sin esto la GPU emulada redondearia distinto que
+    // en el hilo de emulacion.
+    Common::VitaEnableFastFloatMode();
+    Common::VitaPinThreadToUserCore(1, "gpu");
+#endif
+    const auto fail = [&worker](const char* what) {
+        std::lock_guard lock{worker.mutex};
+        worker.failed = true;
+        worker.error = what != nullptr ? what : "?";
+        worker.interrupts_ready.store(true, std::memory_order_release);
+    };
+    while (true) {
+        AsyncWorker::Item item;
+        {
+            std::unique_lock lock{worker.mutex};
+#ifdef __PSVITA__
+            Common::vita_gpu_stage.store("gpu: sin trabajo", std::memory_order_relaxed);
+#endif
+            worker.work_ready.wait(lock,
+                                   [&worker] { return worker.stop || !worker.queue.empty(); });
+            if (worker.stop) {
+                break;
+            }
+            item = std::move(worker.queue.front());
+            worker.queue.pop_front();
+            worker.executing = true;
+        }
+        const u64 begin = NowUs();
+        // Muerto el hilo, se sigue vaciando la cola sin ejecutar para que nadie
+        // se quede esperando; el de emulacion lo ve en DeliverInterrupts.
+        if (!worker.failed) {
+            try {
+                switch (item.type) {
+                case AsyncWorker::Type::Command:
+#ifdef __PSVITA__
+                    Common::vita_gpu_stage.store("gpu: orden de GSP", std::memory_order_relaxed);
+#endif
+                    ExecuteCommand(item.command, item.process);
+                    break;
+                case AsyncWorker::Type::BufferSwap:
+                    ApplyBufferSwap(item.screen_id, item.info);
+                    break;
+                case AsyncWorker::Type::Present:
+#ifdef __PSVITA__
+                    Common::vita_gpu_stage.store("gpu: presentar", std::memory_order_relaxed);
+#endif
+                    worker.present_time_us = item.time_us;
+                    impl->renderer->SwapBuffers();
+                    break;
+                }
+            } catch (const std::exception& e) {
+                fail(e.what());
+            } catch (...) {
+                fail("excepcion de tipo no estandar");
+            }
+        }
+        item.process.reset();
+        GxStats::thread_busy_us.fetch_add(NowUs() - begin, std::memory_order_relaxed);
+        {
+            std::lock_guard lock{worker.mutex};
+            worker.executing = false;
+            if (item.type == AsyncWorker::Type::Command) {
+                worker.command_work.fetch_sub(1, std::memory_order_relaxed);
+            } else if (item.type == AsyncWorker::Type::Present) {
+                worker.presents--;
+            }
+        }
+        worker.progress.notify_all();
+    }
+}
+
+void GPU::RouteInterrupt(Service::GSP::InterruptId interrupt_id, u64 wait_delay_ns) {
+    if (OnGpuThread()) {
+        {
+            std::lock_guard lock{async->mutex};
+            async->interrupts.emplace_back(interrupt_id, wait_delay_ns);
+            async->interrupts_ready.store(true, std::memory_order_release);
+        }
+        async->progress.notify_all();
+        return;
+    }
+    async->handler(interrupt_id, wait_delay_ns);
+}
+
+void GPU::DeliverInterrupts() {
+    if (async == nullptr || !async->interrupts_ready.load(std::memory_order_acquire)) {
+        return;
+    }
+    {
+        std::lock_guard lock{async->mutex};
+        if (async->failed) {
+            throw std::runtime_error("hilo de la GPU: " + async->error);
+        }
+        async->delivering.swap(async->interrupts);
+        async->interrupts_ready.store(false, std::memory_order_relaxed);
+    }
+    for (const auto& [interrupt_id, wait_delay_ns] : async->delivering) {
+        async->handler(interrupt_id, wait_delay_ns);
+    }
+    async->delivering.clear();
+}
+
+bool GPU::HasInterruptWork() const {
+    return Async() && async->command_work.load(std::memory_order_relaxed) != 0;
+}
+
+void GPU::WaitForInterrupts() {
+    if (!Async()) {
+        return;
+    }
+    const u64 begin = NowUs();
+    {
+#ifdef __PSVITA__
+        const Common::ScopedVitaStage stage{"esperando a la gpu"};
+#endif
+        std::unique_lock lock{async->mutex};
+        async->progress.wait(lock, [this] {
+            return !async->interrupts.empty() || async->failed ||
+                   async->command_work.load(std::memory_order_relaxed) == 0;
+        });
+    }
+    GxStats::irq_waits.fetch_add(1, std::memory_order_relaxed);
+    GxStats::emu_wait_us.fetch_add(NowUs() - begin, std::memory_order_relaxed);
+}
+
+void GPU::Sync() {
+    if (!Async() || OnGpuThread()) {
+        return;
+    }
+    std::unique_lock lock{async->mutex};
+    if (async->queue.empty() && !async->executing) {
+        return;
+    }
+    const u64 begin = NowUs();
+    {
+#ifdef __PSVITA__
+        const Common::ScopedVitaStage stage{"esperando a la gpu (sincronizar)"};
+#endif
+        async->progress.wait(lock, [this] { return async->queue.empty() && !async->executing; });
+    }
+    GxStats::syncs.fetch_add(1, std::memory_order_relaxed);
+    GxStats::emu_wait_us.fetch_add(NowUs() - begin, std::memory_order_relaxed);
+}
+
+std::chrono::microseconds GPU::PresentTimeUs() const {
+    if (OnGpuThread()) {
+        return async->present_time_us;
+    }
+    return impl->timing.GetGlobalTimeUs();
+}
+
+void GPU::QueueCommand(const Service::GSP::Command& command) {
+    AsyncWorker::Item item;
+    item.type = AsyncWorker::Type::Command;
+    item.command = command;
+    if (command.id == Service::GSP::CommandId::RequestDma) {
+        item.process = impl->system.Kernel().GetCurrentProcess();
+    }
+    u32 depth = 0;
+    {
+        std::lock_guard lock{async->mutex};
+        async->queue.push_back(std::move(item));
+        async->command_work.fetch_add(1, std::memory_order_relaxed);
+        depth = static_cast<u32>(async->queue.size());
+    }
+    async->work_ready.notify_one();
+    u32 seen = GxStats::queue_max.load(std::memory_order_relaxed);
+    while (depth > seen &&
+           !GxStats::queue_max.compare_exchange_weak(seen, depth, std::memory_order_relaxed)) {
+    }
+}
+
+void GPU::QueueBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
+    AsyncWorker::Item item;
+    item.type = AsyncWorker::Type::BufferSwap;
+    item.screen_id = screen_id;
+    item.info = info;
+    {
+        std::lock_guard lock{async->mutex};
+        async->queue.push_back(std::move(item));
+    }
+    async->work_ready.notify_one();
+}
+
+void GPU::QueuePresent() {
+    AsyncWorker::Item item;
+    item.type = AsyncWorker::Type::Present;
+    item.time_us = impl->timing.GetGlobalTimeUs();
+    {
+        std::unique_lock lock{async->mutex};
+        if (async->presents >= AsyncWorker::kMaxPresents) {
+            const u64 begin = NowUs();
+            {
+#ifdef __PSVITA__
+                const Common::ScopedVitaStage stage{"esperando a la gpu (presentar)"};
+#endif
+                async->progress.wait(
+                    lock, [this] { return async->presents < AsyncWorker::kMaxPresents; });
+            }
+            GxStats::present_waits.fetch_add(1, std::memory_order_relaxed);
+            GxStats::emu_wait_us.fetch_add(NowUs() - begin, std::memory_order_relaxed);
+        }
+        async->presents++;
+        async->queue.push_back(std::move(item));
+    }
+    async->work_ready.notify_one();
 }
 
 template <class Archive>

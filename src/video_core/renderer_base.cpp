@@ -7,6 +7,7 @@
 #include "core/frontend/emu_window.h"
 #include "core/tracer/recorder.h"
 #include "video_core/debug_utils/debug_utils.h"
+#include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 
 namespace VideoCore {
@@ -47,7 +48,7 @@ void RendererBase::EndFrame() {
 
     render_window.PollEvents();
 
-    system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
+    system.frame_limiter.DoFrameLimiting(system.GPU().PresentTimeUs());
     system.perf_stats->BeginSystemFrame();
 }
 
