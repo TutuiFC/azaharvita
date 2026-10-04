@@ -2012,6 +2012,56 @@ public:
     }
 };
 
+/**
+ * LO QUE DECIDIO EL LOTE ANTERIOR (0.2.1.0). Buscar el programa de fragmentos
+ * (construir FSConfig, la mezcla, su hash y el mapa) y el de vertices
+ * (PicaVSConfig, la clave, el programa, la disposicion de atributos y el
+ * enlazado) eran ~20 de los ~50 us fijos de cada lote ("preguntas", "vs" y
+ * "enlazar" en crash.txt), y casi siempre salia lo mismo que en el lote
+ * anterior: entre dos dibujados el juego cambia matrices, vertices y texturas,
+ * no materiales. La PICA marca cada registro que se escribe (dirty_regs); si
+ * desde el lote anterior no se ha escrito ninguno de los que deciden esto
+ * (kFsMemoMask, kVsMemoMask), se reutiliza tal cual. Las caches de donde salen
+ * los punteros no borran entradas utiles mientras vive el rasterizador.
+ */
+struct RasterizerGXM::BatchMemo {
+    struct Location {
+        bool found = false;
+        u8 loader = 0;
+        u16 offset = 0;
+    };
+    /// De donde sale cada atributo, para convertirlo si hace falta (0.1.8.5).
+    struct AttributeSource {
+        u8 stream = 0;
+        u8 format = 0;
+        u16 offset = 0;
+        /// Las que trae el invitado y las que declara el programa compilado.
+        u8 components = 0;
+        u8 declared = 0;
+    };
+    struct VertexLayout {
+        std::array<Location, 12> locations{};
+        Pica::Shader::Generator::GXM::VSInputs inputs{};
+        std::array<u8, 16> input_attribute{};
+        u64 program_key = 0;
+        const HwShaderCache::Program* program = nullptr;
+        std::array<SceGxmVertexAttribute, 16> gxm_attributes{};
+        std::array<SceGxmVertexStream, 12> gxm_streams{};
+        std::array<u8, 12> stream_of_loader{};
+        std::array<u8, 12> loader_of_stream{};
+        std::array<AttributeSource, 16> attribute_sources{};
+        u32 attribute_count = 0;
+        u32 stream_count = 0;
+        u64 layout_key = 0;
+        SceGxmVertexProgram* vertex_program = nullptr;
+        bool converted = false;
+        u32 converted_stride = 0;
+    };
+    const PipelineCache::Entry* pipeline = nullptr;
+    bool vs_valid = false;
+    VertexLayout layout;
+};
+
 RasterizerGXM::RasterizerGXM(VideoCore::RasterizerInterface& software_, Memory::MemorySystem& memory_,
                              Pica::PicaCore& pica_)
     : software{software_}, memory{memory_}, pica{pica_} {
@@ -2185,6 +2235,7 @@ bool RasterizerGXM::EnsureInitialized() {
     }
     textures = std::make_unique<TextureCache>();
     hw_shaders = std::make_unique<HwShaderCache>(patcher);
+    batch_memo = std::make_unique<BatchMemo>();
     available = true;
     status = "gxm";
     Common::VitaNote("gxm init", "rasterizador listo");
@@ -4226,6 +4277,8 @@ template <typename Entry>
 bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                                    const SceGxmVertexProgram* vertex_program,
                                    const SceGxmFragmentProgram* fragment_program) {
+    const bool timed = profile_state;
+    unsigned long long mark = timed ? Common::VitaMicros() : 0;
     if (!surface->scene_open) {
         // Una escena nueva va a cambiar el color: lo que se llevo una copia de
         // pantalla ya no es lo que hay (0.1.8.7).
@@ -4251,6 +4304,11 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         if (surface->clear_pending) {
             DrawClearQuad(*surface);
         }
+    }
+    if (timed) {
+        const unsigned long long now = Common::VitaMicros();
+        state_scene_us += now - mark;
+        mark = now;
     }
 
     // Viewport: la misma transformacion que hace el rasterizador de software
@@ -4449,6 +4507,9 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
     // Texturas: por cada sampler que el shader use de verdad, su unidad. Si
     // alguna no se puede servir (formato, borde, unidad apagada...), el lote
     // entero vuelve a software desde DrawTriangles.
+    if (timed) {
+        mark = Common::VitaMicros();
+    }
     for (u32 i = 0; i < 3; i++) {
         if (pipeline->samplers[i] == nullptr) {
             continue;
@@ -4459,6 +4520,9 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
             return false;
         }
         sceGxmSetFragmentTexture(context, pipeline->sampler_units[i], texture);
+    }
+    if (timed) {
+        state_texture_us += Common::VitaMicros() - mark;
     }
     if (pipeline->lighting_lut != nullptr) {
         // La version vigente: ver UpdateLightingLut.
@@ -4783,6 +4847,59 @@ void RasterizerGXM::ClearAll(bool flush) {
  * forma de saber por que 'vsg' se quedaba en 12 de 177 lotes. Los motivos son
  * siempre literales de texto, que viven lo que el programa.
  */
+namespace {
+/**
+ * Registros que NO deciden el programa de fragmentos ni el de vertices de un
+ * lote (ver BatchMemo): datos que se leen otra vez en cada lote (viewport,
+ * recorte, colores constantes, direcciones y tamanos de textura, niebla, luces,
+ * tablas, punteros de vertices e indices, uniforms de coma flotante) y
+ * registros de disparo. Comprobado contra lo que leen FSConfig, BuildBlend,
+ * PicaVSConfig y la disposicion de atributos. Escribirlos no invalida nada.
+ */
+constexpr u16 kMemoIgnoredRegs[] = {
+    // Rasterizador: cara oculta, viewport, profundidad, caja de recorte.
+    0x040, 0x041, 0x042, 0x043, 0x044, 0x04D, 0x04E, 0x066, 0x067, 0x068,
+    // Unidades de textura: borde, tamano, LOD, direcciones y formato.
+    0x081, 0x082, 0x084, 0x085, 0x086, 0x087, 0x088, 0x089, 0x08A, 0x08E, 0x091, 0x092, 0x094,
+    0x095, 0x096, 0x099, 0x09A, 0x09C, 0x09D, 0x09E,
+    // Colores constantes del combinador, su buffer, la niebla y su tabla.
+    0x0C3, 0x0CB, 0x0D3, 0x0DB, 0x0F3, 0x0FB, 0x0FD, 0x0E1, 0x0E6, 0x0E8, 0x0E9, 0x0EA, 0x0EB,
+    0x0EC, 0x0ED, 0x0EE, 0x0EF,
+    // Plantilla, disparos y buffers del framebuffer.
+    0x105, 0x106, 0x110, 0x111, 0x112, 0x113, 0x114, 0x115, 0x116, 0x117, 0x11C, 0x11D, 0x11E,
+    // Luz ambiente global, indice y datos de las tablas de luz.
+    0x1C0, 0x1C5, 0x1C8, 0x1C9, 0x1CA, 0x1CB, 0x1CC, 0x1CD, 0x1CE, 0x1CF,
+    // Vertices: base, desplazamiento de cada cargador, indices, cuantos,
+    // disparos, atributo fijo, buffers de comandos, modo, topologia.
+    0x200, 0x203, 0x206, 0x209, 0x20C, 0x20F, 0x212, 0x215, 0x218, 0x21B, 0x21E, 0x221, 0x224,
+    0x227, 0x228, 0x22A, 0x22E, 0x22F, 0x232, 0x233, 0x234, 0x235, 0x238, 0x239, 0x23A, 0x23B,
+    0x23C, 0x23D, 0x245, 0x25E, 0x25F,
+    // Uniforms de coma flotante del shader de vertices.
+    0x2C0, 0x2C1, 0x2C2, 0x2C3, 0x2C4, 0x2C5, 0x2C6, 0x2C7, 0x2C8,
+};
+
+constexpr std::array<u64, 12> MemoMask(u32 first, u32 end) {
+    std::array<u64, 12> mask{};
+    for (u32 reg = first; reg < end; reg++) {
+        // Los datos de cada luz (colores, posicion, foco, atenuacion): todo
+        // menos su palabra de configuracion, la novena.
+        bool ignored = reg >= 0x140 && reg < 0x1C0 && (reg & 0xF) != 9;
+        for (const u16 skip : kMemoIgnoredRegs) {
+            ignored = ignored || skip == reg;
+        }
+        if (!ignored) {
+            mask[reg >> 6] |= 1ull << (reg & 63);
+        }
+    }
+    return mask;
+}
+
+/// Deciden el programa de fragmentos (y parte del de vertices: salidas y luz).
+constexpr std::array<u64, 12> kFsMemoMask = MemoMask(0x040, 0x200);
+/// Deciden el resto del de vertices: atributos, programa y geometria.
+constexpr std::array<u64, 12> kVsMemoMask = MemoMask(0x200, 0x300);
+} // Anonymous namespace
+
 static bool HwVsReject(const char* why) {
     RasterizerGXM::hw_vs_last_reject.store(why, std::memory_order_relaxed);
     RasterizerGXM::hw_vs_rejects.fetch_add(1, std::memory_order_relaxed);
@@ -4850,13 +4967,25 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
      * 'lote' cuenta la funcion ENTERA desde 0.1.9.5, preguntas y rechazos
      * incluidos: en el titulo de Zafiro Alfa (2D, ~230 lotes por fotograma)
      * "gx" eran 21 ms y "lote" solo 1,7, y no se veia donde iba el resto.
+     *
+     * Y POR FASES (0.1.9.6), uno de cada 8 lotes: en que se va el coste fijo
+     * de cada lote (en el 2D de Zafiro Alfa, ~70 us por lote y 230 lotes por
+     * fotograma). Solo cuentan los lotes que llegan a dibujarse. Desde 0.2.1.0
+     * el total del lote tambien sale de esos, por ocho: leer el reloj es una
+     * llamada al kernel, y eran dos por lote.
      */
+    static u32 profile_tick = 0;
+    const bool profile = (++profile_tick & 7u) == 0;
     struct BatchTimer {
-        unsigned long long begin = Common::VitaMicros();
+        bool timed;
+        unsigned long long begin = timed ? Common::VitaMicros() : 0;
         ~BatchTimer() {
-            Common::FrameStats::Add(Common::FrameStats::batch_us, begin);
+            if (timed) {
+                Common::FrameStats::batch_us.fetch_add((Common::VitaMicros() - begin) * 8,
+                                                       std::memory_order_relaxed);
+            }
         }
-    } const batch_timer;
+    } const batch_timer{profile};
     /**
      * SALTO DE FOTOGRAMAS EN LA GPU (0.1.9.6). Hasta ahora SELECT+L/R solo se
      * saltaba la PRESENTACION: la GPU emulada dibujaba todos los fotogramas
@@ -4866,13 +4995,6 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     if (!SwRenderer::FrameSkip::ShouldRender()) {
         return true;
     }
-    /**
-     * Y POR FASES (0.1.9.6), uno de cada 8 lotes: en que se va el coste fijo
-     * de cada lote (en el 2D de Zafiro Alfa, ~70 us por lote y 230 lotes por
-     * fotograma). Solo cuentan los lotes que llegan a dibujarse.
-     */
-    static u32 profile_tick = 0;
-    const bool profile = (++profile_tick & 7u) == 0;
     std::array<unsigned long long, kBatchPhases> phase_us{};
     unsigned long long phase_mark = profile ? Common::VitaMicros() : 0;
     const auto phase = [&](u32 index) {
@@ -4885,6 +5007,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     using Pica::PipelineRegs;
     using Pica::Shader::Generator::GXM::VSInputs;
     using Pica::Shader::Generator::GXM::VSInputSource;
+    using Location = BatchMemo::Location;
+    using AttributeSource = BatchMemo::AttributeSource;
 
     const u32 ablation = Ablation::mode.load(std::memory_order_relaxed);
     if (ablation == Ablation::kCpuVertexShader || ablation == Ablation::kNoGpu) {
@@ -4918,13 +5042,36 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     if (regs.rasterizer.depthmap_enable == RasterizerRegs::DepthBuffering::WBuffering) {
         return HwVsReject("wbuffer");
     }
+    // Lo que no haya cambiado desde el lote anterior se reutiliza (BatchMemo).
+    BatchMemo& memo = *batch_memo;
+    {
+        bool fs_dirty = false;
+        bool vs_dirty = false;
+        const auto& dirty = pica.dirty_regs.qwords;
+        for (u32 i = 0; i < dirty.size(); i++) {
+            fs_dirty = fs_dirty || (dirty[i] & kFsMemoMask[i]) != 0;
+            vs_dirty = vs_dirty || (dirty[i] & kVsMemoMask[i]) != 0;
+        }
+        if (fs_dirty) {
+            memo.pipeline = nullptr;
+        }
+        if (fs_dirty || vs_dirty) {
+            memo.vs_valid = false;
+        }
+        pica.dirty_regs.Reset();
+    }
     const char* fs_reason = nullptr;
-    const PipelineCache::Entry* pipeline = pipelines->Get(regs, &fs_reason);
-    // Su shader de fragmentos se esta compilando: el lote se salta (0.1.9.8).
-    if (pipeline == nullptr && fs_reason != nullptr &&
-        std::strcmp(fs_reason, "fs compilando") == 0) {
-        skipped_batches.fetch_add(1, std::memory_order_relaxed);
-        return true;
+    const PipelineCache::Entry* pipeline = memo.pipeline;
+    if (pipeline == nullptr) {
+        memo.vs_valid = false;
+        pipeline = pipelines->Get(regs, &fs_reason);
+        // Su shader de fragmentos se esta compilando: el lote se salta (0.1.9.8).
+        if (pipeline == nullptr && fs_reason != nullptr &&
+            std::strcmp(fs_reason, "fs compilando") == 0) {
+            skipped_batches.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        memo.pipeline = pipeline;
     }
     if (pipeline == nullptr || AblatedByMode()) {
         // El motivo lo anota la ruta de la CPU al llegar a AddTriangle.
@@ -4974,297 +5121,323 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     const u32 vertex_range = max_index - min_index + 1;
 
     /**
-     * Donde vive cada atributo, con la misma cuenta que VertexLoader: cada
-     * cargador va poniendo sus componentes seguidas, alineando cada una a su
-     * tamano de elemento, y los codigos 12-15 son relleno de 4 a 16 bytes. Si
-     * dos cargadores nombran el mismo atributo, gana el ultimo (el constructor
-     * de VertexLoader lo pisa igual).
+     * La disposicion de los atributos y el programa de vertices, los del lote
+     * anterior si la PICA no ha tocado nada que los decida (BatchMemo).
      */
-    struct Location {
-        bool found = false;
-        u8 loader = 0;
-        u16 offset = 0;
-    };
-    std::array<Location, 12> locations{};
-    for (u32 loader = 0; loader < 12; loader++) {
-        const auto& config = attributes.attribute_loaders[loader];
-        if (config.component_count == 0 || config.byte_count == 0) {
-            continue;
-        }
-        u32 offset = 0;
-        for (u32 component = 0; component < config.component_count && component < 12;
-             component++) {
-            const u32 attribute = config.GetComponent(component);
-            if (attribute < 12) {
-                offset = Common::AlignUp(offset, attributes.GetElementSizeInBytes(attribute));
-                locations[attribute] = {true, static_cast<u8>(loader), static_cast<u16>(offset)};
-                offset += attributes.GetStride(attribute);
-            } else {
-                offset = Common::AlignUp(offset, 4);
-                offset += (attribute - 11) * 4;
-            }
-        }
-    }
-
-    /**
-     * Y de donde sale cada REGISTRO de entrada: como ShaderUnit::LoadInput, el
-     * atributo 'a' va al registro GetRegisterForAttribute(a) para a de 0 al
-     * ultimo indice, y los posteriores pisan a los anteriores.
-     */
-    const u32 total_attributes = attributes.GetNumTotalAttributes();
-    VSInputs inputs{};
-    std::array<u8, 16> input_attribute{};
-    for (u32 attribute = 0; attribute <= regs.vs.max_input_attribute_index && attribute < 16;
-         attribute++) {
-        const u32 reg = regs.vs.GetRegisterForAttribute(attribute);
-        if (reg >= 16) {
-            continue;
-        }
-        VSInputSource source{};
-        if (attribute < total_attributes && attribute < 12) {
-            if (attributes.IsDefaultAttribute(attribute)) {
-                source.kind = VSInputSource::Default;
-            } else if (locations[attribute].found && attributes.GetNumElements(attribute) != 0) {
-                source.kind = VSInputSource::Array;
-                source.components = static_cast<u8>(attributes.GetNumElements(attribute));
-            }
-        }
-        inputs[reg] = source;
-        input_attribute[reg] = static_cast<u8>(attribute);
-    }
-
-    // El programa traducido y compilado.
-    const Pica::Shader::Generator::PicaVSConfig vs_config{regs, pica.vs_setup};
-    u64 program_key = vs_config.Hash();
-    for (u32 reg = 0; reg < 16; reg++) {
-        program_key = Common::HashCombine(program_key,
-                                          (static_cast<u64>(inputs[reg].kind) << 8) |
-                                              inputs[reg].components);
-    }
-    // La variante de salidas es la del shader de fragmentos (ver
-    // GenerateVertexShader): entra en la clave.
-    program_key = Common::HashCombine(program_key, (pipeline->lit ? 2u : 0u) |
-                                                       (pipeline->proj ? 1u : 0u));
-    if (hw_shaders->unlinkable.count(program_key) != 0) {
-        return HwVsReject("vs enlazar atributos");
-    }
-    const char* reason = nullptr;
-    const HwShaderCache::Program* program =
-        hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs, pipeline->lit,
-                               pipeline->proj, &reason);
-    /**
-     * PROGRAMA ESPECIALIZADO CON LOS BOOLEANOS DEL LOTE (0.1.7.4).
-     *
-     * crash.txt de 0.1.6.3: el shader de piel de Rubi Omega se queda en la CPU
-     * por "salto en 0x130 -> 0x157" fuera de su tramo, y ese salto es un JMPU
-     * (salta segun un uniform booleano). Con los saltos de escape puestos, el
-     * mismo shader rompe el compilador (cg_error.txt). Pero los booleanos no
-     * cambian dentro de un lote: traducido con sus valores como constantes, el
-     * JMPU es un NOP o un salto fijo, y los IFU/CALLU que no se toman
-     * desaparecen con todo su codigo. El programa queda mucho mas pequeno y
-     * sencillo para el compilador y para la GPU.
-     *
-     * Solo si la traduccion generica no sirve, para no multiplicar programas
-     * que ya funcionan. La clave lleva los booleanos que el codigo lee.
-     */
-    if (program == nullptr && reason != nullptr &&
-        specialize_vs.load(std::memory_order_relaxed) != 0 &&
-        std::strcmp(reason, "vs tope de programas") != 0 &&
-        std::strcmp(reason, "vs compilador roto") != 0 &&
-        std::strcmp(reason, "vs compilando") != 0 &&
-        std::strcmp(reason, "vs con geometria") != 0) {
-        using namespace Pica::Shader::Generator::GXM;
-        auto used = hw_shaders->used_bools.find(program_key);
-        if (used == hw_shaders->used_bools.end()) {
-            used = hw_shaders->used_bools.emplace(program_key, UsedBoolUniforms(pica.vs_setup))
-                       .first;
-        }
-        u32 bools = 0;
-        for (u32 i = 0; i < 16; i++) {
-            if (((used->second >> i) & 1u) != 0 && pica.vs_setup.uniforms.b[i]) {
-                bools |= 1u << i;
-            }
-        }
-        const u64 special_key =
-            Common::HashCombine(program_key, 0xB0010000ull | (bools & 0xFFFFu));
-        const char* special_reason = nullptr;
-        // 0.1.7.9: un especializado NUEVO solo si queda hueco en el tope de
-        // ese shader y heap de sobra. Los ya hechos se siguen usando siempre.
-        bool may_build = true;
-        if (!hw_shaders->Has(special_key)) {
-            u32& count = hw_shaders->specialized_count[program_key];
-            if (count >= HwShaderCache::kMaxSpecializedPerProgram) {
-                special_reason = "vs tope de especializados";
-                may_build = false;
-            } else if (CgHeapLow()) {
-                special_reason = "vs sin heap para especializar";
-                may_build = false;
-            } else {
-                count++;
-            }
-        }
-        if (may_build) {
-            g_cg_const_bools.store(kCgBoolsKnown | bools, std::memory_order_relaxed);
-            program = hw_shaders->GetProgram(special_key, pica.vs_setup, vs_config, inputs,
-                                             pipeline->lit, pipeline->proj, &special_reason);
-            g_cg_const_bools.store(0, std::memory_order_relaxed);
-        }
-        if (program != nullptr) {
-            static u32 special_notes = 0;
-            if (special_notes < 4) {
-                special_notes++;
-                NoteFmt("gxm vs", "especializado con booleanos {:#06x} ({}): a la GPU", bools,
-                        reason);
-            }
-        } else if (special_reason != nullptr) {
-            reason = special_reason;
-        }
-    }
-    if (program == nullptr) {
-        NoteSkip(5, reason != nullptr ? reason : "vs");
-        return HwVsReject(reason != nullptr ? reason : "vs");
-    }
-    phase(1);
-
-    /**
-     * Flujos y atributos de GXM. Un flujo por cargador que aporte algun
-     * registro que el programa lee; cada atributo, en su flujo y su
-     * desplazamiento, con el formato de la PICA SIN normalizar (la PICA
-     * convierte el entero a flotante tal cual) y las componentes que traiga:
-     * las que faltan las rellena el propio shader (ver VSInputs).
-     */
-    std::array<SceGxmVertexAttribute, 16> gxm_attributes{};
-    std::array<SceGxmVertexStream, 12> gxm_streams{};
-    std::array<u8, 12> stream_of_loader;
-    stream_of_loader.fill(0xFF);
-    std::array<u8, 12> loader_of_stream{};
-    /// De donde sale cada atributo, para convertirlo si hace falta (0.1.8.5).
-    struct AttributeSource {
-        u8 stream = 0;
-        u8 format = 0;
-        u16 offset = 0;
-        /// Las que trae el invitado y las que declara el programa compilado.
-        u8 components = 0;
-        u8 declared = 0;
-    };
-    std::array<AttributeSource, 16> attribute_sources{};
-    u32 attribute_count = 0;
-    u32 stream_count = 0;
-    u64 layout_key = program_key;
-    for (u32 reg = 0; reg < 16; reg++) {
-        if (inputs[reg].kind != VSInputSource::Array || program->inputs[reg] == nullptr) {
-            continue;
-        }
-        const u32 attribute = input_attribute[reg];
-        const Location& location = locations[attribute];
-        if (stream_of_loader[location.loader] == 0xFF) {
-            stream_of_loader[location.loader] = static_cast<u8>(stream_count);
-            loader_of_stream[stream_count] = location.loader;
-            gxm_streams[stream_count].stride =
-                static_cast<u16>(attributes.attribute_loaders[location.loader].byte_count);
-            gxm_streams[stream_count].indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
-            stream_count++;
-        }
-        attribute_sources[attribute_count] = {
-            stream_of_loader[location.loader],
-            static_cast<u8>(attributes.GetFormat(attribute)), location.offset};
-        SceGxmVertexAttribute& out = gxm_attributes[attribute_count++];
-        out.streamIndex = stream_of_loader[location.loader];
-        out.offset = location.offset;
-        switch (attributes.GetFormat(attribute)) {
-        case PipelineRegs::VertexAttributeFormat::BYTE:
-            out.format = SCE_GXM_ATTRIBUTE_FORMAT_S8;
-            break;
-        case PipelineRegs::VertexAttributeFormat::UBYTE:
-            out.format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
-            break;
-        case PipelineRegs::VertexAttributeFormat::SHORT:
-            out.format = SCE_GXM_ATTRIBUTE_FORMAT_S16;
-            break;
-        default:
-            out.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
-            break;
-        }
+    BatchMemo::VertexLayout& layout = memo.layout;
+    if (!memo.vs_valid) {
         /**
-         * No mas componentes de las que tiene el parametro COMPILADO (0.1.8.9).
-         * El compilador quita las que el shader no lee (un float4 del que solo
-         * se usa .xy queda en 2), y pasarle a GXM mas de las que hay es el
-         * 0x805b0023 de los shaders de piel de Zafiro Alfa: 213 lotes por
-         * fotograma sombreados en la CPU.
+         * Donde vive cada atributo, con la misma cuenta que VertexLoader: cada
+         * cargador va poniendo sus componentes seguidas, alineando cada una a su
+         * tamano de elemento, y los codigos 12-15 son relleno de 4 a 16 bytes. Si
+         * dos cargadores nombran el mismo atributo, gana el ultimo (el constructor
+         * de VertexLoader lo pisa igual).
          */
-        out.componentCount = static_cast<u8>(std::min<u32>(
-            inputs[reg].components, sceGxmProgramParameterGetComponentCount(program->inputs[reg])));
-        out.regIndex =
-            static_cast<u16>(sceGxmProgramParameterGetResourceIndex(program->inputs[reg]));
-        attribute_sources[attribute_count - 1].components = out.componentCount;
-        attribute_sources[attribute_count - 1].declared = static_cast<u8>(std::clamp<u32>(
-            sceGxmProgramParameterGetComponentCount(program->inputs[reg]), out.componentCount, 4));
-        layout_key = Common::HashCombine(
-            layout_key, (static_cast<u64>(out.streamIndex) << 48) |
-                            (static_cast<u64>(out.offset) << 32) |
-                            (static_cast<u64>(out.format) << 24) |
-                            (static_cast<u64>(out.componentCount) << 16) | out.regIndex);
-    }
-    for (u32 stream = 0; stream < stream_count; stream++) {
-        layout_key = Common::HashCombine(layout_key, gxm_streams[stream].stride);
-    }
-    SceGxmVertexProgram* vertex_program =
-        hw_shaders->GetLinked(layout_key, *program, gxm_attributes.data(), attribute_count,
-                              gxm_streams.data(), stream_count);
-    /**
-     * DISPOSICION CONVERTIDA (0.1.8.5). crash.txt de 0.1.8.4, Zafiro Alfa: el
-     * shader de piel ya compila especializado, pero GXM rechaza enlazarlo con
-     * los atributos tal como los guarda el 3DS ("crear programa de vertices err
-     * 0x805b0023 (5 atributos, 1 flujos)") y 213 de 246 lotes por segundo
-     * vuelven a la CPU. Esos modelos llevan indices y pesos de huesos en bytes,
-     * con desplazamientos y paso que no son multiplos de 4. Si la disposicion
-     * original no vale, se prueba la mas sencilla que hay: un solo flujo con
-     * todos los atributos en float de 32 bits seguidos y alineados, convertidos
-     * en la CPU solo para los vertices del lote. Los valores son los mismos: la
-     * PICA pasa los enteros a float tal cual, sin normalizar.
-     */
-    bool converted = false;
-    u32 converted_stride = 0;
-    if (vertex_program == nullptr) {
-        u64 converted_key = Common::HashCombine(program_key, 0xF32F32F3ull);
-        for (u32 i = 0; i < attribute_count; i++) {
-            SceGxmVertexAttribute& out = gxm_attributes[i];
-            out.streamIndex = 0;
-            out.offset = static_cast<u16>(converted_stride);
-            out.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+        auto& locations = layout.locations;
+        locations = {};
+        for (u32 loader = 0; loader < 12; loader++) {
+            const auto& config = attributes.attribute_loaders[loader];
+            if (config.component_count == 0 || config.byte_count == 0) {
+                continue;
+            }
+            u32 offset = 0;
+            for (u32 component = 0; component < config.component_count && component < 12;
+                 component++) {
+                const u32 attribute = config.GetComponent(component);
+                if (attribute < 12) {
+                    offset = Common::AlignUp(offset, attributes.GetElementSizeInBytes(attribute));
+                    locations[attribute] = {true, static_cast<u8>(loader),
+                                            static_cast<u16>(offset)};
+                    offset += attributes.GetStride(attribute);
+                } else {
+                    offset = Common::AlignUp(offset, 4);
+                    offset += (attribute - 11) * 4;
+                }
+            }
+        }
+
+        /**
+         * Y de donde sale cada REGISTRO de entrada: como ShaderUnit::LoadInput, el
+         * atributo 'a' va al registro GetRegisterForAttribute(a) para a de 0 al
+         * ultimo indice, y los posteriores pisan a los anteriores.
+         */
+        const u32 total_attributes = attributes.GetNumTotalAttributes();
+        auto& inputs = layout.inputs;
+        auto& input_attribute = layout.input_attribute;
+        inputs = {};
+        input_attribute = {};
+        for (u32 attribute = 0; attribute <= regs.vs.max_input_attribute_index && attribute < 16;
+             attribute++) {
+            const u32 reg = regs.vs.GetRegisterForAttribute(attribute);
+            if (reg >= 16) {
+                continue;
+            }
+            VSInputSource source{};
+            if (attribute < total_attributes && attribute < 12) {
+                if (attributes.IsDefaultAttribute(attribute)) {
+                    source.kind = VSInputSource::Default;
+                } else if (locations[attribute].found &&
+                           attributes.GetNumElements(attribute) != 0) {
+                    source.kind = VSInputSource::Array;
+                    source.components = static_cast<u8>(attributes.GetNumElements(attribute));
+                }
+            }
+            inputs[reg] = source;
+            input_attribute[reg] = static_cast<u8>(attribute);
+        }
+
+        // El programa traducido y compilado.
+        const Pica::Shader::Generator::PicaVSConfig vs_config{regs, pica.vs_setup};
+        u64& program_key = layout.program_key;
+        program_key = vs_config.Hash();
+        for (u32 reg = 0; reg < 16; reg++) {
+            program_key = Common::HashCombine(program_key,
+                                              (static_cast<u64>(inputs[reg].kind) << 8) |
+                                                  inputs[reg].components);
+        }
+        // La variante de salidas es la del shader de fragmentos (ver
+        // GenerateVertexShader): entra en la clave.
+        program_key = Common::HashCombine(program_key, (pipeline->lit ? 2u : 0u) |
+                                                           (pipeline->proj ? 1u : 0u));
+        if (hw_shaders->unlinkable.count(program_key) != 0) {
+            return HwVsReject("vs enlazar atributos");
+        }
+        const char* reason = nullptr;
+        const HwShaderCache::Program*& program = layout.program;
+        program = hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs,
+                                         pipeline->lit, pipeline->proj, &reason);
+        /**
+         * PROGRAMA ESPECIALIZADO CON LOS BOOLEANOS DEL LOTE (0.1.7.4).
+         *
+         * crash.txt de 0.1.6.3: el shader de piel de Rubi Omega se queda en la CPU
+         * por "salto en 0x130 -> 0x157" fuera de su tramo, y ese salto es un JMPU
+         * (salta segun un uniform booleano). Con los saltos de escape puestos, el
+         * mismo shader rompe el compilador (cg_error.txt). Pero los booleanos no
+         * cambian dentro de un lote: traducido con sus valores como constantes, el
+         * JMPU es un NOP o un salto fijo, y los IFU/CALLU que no se toman
+         * desaparecen con todo su codigo. El programa queda mucho mas pequeno y
+         * sencillo para el compilador y para la GPU.
+         *
+         * Solo si la traduccion generica no sirve, para no multiplicar programas
+         * que ya funcionan. La clave lleva los booleanos que el codigo lee.
+         */
+        if (program == nullptr && reason != nullptr &&
+            specialize_vs.load(std::memory_order_relaxed) != 0 &&
+            std::strcmp(reason, "vs tope de programas") != 0 &&
+            std::strcmp(reason, "vs compilador roto") != 0 &&
+            std::strcmp(reason, "vs compilando") != 0 &&
+            std::strcmp(reason, "vs con geometria") != 0) {
+            using namespace Pica::Shader::Generator::GXM;
+            auto used = hw_shaders->used_bools.find(program_key);
+            if (used == hw_shaders->used_bools.end()) {
+                used = hw_shaders->used_bools.emplace(program_key, UsedBoolUniforms(pica.vs_setup))
+                           .first;
+            }
+            u32 bools = 0;
+            for (u32 i = 0; i < 16; i++) {
+                if (((used->second >> i) & 1u) != 0 && pica.vs_setup.uniforms.b[i]) {
+                    bools |= 1u << i;
+                }
+            }
+            const u64 special_key =
+                Common::HashCombine(program_key, 0xB0010000ull | (bools & 0xFFFFu));
+            const char* special_reason = nullptr;
+            // 0.1.7.9: un especializado NUEVO solo si queda hueco en el tope de
+            // ese shader y heap de sobra. Los ya hechos se siguen usando siempre.
+            bool may_build = true;
+            if (!hw_shaders->Has(special_key)) {
+                u32& count = hw_shaders->specialized_count[program_key];
+                if (count >= HwShaderCache::kMaxSpecializedPerProgram) {
+                    special_reason = "vs tope de especializados";
+                    may_build = false;
+                } else if (CgHeapLow()) {
+                    special_reason = "vs sin heap para especializar";
+                    may_build = false;
+                } else {
+                    count++;
+                }
+            }
+            if (may_build) {
+                g_cg_const_bools.store(kCgBoolsKnown | bools, std::memory_order_relaxed);
+                program = hw_shaders->GetProgram(special_key, pica.vs_setup, vs_config, inputs,
+                                                 pipeline->lit, pipeline->proj, &special_reason);
+                g_cg_const_bools.store(0, std::memory_order_relaxed);
+            }
+            if (program != nullptr) {
+                static u32 special_notes = 0;
+                if (special_notes < 4) {
+                    special_notes++;
+                    NoteFmt("gxm vs", "especializado con booleanos {:#06x} ({}): a la GPU", bools,
+                            reason);
+                }
+            } else if (special_reason != nullptr) {
+                reason = special_reason;
+            }
+        }
+        if (program == nullptr) {
+            NoteSkip(5, reason != nullptr ? reason : "vs");
+            return HwVsReject(reason != nullptr ? reason : "vs");
+        }
+        phase(1);
+
+        /**
+         * Flujos y atributos de GXM. Un flujo por cargador que aporte algun
+         * registro que el programa lee; cada atributo, en su flujo y su
+         * desplazamiento, con el formato de la PICA SIN normalizar (la PICA
+         * convierte el entero a flotante tal cual) y las componentes que traiga:
+         * las que faltan las rellena el propio shader (ver VSInputs).
+         */
+        auto& gxm_attributes = layout.gxm_attributes;
+        auto& gxm_streams = layout.gxm_streams;
+        auto& stream_of_loader = layout.stream_of_loader;
+        auto& loader_of_stream = layout.loader_of_stream;
+        auto& attribute_sources = layout.attribute_sources;
+        u32& attribute_count = layout.attribute_count;
+        u32& stream_count = layout.stream_count;
+        u64& layout_key = layout.layout_key;
+        gxm_attributes = {};
+        gxm_streams = {};
+        stream_of_loader.fill(0xFF);
+        loader_of_stream = {};
+        attribute_sources = {};
+        attribute_count = 0;
+        stream_count = 0;
+        layout_key = program_key;
+        for (u32 reg = 0; reg < 16; reg++) {
+            if (inputs[reg].kind != VSInputSource::Array || program->inputs[reg] == nullptr) {
+                continue;
+            }
+            const u32 attribute = input_attribute[reg];
+            const Location& location = locations[attribute];
+            if (stream_of_loader[location.loader] == 0xFF) {
+                stream_of_loader[location.loader] = static_cast<u8>(stream_count);
+                loader_of_stream[stream_count] = location.loader;
+                gxm_streams[stream_count].stride =
+                    static_cast<u16>(attributes.attribute_loaders[location.loader].byte_count);
+                gxm_streams[stream_count].indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+                stream_count++;
+            }
+            attribute_sources[attribute_count] = {
+                stream_of_loader[location.loader],
+                static_cast<u8>(attributes.GetFormat(attribute)), location.offset};
+            SceGxmVertexAttribute& out = gxm_attributes[attribute_count++];
+            out.streamIndex = stream_of_loader[location.loader];
+            out.offset = location.offset;
+            switch (attributes.GetFormat(attribute)) {
+            case PipelineRegs::VertexAttributeFormat::BYTE:
+                out.format = SCE_GXM_ATTRIBUTE_FORMAT_S8;
+                break;
+            case PipelineRegs::VertexAttributeFormat::UBYTE:
+                out.format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
+                break;
+            case PipelineRegs::VertexAttributeFormat::SHORT:
+                out.format = SCE_GXM_ATTRIBUTE_FORMAT_S16;
+                break;
+            default:
+                out.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+                break;
+            }
             /**
-             * Todas las componentes que declara el programa (0.1.9.2). crash.txt
-             * de 0.1.9.1: los shaders de piel declaran float4 en cada entrada y
-             * GXM no los enlaza con 2 o 3 (err 0x805b0023, tambien en float).
-             * Las que el invitado no trae van con los valores por defecto de
-             * la PICA: 0 y la w a 1.
+             * No mas componentes de las que tiene el parametro COMPILADO (0.1.8.9).
+             * El compilador quita las que el shader no lee (un float4 del que solo
+             * se usa .xy queda en 2), y pasarle a GXM mas de las que hay es el
+             * 0x805b0023 de los shaders de piel de Zafiro Alfa: 213 lotes por
+             * fotograma sombreados en la CPU.
              */
-            out.componentCount = attribute_sources[i].declared;
-            converted_stride += out.componentCount * 4u;
-            converted_key = Common::HashCombine(
-                converted_key, (static_cast<u64>(out.componentCount) << 16) | out.regIndex);
+            out.componentCount = static_cast<u8>(
+                std::min<u32>(inputs[reg].components,
+                              sceGxmProgramParameterGetComponentCount(program->inputs[reg])));
+            out.regIndex =
+                static_cast<u16>(sceGxmProgramParameterGetResourceIndex(program->inputs[reg]));
+            attribute_sources[attribute_count - 1].components = out.componentCount;
+            attribute_sources[attribute_count - 1].declared = static_cast<u8>(
+                std::clamp<u32>(sceGxmProgramParameterGetComponentCount(program->inputs[reg]),
+                                out.componentCount, 4));
+            layout_key = Common::HashCombine(
+                layout_key, (static_cast<u64>(out.streamIndex) << 48) |
+                                (static_cast<u64>(out.offset) << 32) |
+                                (static_cast<u64>(out.format) << 24) |
+                                (static_cast<u64>(out.componentCount) << 16) | out.regIndex);
         }
-        SceGxmVertexStream converted_stream{};
-        converted_stream.stride = static_cast<u16>(converted_stride);
-        converted_stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
-        if (attribute_count > 0) {
-            vertex_program = hw_shaders->GetLinked(converted_key, *program, gxm_attributes.data(),
-                                                   attribute_count, &converted_stream, 1);
+        for (u32 stream = 0; stream < stream_count; stream++) {
+            layout_key = Common::HashCombine(layout_key, gxm_streams[stream].stride);
         }
-        if (vertex_program != nullptr) {
-            converted = true;
-            static bool noted_converted = false;
-            NoteOnce(noted_converted, "gxm vs",
-                     "atributos convertidos a float: enlaza ({} atributos, paso {})",
-                     attribute_count, converted_stride);
+        SceGxmVertexProgram*& vertex_program = layout.vertex_program;
+        vertex_program = hw_shaders->GetLinked(layout_key, *program, gxm_attributes.data(),
+                                               attribute_count, gxm_streams.data(), stream_count);
+        /**
+         * DISPOSICION CONVERTIDA (0.1.8.5). crash.txt de 0.1.8.4, Zafiro Alfa: el
+         * shader de piel ya compila especializado, pero GXM rechaza enlazarlo con
+         * los atributos tal como los guarda el 3DS ("crear programa de vertices err
+         * 0x805b0023 (5 atributos, 1 flujos)") y 213 de 246 lotes por segundo
+         * vuelven a la CPU. Esos modelos llevan indices y pesos de huesos en bytes,
+         * con desplazamientos y paso que no son multiplos de 4. Si la disposicion
+         * original no vale, se prueba la mas sencilla que hay: un solo flujo con
+         * todos los atributos en float de 32 bits seguidos y alineados, convertidos
+         * en la CPU solo para los vertices del lote. Los valores son los mismos: la
+         * PICA pasa los enteros a float tal cual, sin normalizar.
+         */
+        bool& converted = layout.converted;
+        u32& converted_stride = layout.converted_stride;
+        converted = false;
+        converted_stride = 0;
+        if (vertex_program == nullptr) {
+            u64 converted_key = Common::HashCombine(program_key, 0xF32F32F3ull);
+            for (u32 i = 0; i < attribute_count; i++) {
+                SceGxmVertexAttribute& out = gxm_attributes[i];
+                out.streamIndex = 0;
+                out.offset = static_cast<u16>(converted_stride);
+                out.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+                /**
+                 * Todas las componentes que declara el programa (0.1.9.2). crash.txt
+                 * de 0.1.9.1: los shaders de piel declaran float4 en cada entrada y
+                 * GXM no los enlaza con 2 o 3 (err 0x805b0023, tambien en float).
+                 * Las que el invitado no trae van con los valores por defecto de
+                 * la PICA: 0 y la w a 1.
+                 */
+                out.componentCount = attribute_sources[i].declared;
+                converted_stride += out.componentCount * 4u;
+                converted_key = Common::HashCombine(
+                    converted_key, (static_cast<u64>(out.componentCount) << 16) | out.regIndex);
+            }
+            SceGxmVertexStream converted_stream{};
+            converted_stream.stride = static_cast<u16>(converted_stride);
+            converted_stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
+            if (attribute_count > 0) {
+                vertex_program =
+                    hw_shaders->GetLinked(converted_key, *program, gxm_attributes.data(),
+                                          attribute_count, &converted_stream, 1);
+            }
+            if (vertex_program != nullptr) {
+                converted = true;
+                static bool noted_converted = false;
+                NoteOnce(noted_converted, "gxm vs",
+                         "atributos convertidos a float: enlaza ({} atributos, paso {})",
+                         attribute_count, converted_stride);
+            }
         }
-    }
-    if (vertex_program == nullptr) {
-        hw_shaders->unlinkable.insert(program_key);
-        NoteSkip(5, "vs enlazar atributos");
-        return HwVsReject("vs enlazar atributos");
+        if (vertex_program == nullptr) {
+            hw_shaders->unlinkable.insert(program_key);
+            NoteSkip(5, "vs enlazar atributos");
+            return HwVsReject("vs enlazar atributos");
+        }
+        memo.vs_valid = true;
+    } else {
+        phase(1);
     }
     phase(2);
+    const VSInputs& inputs = layout.inputs;
+    const auto& input_attribute = layout.input_attribute;
+    const HwShaderCache::Program* const program = layout.program;
+    SceGxmVertexProgram* const vertex_program = layout.vertex_program;
+    const auto& gxm_attributes = layout.gxm_attributes;
+    const auto& loader_of_stream = layout.loader_of_stream;
+    const auto& attribute_sources = layout.attribute_sources;
+    const u32 attribute_count = layout.attribute_count;
+    // Local: el camino convertido lo deja en uno.
+    u32 stream_count = layout.stream_count;
+    const bool converted = layout.converted;
+    const u32 converted_stride = layout.converted_stride;
     // El MISMO programa de fragmentos que la ruta de la CPU: el shader de
     // vertices traducido escribe exactamente los varyings de la variante fija
     // contra la que se enlazo (FormatFor(lit, proj)).
@@ -5391,7 +5564,10 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     }
 
     phase(3);
-    if (!SetupDrawState(surface, pipeline, vertex_program, fragment_program)) {
+    profile_state = profile;
+    const bool state_ok = SetupDrawState(surface, pipeline, vertex_program, fragment_program);
+    profile_state = false;
+    if (!state_ok) {
         return HwVsReject("estado");
     }
     phase(4);
@@ -5471,6 +5647,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
 
 std::array<unsigned long long, RasterizerGXM::kBatchPhases> RasterizerGXM::batch_phase_us{};
 u32 RasterizerGXM::batch_phase_samples = 0;
+unsigned long long RasterizerGXM::state_scene_us = 0;
+unsigned long long RasterizerGXM::state_texture_us = 0;
 
 std::string RasterizerGXM::TakeBatchProfile() {
     const u32 samples = batch_phase_samples;
@@ -5479,11 +5657,14 @@ std::string RasterizerGXM::TakeBatchProfile() {
     };
     std::string text = fmt::format(
         "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
-        "uniforms {:.1f} ({} muestras)",
+        "(escena {:.1f} texturas {:.1f}) uniforms {:.1f} ({} muestras)",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
-        avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(batch_phase_us[5]), samples);
+        avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
+        avg(state_texture_us), avg(batch_phase_us[5]), samples);
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
+    state_scene_us = 0;
+    state_texture_us = 0;
     return text;
 }
 

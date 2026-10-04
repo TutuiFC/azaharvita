@@ -149,6 +149,10 @@ public:
     static constexpr u32 kBatchPhases = 6;
     static std::array<unsigned long long, kBatchPhases> batch_phase_us;
     static u32 batch_phase_samples;
+    /// Dentro de "estado" (0.2.1.0): abrir la escena y las texturas, que es
+    /// donde puede esperar a la GPU o volver a mirar una textura entera.
+    static unsigned long long state_scene_us;
+    static unsigned long long state_texture_us;
     [[nodiscard]] static std::string TakeBatchProfile();
     /// Veces que un lote por software tuvo que bajar antes lo de la GPU.
     static std::atomic<u32> software_syncs;
@@ -494,6 +498,10 @@ private:
     void DestroyShaderPatcher();
 
     std::unique_ptr<PipelineCache> pipelines;
+    /// Lo que decidio el lote anterior, mientras la PICA no toque los registros
+    /// que lo deciden (0.2.1.0). Ver BatchMemo en el .cpp.
+    struct BatchMemo;
+    std::unique_ptr<BatchMemo> batch_memo;
     std::unique_ptr<TextureCache> textures;
     std::vector<std::unique_ptr<Surface>> surfaces;
     Surface* open_surface = nullptr;
@@ -597,6 +605,8 @@ private:
     /// espera a la GPU entera (una vez cada 4 MB de vertices).
     u32 vertex_used = 0;
     u32 index_capacity = 0;
+    /// El lote en curso es de los que se cronometran por fases.
+    bool profile_state = false;
 };
 
 } // namespace Gxm
