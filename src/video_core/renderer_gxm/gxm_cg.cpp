@@ -124,9 +124,15 @@ std::size_t g_compile_budget = static_cast<std::size_t>(-1);
 bool g_compile_over_budget = false;
 
 void* CgAlloc(unsigned int size) {
+    /**
+     * Sin NULL por presupuesto (0.2.0.8). libshacccg no comprueba lo que le
+     * devuelve el reservador: un NULL a mitad de compilacion lo tumbaba con un
+     * acceso a una direccion casi nula (volcados de 0.2.0.5 a 0.2.0.7, Pokemon
+     * Sol al pasar al 3D). Pasado el presupuesto solo se apunta; si la memoria
+     * se acaba de verdad, el NULL es inevitable.
+     */
     if (g_tracking && g_compile_bytes + size > g_compile_budget) {
         g_compile_over_budget = true;
-        return nullptr;
     }
     /**
      * Alineado y redondeado a 16 (0.2.0.7). malloc de newlib da 8, y el
@@ -531,6 +537,14 @@ constexpr char kBadListPath[] = "ux0:/data/azahar/shadercache/cg_roto2.bin";
  * negra. Ese shader se dibuja por el otro camino, pero el juego ya no se cae.
  */
 constexpr char kCompilingPath[] = "ux0:/data/azahar/shadercache/cg_compilando.bin";
+/// El codigo del que se compila, para estudiar el que lo tumbe (0.2.0.8).
+constexpr char kCompilingSourcePath[] = "ux0:/data/azahar/shadercache/cg_compilando.cg";
+/**
+ * Los que ya tumbaron el compilador una vez con optimizacion (0.2.0.8): se
+ * reintentan sin ella (menos memoria y otro camino dentro del compilador). Si
+ * tambien asi se caen, a la lista negra.
+ */
+constexpr char kNoOptListPath[] = "ux0:/data/azahar/shadercache/cg_sin_optimizar.bin";
 struct BadSource {
     u64 hash_city;
     u64 hash_fnv;
@@ -544,7 +558,42 @@ struct BadSourceHash {
     }
 };
 std::unordered_set<BadSource, BadSourceHash> g_bad_sources;
+std::unordered_set<BadSource, BadSourceHash> g_no_opt_sources;
 bool g_bad_loaded = false;
+
+/// Lo que se apunta en kCompilingPath antes de compilar.
+struct CompilingMarker {
+    BadSource source;
+    u32 profile;
+    u32 optimization;
+    u32 source_size;
+    u32 free_kb;
+};
+
+void AppendRecord(const char* path, const BadSource& record) {
+    const SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    if (fd < 0) {
+        return;
+    }
+    sceIoWrite(fd, &record, sizeof(record));
+    sceIoClose(fd);
+}
+
+void ReadRecords(const char* path, std::unordered_set<BadSource, BadSourceHash>& out) {
+    const SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return;
+    }
+    BadSource record{};
+    // Tope por si el fichero estuviera mal: 4096 entradas son 64 KB.
+    for (u32 i = 0; i < 4096; i++) {
+        if (sceIoRead(fd, &record, sizeof(record)) != static_cast<int>(sizeof(record))) {
+            break;
+        }
+        out.insert(record);
+    }
+    sceIoClose(fd);
+}
 
 void StoreBadSource(const BadSource& bad);
 
@@ -553,30 +602,38 @@ void LoadBadSources() {
         return;
     }
     g_bad_loaded = true;
-    const SceUID fd = sceIoOpen(kBadListPath, SCE_O_RDONLY, 0);
-    if (fd < 0) {
-        return;
-    }
-    BadSource bad{};
-    // Tope por si el fichero estuviera mal: 4096 entradas son 64 KB.
-    for (u32 i = 0; i < 4096; i++) {
-        if (sceIoRead(fd, &bad, sizeof(bad)) != static_cast<int>(sizeof(bad))) {
-            break;
-        }
-        g_bad_sources.insert(bad);
-    }
-    sceIoClose(fd);
+    ReadRecords(kBadListPath, g_bad_sources);
+    ReadRecords(kNoOptListPath, g_no_opt_sources);
     const SceUID crashed_fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
     if (crashed_fd >= 0) {
-        BadSource crashed{};
+        // El de 0.2.0.6 y 0.2.0.7 solo traia el hash: se toma como uno de
+        // vertices optimizado, que es lo que se caia.
+        CompilingMarker crashed{{}, SCE_SHACCCG_PROFILE_VP, 1, 0, 0};
+        const int read = sceIoRead(crashed_fd, &crashed, sizeof(crashed));
         const bool read_ok =
-            sceIoRead(crashed_fd, &crashed, sizeof(crashed)) == static_cast<int>(sizeof(crashed));
+            read == static_cast<int>(sizeof(crashed)) || read == static_cast<int>(sizeof(BadSource));
         sceIoClose(crashed_fd);
         sceIoRemove(kCompilingPath);
         if (read_ok) {
-            StoreBadSource(crashed);
-            Common::VitaNote("gxm shader", "el compilador murio con un shader en la sesion "
-                                           "anterior: ese shader va a la lista negra");
+            const bool retry = crashed.optimization != 0 &&
+                               g_no_opt_sources.insert(crashed.source).second;
+            if (retry) {
+                AppendRecord(kNoOptListPath, crashed.source);
+            } else {
+                StoreBadSource(crashed.source);
+            }
+            // El codigo, guardado con su hash para estudiarlo desde el PC.
+            sceIoRename(kCompilingSourcePath,
+                        fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir, crashed.source.hash_city)
+                            .c_str());
+            Common::VitaNote(
+                "gxm shader",
+                fmt::format("el compilador murio en la sesion anterior con un shader de {} "
+                            "({} bytes, O{}, heap libre {} KB): {}",
+                            crashed.profile == SCE_SHACCCG_PROFILE_VP ? "vertices" : "fragmentos",
+                            crashed.source_size, crashed.optimization, crashed.free_kb,
+                            retry ? "se reintenta sin optimizar" : "a la lista negra")
+                    .c_str());
         }
     }
     if (!g_bad_sources.empty()) {
@@ -887,6 +944,9 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     if (profile == SCE_SHACCCG_PROFILE_VP) {
         options.optimizationLevel = 1;
     }
+    if (g_no_opt_sources.count(BadSource{key.hash_city, key.hash_fnv}) != 0) {
+        options.optimizationLevel = 0;
+    }
 
     const std::size_t heap_before = HeapInUse();
     g_compile_budget = FreeHeap() - kEmulatorReserve;
@@ -899,8 +959,9 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     g_tracking = true;
     // Que se compila y de que tamano, a crash.txt (0.1.9.1): en 0.1.9.0 el
     // juego se quedaba congelado dentro de una compilacion sin saber cual.
+    // Hasta 200 (eran 24): con menos, el que tumba el compilador no salia.
     static u32 start_notes = 0;
-    if (start_notes < 24) {
+    if (start_notes < 200) {
         start_notes++;
         Common::VitaNote("gxm compila", fmt::format("{}: {} bytes de codigo, heap libre {} KB, O{}",
                                                     name, g_source.size, FreeHeap() / 1024,
@@ -909,7 +970,17 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     }
     const SceShaccCgCompileOutput* output = nullptr;
     {
-        const BadSource compiling{key.hash_city, key.hash_fnv};
+        const CompilingMarker compiling{BadSource{key.hash_city, key.hash_fnv},
+                                        static_cast<u32>(profile),
+                                        static_cast<u32>(options.optimizationLevel),
+                                        static_cast<u32>(source_size),
+                                        static_cast<u32>(FreeHeap() / 1024)};
+        const SceUID source_fd =
+            sceIoOpen(kCompilingSourcePath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        if (source_fd >= 0) {
+            sceIoWrite(source_fd, source, static_cast<SceSize>(source_size));
+            sceIoClose(source_fd);
+        }
         const SceUID marker =
             sceIoOpen(kCompilingPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         if (marker >= 0) {
@@ -923,7 +994,6 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         const Common::ScopedVitaStage stage{"compilando shader"};
         output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     }
-    sceIoRemove(kCompilingPath);
     g_tracking = false;
     g_compile_budget = static_cast<std::size_t>(-1);
     if (g_compile_over_budget) {
@@ -993,6 +1063,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         if (output != nullptr) {
             sceShaccCgDestroyCompileOutput(output);
         }
+        sceIoRemove(kCompilingPath);
         if (internal) {
             // Ese codigo no se vuelve a mandar (ni en otra sesion) y el
             // compilador se recarga limpio para el siguiente.
@@ -1025,9 +1096,11 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     // (como antes de 0.1.7.9) y el compilador se queda como estaba.
     const SceShaccCgCompileOutput* copy = CopyOutput(*output);
     if (copy == nullptr) {
+        sceIoRemove(kCompilingPath);
         return output;
     }
     sceShaccCgDestroyCompileOutput(output);
+    sceIoRemove(kCompilingPath);
     NoteCompileMemory(name, heap_before, live_before);
     /**
      * TOPE DE LO QUE RETIENE EL COMPILADOR (0.1.9.1). Desde 0.1.8.5 no se le
