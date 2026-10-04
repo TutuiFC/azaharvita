@@ -514,6 +514,16 @@ void DumpFailedSource(const char* name, const char* source, const SceShaccCgComp
  * compilador recien cargado; lo demas solo se salta en esta sesion.
  */
 constexpr char kBadListPath[] = "ux0:/data/azahar/shadercache/cg_roto2.bin";
+/**
+ * EL SHADER QUE SE ESTA COMPILANDO, EN LA TARJETA (0.2.0.6). libshacccg no solo
+ * devuelve "internal error": con algun shader se cae entero (acceso a memoria
+ * invalido dentro del modulo de Sony, volcados de 0.2.0.1 y 0.2.0.5 al pasar
+ * al 3D de Pokemon Sol), y eso se lleva el proceso sin que se pueda apuntar
+ * nada despues. Se escribe aqui antes de compilar y se borra al volver: si al
+ * arrancar sigue ahi, la sesion anterior murio compilandolo, y va a la lista
+ * negra. Ese shader se dibuja por el otro camino, pero el juego ya no se cae.
+ */
+constexpr char kCompilingPath[] = "ux0:/data/azahar/shadercache/cg_compilando.bin";
 struct BadSource {
     u64 hash_city;
     u64 hash_fnv;
@@ -528,6 +538,8 @@ struct BadSourceHash {
 };
 std::unordered_set<BadSource, BadSourceHash> g_bad_sources;
 bool g_bad_loaded = false;
+
+void StoreBadSource(const BadSource& bad);
 
 void LoadBadSources() {
     if (g_bad_loaded) {
@@ -547,6 +559,19 @@ void LoadBadSources() {
         g_bad_sources.insert(bad);
     }
     sceIoClose(fd);
+    const SceUID crashed_fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
+    if (crashed_fd >= 0) {
+        BadSource crashed{};
+        const bool read_ok =
+            sceIoRead(crashed_fd, &crashed, sizeof(crashed)) == static_cast<int>(sizeof(crashed));
+        sceIoClose(crashed_fd);
+        sceIoRemove(kCompilingPath);
+        if (read_ok) {
+            StoreBadSource(crashed);
+            Common::VitaNote("gxm shader", "el compilador murio con un shader en la sesion "
+                                           "anterior: ese shader va a la lista negra");
+        }
+    }
     if (!g_bad_sources.empty()) {
         Common::VitaNote("gxm shader", fmt::format("{} shaders que rompen el compilador se "
                                                    "saltan (lista de la tarjeta)",
@@ -876,12 +901,22 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
                                             .c_str());
     }
     const SceShaccCgCompileOutput* output = nullptr;
+    {
+        const BadSource compiling{key.hash_city, key.hash_fnv};
+        const SceUID marker =
+            sceIoOpen(kCompilingPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        if (marker >= 0) {
+            sceIoWrite(marker, &compiling, sizeof(compiling));
+            sceIoClose(marker);
+        }
+    }
     if (g_worker_running && pthread_equal(pthread_self(), g_worker_thread)) {
         output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     } else {
         const Common::ScopedVitaStage stage{"compilando shader"};
         output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     }
+    sceIoRemove(kCompilingPath);
     g_tracking = false;
     g_compile_budget = static_cast<std::size_t>(-1);
     if (g_compile_over_budget) {
