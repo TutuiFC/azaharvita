@@ -14,6 +14,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -211,6 +212,33 @@ public:
         Blx(12);
     }
 
+    /// Salto a una posicion ya emitida: la vuelta de un camino frio (0.2.1.0).
+    void BranchTo(u32 cond, u32 target_index) {
+        const s32 offset = static_cast<s32>(target_index) - static_cast<s32>(position + 2);
+        Emit((cond << 28) | 0x0A000000u | (static_cast<u32>(offset) & 0x00FFFFFFu));
+    }
+
+    /// LDRD/STRD rt, rt+1, [rn, #offset], offset de 0 a 255.
+    void LdrdImm(u32 rt, u32 rn, u32 offset) {
+        Emit(0xE1C000D0u | (rn << 16) | (rt << 12) | ((offset & 0xF0u) << 4) | (offset & 0xFu));
+    }
+    void StrdImm(u32 rt, u32 rn, u32 offset) {
+        Emit(0xE1C000F0u | (rn << 16) | (rt << 12) | ((offset & 0xF0u) << 4) | (offset & 0xFu));
+    }
+
+    /// El inmediato de una operacion de datos (8 bits rotados una cantidad
+    /// par) que vale 'value', si lo hay.
+    static bool EncodeImmediate(u32 value, u32* encoded) {
+        for (u32 rotation = 0; rotation < 16; rotation++) {
+            const u32 bits = std::rotl(value, static_cast<int>(rotation * 2));
+            if (bits <= 0xFFu) {
+                *encoded = (rotation << 8) | bits;
+                return true;
+            }
+        }
+        return false;
+    }
+
 private:
     u32* base;
     u32 capacity;
@@ -229,6 +257,8 @@ struct Offsets {
     u32 cpsr = 0;  ///< Cpsr, para la comprobacion de IRQ del enlazado (4.8).
     u32 nirq = 0;  ///< NirqSig, idem.
     u32 vfp = 0;   ///< VFP[0] (FPSCR y demas), 0.1.6.1.
+    u32 link = 0;  ///< jit_link_budget (y jit_link_hops detras), 0.2.1.0.
+    u32 cp15 = 0;  ///< CP15[0]: el TLS se lee en linea (0.2.1.0).
 };
 Offsets g_offsets;
 
@@ -266,16 +296,14 @@ u32 ExtOffset(u32 vfp_reg) {
  * esta ejecutando; lo pone TryRun y cada enlace le resta el bloque destino.
  * hops: enlaces hechos (estadistica). Lo que TryRun ve al volver:
  *   instrucciones ejecutadas de mas = budget inicial - budget final.
+ *
+ * Desde 0.2.1.0 los dos viven en ARMul_State (jit_link_budget y
+ * jit_link_hops), a un desplazamiento pequeno de kCpu: el enlace los lee con
+ * un LDRD desde el estado en vez de cargar antes la direccion de una global.
  */
-struct LinkContext {
-    u32 budget = 0;
-    u32 hops = 0;
-    /// Presupuesto retirado por StopLinksIfRescheduled: no son instrucciones
-    /// ejecutadas, y RunCompiled lo descuenta. Solo lo toca C++.
-    u32 withdrawn = 0;
-};
-/// alignas(8): el enlace lee y escribe budget y hops con LDRD/STRD (0.1.8.1).
-alignas(8) LinkContext g_link_ctx;
+/// Presupuesto retirado por StopLinksIfRescheduled: no son instrucciones
+/// ejecutadas, y RunCompiled lo descuenta. Solo lo toca C++.
+u32 g_link_withdrawn = 0;
 /// Diagnostico (0.1.6.3): llamadas a las funciones lentas de memoria y a la
 /// aritmetica VFP. Variables normales (un solo hilo emula); se publican con
 /// el resto en FlushLocalStats.
@@ -298,6 +326,7 @@ u64 g_vfp_calls = 0;
  */
 constexpr u32 kTimeSampleEvery = 16;
 u64 g_jit_us = 0;
+u64 g_jit_entries = 0;
 u64 g_slow_us = 0;
 u64 g_vfp_us = 0;
 u64 g_check_us = 0;
@@ -331,11 +360,6 @@ struct SampledMicros {
     u64 begin;
 };
 
-constexpr u32 kCtxBudget = 0;
-constexpr u32 kCtxHops = 4;
-static_assert(offsetof(LinkContext, budget) == kCtxBudget &&
-                  offsetof(LinkContext, hops) == kCtxHops,
-              "el enlace lee budget y hops juntos con LDRD");
 /**
  * NumInstrsToExecute al empezar TryRun (0.1.5.7). El interprete mira el
  * presupuesto en CADA instruccion, asi que si algo lo cambia a mitad de
@@ -347,10 +371,10 @@ static_assert(offsetof(LinkContext, budget) == kCtxBudget &&
  */
 u64 g_run_target = 0;
 
-void StopLinksIfRescheduled(const ARMul_State* cpu) {
+void StopLinksIfRescheduled(ARMul_State* cpu) {
     if (cpu->NumInstrsToExecute != g_run_target) {
-        g_link_ctx.withdrawn += g_link_ctx.budget;
-        g_link_ctx.budget = 0;
+        g_link_withdrawn += cpu->jit_link_budget;
+        cpu->jit_link_budget = 0;
     }
 }
 
@@ -398,6 +422,53 @@ void SlowWrite(ARMul_State* cpu, u32 address, u32 value, u32 kind) {
         break;
     }
     StopLinksIfRescheduled(cpu);
+}
+
+/**
+ * LDREX y STREX (y sus variantes de byte y media palabra), 0.2.1.0: lo mismo
+ * que LDREX_INST/STREX_INST del interprete, con el mismo monitor exclusivo del
+ * estado. Estaban en todas las rutinas de bloqueo del sistema del 3DS y
+ * mandaban sus bloques enteros al interprete ("rech ldrex" en crash.txt).
+ */
+u32 JitLoadExclusive(ARMul_State* cpu, u32 address, u32 kind) {
+    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
+    cpu->SetExclusiveMemoryAddress(address);
+    u32 value;
+    switch (kind) {
+    case kByte:
+        value = cpu->ReadMemory8(address);
+        break;
+    case kHalf:
+        value = cpu->ReadMemory16(address);
+        break;
+    default:
+        value = cpu->ReadMemory32(address);
+        break;
+    }
+    StopLinksIfRescheduled(cpu);
+    return value;
+}
+
+/// 0 si guarda, 1 si el monitor ya no es de esa direccion (como STREX).
+u32 JitStoreExclusive(ARMul_State* cpu, u32 address, u32 value, u32 kind) {
+    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
+    if (!cpu->IsExclusiveMemoryAccess(address)) {
+        return 1;
+    }
+    cpu->UnsetExclusiveMemoryAddress();
+    switch (kind) {
+    case kByte:
+        cpu->WriteMemory8(address, static_cast<u8>(value));
+        break;
+    case kHalf:
+        cpu->WriteMemory16(address, static_cast<u16>(value));
+        break;
+    default:
+        cpu->WriteMemory32(address, value);
+        break;
+    }
+    StopLinksIfRescheduled(cpu);
+    return 0;
 }
 
 /**
@@ -777,6 +848,8 @@ struct Block {
 SceUID g_code_block = -1;
 u32* g_code = nullptr;
 u32 g_code_used_words = 0;
+/// Bloques generados (las dos variantes) desde el ultimo vaciado.
+u32 g_code_blocks = 0;
 bool g_ready = false;
 bool g_init_tried = false;
 
@@ -885,6 +958,19 @@ bool Init(ARMul_State* cpu) {
     g_offsets.cpsr = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->Cpsr) - base);
     g_offsets.nirq = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->NirqSig) - base);
     g_offsets.vfp = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->VFP[0]) - base);
+    g_offsets.link = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->jit_link_budget) - base);
+    g_offsets.cp15 = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->CP15[0]) - base);
+    // El enlace lee budget y hops con un LDRD: alineados a 8, seguidos y a
+    // menos de 256 bytes del principio del estado.
+    if (g_offsets.link > 248 ||
+        (reinterpret_cast<uintptr_t>(&cpu->jit_link_budget) & 7u) != 0 ||
+        reinterpret_cast<const u8*>(&cpu->jit_link_hops) !=
+            reinterpret_cast<const u8*>(&cpu->jit_link_budget) + 4) {
+        Common::VitaNote("jit arm", fmt::format("contexto de enlace en {}: JIT apagado",
+                                                g_offsets.link)
+                                        .c_str());
+        return false;
+    }
     {
         // Donde cae Block::link dentro de Block (ver g_link_in_block).
         const Block probe;
@@ -895,7 +981,8 @@ bool Init(ARMul_State* cpu) {
     const u32 highest = std::max({g_offsets.reg + 60, g_offsets.ext + 252, g_offsets.n,
                                   g_offsets.z, g_offsets.c, g_offsets.v, g_offsets.t,
                                   g_offsets.cpsr, g_offsets.nirq,
-                                  g_offsets.vfp + VFP_SYSTEM_REGISTER_COUNT * 4 - 4});
+                                  g_offsets.vfp + VFP_SYSTEM_REGISTER_COUNT * 4 - 4,
+                                  g_offsets.cp15 + CP15_REGISTER_COUNT * 4 - 4});
     if (highest > 4092) {
         Common::VitaNote("jit arm", fmt::format("desplazamientos de ARMul_State fuera de rango "
                                                 "({}): JIT apagado",
@@ -949,6 +1036,7 @@ enum class Kind {
     VfpTransfer,  ///< VPUSH, VPOP, VSTM, VLDM (0.1.6.1)
     Clrex,        ///< CLREX (0.1.9.8)
     BranchLinkExchangeImm, ///< BLX inmediato: llamada a Thumb (0.1.9.8)
+    Exclusive,             ///< LDREX/STREX de palabra, byte y media palabra (0.2.1.0)
 };
 
 struct Decoded {
@@ -1076,7 +1164,24 @@ Decoded Classify(u32 inst) {
                     }
                     return Supported(Kind::MultiplyLong);
                 }
-                // SWP, LDREX, STREX...
+                /**
+                 * LDREX/STREX, B y H (0.2.1.0). Los de 64 bits (D) y SWP se
+                 * quedan en el interprete. Fuera tambien el PC en cualquier
+                 * campo y, en STREX, el registro de estado igual a la direccion
+                 * o al dato (la arquitectura no dice que pasa).
+                 */
+                const u32 op = Bits(inst, 20, 27);
+                if (op == 0x18 || op == 0x19 || op == 0x1C || op == 0x1D || op == 0x1E ||
+                    op == 0x1F) {
+                    const u32 rn = Bits(inst, 16, 19);
+                    const u32 rd = Bits(inst, 12, 15);
+                    const u32 rt = Bits(inst, 0, 3);
+                    const bool load = (op & 1) != 0;
+                    if (rn == 15 || rd == 15 || (!load && (rt == 15 || rd == rn || rd == rt))) {
+                        return Reject(kRejectExclusive);
+                    }
+                    return Supported(Kind::Exclusive);
+                }
                 return Reject(kRejectExclusive);
             }
             const bool load = Bits(inst, 20, 20) == 1;
@@ -1382,8 +1487,14 @@ public:
     }
 
     void Epilogue() {
+        for (const u32 branch : to_epilogue) {
+            e.PatchBranch(branch, e.Position());
+        }
         // Vuelca la cache ANTES de usar r0-r1 para los flags.
         FlushCachedRegs();
+        // Aqui entran los enlaces que fallan (0.2.1.0): ya volcaron la cache, y
+        // r0-r3 tienen lo que dejo el enlace, asi que no se puede volcar otra vez.
+        exit_noflush = e.Position();
         // APSR -> flags del juego.
         e.Mrs(R0);
         e.LsrImm(R1, R0, 31);
@@ -1395,6 +1506,19 @@ public:
         e.Ubfx(R1, R0, 28, 1);
         e.StrImm(R1, kCpu, g_offsets.v);
         e.Pop(0x9FF0u); // r4-r12 y pc
+    }
+
+    /// Los caminos frios, detras del epilogo (ver ColdStub).
+    void EmitColdStubs() {
+        for (std::size_t i = 0; i < cold_stubs.size(); i++) {
+            ColdStub stub = std::move(cold_stubs[i]);
+            for (const u32 branch : stub.branches) {
+                e.PatchBranch(branch, e.Position());
+            }
+            cache_written = stub.written;
+            stub.body();
+        }
+        cold_stubs.clear();
     }
 
     /// Una instruccion. 'pc' es su direccion en el juego.
@@ -1453,6 +1577,9 @@ public:
             break;
         case Kind::Nop:
             break;
+        case Kind::Exclusive:
+            Exclusive(inst, pc);
+            break;
         case Kind::Clz:
             LoadGuest(kRm, Bits(inst, 0, 3), pc);
             e.Emit(0xE16F0F10u | (kRd << 12) | kRm); // CLZ kRd, kRm
@@ -1490,13 +1617,8 @@ public:
 
     /// Final de un bloque que no acaba en salto (fin de pagina).
     void FallThrough(u32 next_pc) {
-        // kT0 en vez de R0: R0-R3 y lr son los huecos de la cache de registros
-        // y un Mov32 ahi pisaria un valor cacheado que el Epilogue (que si
-        // vuelca) escribiria como basura a cpu->Reg. kT0 (R10) nunca se cachea.
-        e.Mov32(kT0, next_pc);
-        e.StrImm(kT0, kCpu, RegOffset(15));
         // El bloque siguiente de la pagina de al lado: destino fijo (0.1.5.7).
-        EmitLinkDirect(next_pc);
+        ExitDirect(next_pc);
     }
 
 private:
@@ -1526,6 +1648,35 @@ private:
      * comparacion. true por defecto: sin informacion, se guardan.
      */
     bool flags_live_after = true;
+    /**
+     * CAMINOS FRIOS FUERA DE LINEA (0.2.1.0). Lo que casi nunca corre -- el
+     * acceso lento a memoria, la llamada de LDM/STM o VPUSH/VPOP cuando no hay
+     * pagina directa, el enlace que falla, la aritmetica VFP con vectores --
+     * iba en medio del bloque, con un salto por encima en cada acceso. Con
+     * ~25.000 bloques por fotograma repartidos por megas de codigo, la cache
+     * de instrucciones de 32 KB del Cortex-A9 se llenaba de lineas que no se
+     * ejecutan. Ahora va todo detras del epilogo: el camino caliente queda
+     * seguido, mas corto y sin el salto. Cada trozo guarda los registros
+     * cacheados escritos HASTA su punto (cache_written), que es lo que vuelca.
+     * Un trozo no puede crear otros.
+     */
+    struct ColdStub {
+        std::vector<u32> branches;
+        std::array<bool, 16> written;
+        std::function<void()> body;
+    };
+    std::vector<ColdStub> cold_stubs;
+    /// Saltos al epilogo (con vuelco) y donde empieza la salida sin vuelco.
+    std::vector<u32> to_epilogue;
+    u32 exit_noflush = 0;
+
+    void DeferCold(std::vector<u32> branches, std::function<void()> body) {
+        DeferCold(std::move(branches), cache_written, std::move(body));
+    }
+    void DeferCold(std::vector<u32> branches, const std::array<bool, 16>& written,
+                   std::function<void()> body) {
+        cold_stubs.push_back(ColdStub{std::move(branches), written, std::move(body)});
+    }
 
 public:
     void SetFlagsLiveAfter(bool live) {
@@ -1713,19 +1864,22 @@ private:
     }
 
     /**
-     * Un acceso a memoria con la direccion en 'address'. Carga: el valor queda
-     * en kRd. Guardado: el valor tiene que estar en kRd.
+     * Un acceso a memoria con la direccion en 'address'. 'data' es el registro
+     * del anfitrion con el valor a guardar o el que recibe el cargado; desde
+     * 0.2.1.0 puede ser el hueco de la cache del registro del juego (sin pasar
+     * por kRd y un MOV).
      *
      * Camino normal: el mismo que MemorySystem::Read32Fast/Write32Fast --
      * puntero = paginas[direccion >> 12]; si no es nulo, acceso directo con el
      * desplazamiento de la pagina; si es nulo, la funcion de siempre del
      * interprete (ReadMemory32 & co.), que sabe de hardware y de memoria
-     * especial. Los flags del juego estan en APSR y la comparacion con cero los
-     * pisaria: se guardan en r12 y se reponen al final.
+     * especial, en un camino frio (ColdStub). Los flags del juego estan en
+     * APSR y la comparacion con cero los pisaria: se guardan en r12 y se
+     * reponen al final.
      *
      * Variante de comprobacion: siempre por CheckRead/CheckWrite (diario).
      */
-    void MemoryAccess(u32 address, bool store, u32 kind, u32 pc) {
+    void MemoryAccess(u32 address, bool store, u32 kind, u32 pc, u32 data = kRd) {
         /**
          * 0.1.5.7: los flags solo se guardan y reponen si alguien los va a leer
          * despues (flags_live_after, ver ComputeFlagsLiveAfter). En el caso
@@ -1739,11 +1893,12 @@ private:
             e.Mrs(kFlags);
         }
         if (check_mode) {
+            SaveAccessOperands(address, store, data);
             FlushCachedRegs();
             if (keep_flags) {
                 e.MovReg(kT0, kFlags);
             }
-            e.MovReg(R0, address);
+            e.MovReg(R0, kT1);
             if (store) {
                 e.MovReg(R1, kRd);
                 e.Mov32(R2, kind);
@@ -1757,67 +1912,135 @@ private:
                 e.MsrFlags(kT0);
             }
             ReloadCachedRegs();
+            if (!store && data != kRd) {
+                e.MovReg(data, kRd);
+            }
             return;
         }
         e.LsrImm(kT0, address, 12);
         e.LdrRegLsl2(kT1, kPages, kT0);
         e.CmpImm0(kT1);
-        const u32 to_slow = e.BranchPlaceholder(0 /* EQ */);
+        const u32 to_slow = e.BranchPlaceholder(kCondEq);
         e.Ubfx(kT0, address, 0, 12);
         // [kT1, kT0]
         switch (kind) {
         case kWord:
-            e.Emit((store ? 0xE7800000u : 0xE7900000u) | (kT1 << 16) | (kRd << 12) | kT0);
+            e.Emit((store ? 0xE7800000u : 0xE7900000u) | (kT1 << 16) | (data << 12) | kT0);
             break;
         case kByte:
-            e.Emit((store ? 0xE7C00000u : 0xE7D00000u) | (kT1 << 16) | (kRd << 12) | kT0);
+            e.Emit((store ? 0xE7C00000u : 0xE7D00000u) | (kT1 << 16) | (data << 12) | kT0);
             break;
         case kHalf:
-            e.Emit((store ? 0xE18000B0u : 0xE19000B0u) | (kT1 << 16) | (kRd << 12) | kT0);
+            e.Emit((store ? 0xE18000B0u : 0xE19000B0u) | (kT1 << 16) | (data << 12) | kT0);
             break;
         case kSignedHalf:
-            e.Emit(0xE19000F0u | (kT1 << 16) | (kRd << 12) | kT0);
+            e.Emit(0xE19000F0u | (kT1 << 16) | (data << 12) | kT0);
             break;
         case kSignedByte:
-            e.Emit(0xE19000D0u | (kT1 << 16) | (kRd << 12) | kT0);
+            e.Emit(0xE19000D0u | (kT1 << 16) | (data << 12) | kT0);
             break;
         }
-        const u32 to_done = e.BranchPlaceholder(kAlways);
-        e.PatchBranch(to_slow, e.Position());
-        // Camino lento. r12 no sobrevive a la llamada: los flags van a r10.
-        // r0-r3 se destruyen, asi que la cache se vuelca antes y se recarga
-        // despues (SlowRead/SlowWrite leen y escriben cpu->Reg).
-        FlushCachedRegs();
-        if (keep_flags) {
-            e.MovReg(kT0, kFlags);
-        }
-        e.Mov32(R0, pc);
-        e.StrImm(R0, kCpu, RegOffset(15));
-        e.MovReg(R0, kCpu);
-        e.MovReg(R1, address);
-        if (store) {
-            e.MovReg(R2, kRd);
-            e.Mov32(R3, kind);
-            e.Call(reinterpret_cast<const void*>(&SlowWrite));
-        } else {
-            e.Mov32(R2, kind);
-            e.Call(reinterpret_cast<const void*>(&SlowRead));
-            e.MovReg(kRd, R0);
-        }
-        if (keep_flags) {
-            e.MovReg(kFlags, kT0);
-        }
-        ReloadCachedRegs();
-        e.PatchBranch(to_done, e.Position());
+        const u32 back = e.Position();
         if (keep_flags) {
             e.MsrFlags(kFlags);
         }
+        DeferCold({to_slow}, [this, address, store, kind, pc, data, keep_flags, back] {
+            // r12 no sobrevive a la llamada: los flags van a r10. r0-r3 y lr se
+            // destruyen, asi que la cache se vuelca antes y se recarga despues
+            // (SlowRead/SlowWrite leen y escriben cpu->Reg).
+            SaveAccessOperands(address, store, data);
+            FlushCachedRegs();
+            if (keep_flags) {
+                e.MovReg(kT0, kFlags);
+            }
+            e.Mov32(R0, pc);
+            e.StrImm(R0, kCpu, RegOffset(15));
+            e.MovReg(R0, kCpu);
+            e.MovReg(R1, kT1);
+            if (store) {
+                e.MovReg(R2, kRd);
+                e.Mov32(R3, kind);
+                e.Call(reinterpret_cast<const void*>(&SlowWrite));
+            } else {
+                e.Mov32(R2, kind);
+                e.Call(reinterpret_cast<const void*>(&SlowRead));
+                e.MovReg(kRd, R0);
+            }
+            if (keep_flags) {
+                e.MovReg(kFlags, kT0);
+            }
+            ReloadCachedRegs();
+            if (!store && data != kRd) {
+                e.MovReg(data, kRd);
+            }
+            e.BranchTo(kAlways, back);
+        });
+    }
+
+    /// La direccion a kT1 y el valor a guardar a kRd, ANTES del vuelco y de
+    /// los argumentos: los dos pueden estar en huecos de la cache (r0-r3, lr).
+    void SaveAccessOperands(u32 address, bool store, u32 data) {
+        if (address != kT1) {
+            e.MovReg(kT1, address);
+        }
+        if (store && data != kRd) {
+            e.MovReg(kRd, data);
+        }
+    }
+
+    /// Carga en el registro del juego 'rd' (no el PC): directa a su hueco si
+    /// esta cacheado (0.2.1.0).
+    void LoadInto(u32 address, u32 kind, u32 pc, u32 rd) {
+        const s8 cached = CacheHost(rd);
+        if (cached >= 0) {
+            MemoryAccess(address, false, kind, pc, static_cast<u32>(cached));
+            cache_written[rd] = true;
+            return;
+        }
+        MemoryAccess(address, false, kind, pc);
+        e.StrImm(kRd, kCpu, RegOffset(rd));
+    }
+
+    /// rd = rn + value (o - value) sin tocar flags: el inmediato va en el
+    /// propio ADD/SUB si cabe; si no, la constante por kRm (rn no puede ser kRm).
+    void AddImmediate(u32 rd, u32 rn, u32 value, bool up) {
+        u32 encoded = 0;
+        if (Emitter::EncodeImmediate(value, &encoded)) {
+            e.Emit((up ? 0xE2800000u : 0xE2400000u) | (rn << 16) | (rd << 12) | encoded);
+            return;
+        }
+        e.Mov32(kRm, value);
+        if (up) {
+            e.AddReg(rd, rn, kRm);
+        } else {
+            e.SubReg(rd, rn, kRm);
+        }
+    }
+
+    /// rd = rn + value para los desplazamientos de LDM/STM y VPUSH/VPOP
+    /// (multiplos de 4 de hasta 1020: siempre caben en el inmediato, asi que
+    /// no se toca ningun temporal; kFlags puede llevar los flags).
+    void AddSmall(u32 rd, u32 rn, s32 value) {
+        if (value == 0) {
+            if (rd != rn) {
+                e.MovReg(rd, rn);
+            }
+            return;
+        }
+        AddImmediate(rd, rn, static_cast<u32>(value < 0 ? -value : value), value > 0);
     }
 
     /**
      * LDR/STR/LDRB/STRB. Mismo orden que el interprete: la direccion y la
      * escritura del base van ANTES del acceso (get_addr), y en un guardado del
      * PC se guarda PC+8.
+     *
+     * 0.2.1.0: el desplazamiento inmediato va en el propio ADD/SUB si cabe
+     * (antes MOVW + ADD), el de registro con su desplazamiento en el mismo ADD
+     * (antes MOV + ADD), el base cacheado se usa sin copiarlo y el dato va de y
+     * a su hueco de la cache. Con escritura del base, el base se copia a kRn:
+     * su hueco recibe el valor nuevo antes del acceso y el post-indice necesita
+     * el original.
      */
     void LoadStore(u32 inst, u32 pc) {
         const bool reg_offset = Bits(inst, 25, 25) == 1;
@@ -1828,25 +2051,37 @@ private:
         const bool load = Bits(inst, 20, 20) == 1;
         const u32 rn = Bits(inst, 16, 19);
         const u32 rd = Bits(inst, 12, 15);
+        const bool writeback = !pre || wb;
 
-        LoadGuest(kRn, rn, pc);
-        if (reg_offset) {
-            LoadGuest(kRm, Bits(inst, 0, 3), pc);
-            // MOV kRm, kRm, <desplazamiento>: mismos campos (7-11 cantidad,
-            // 5-6 tipo). Con RRX lee el acarreo del juego, que esta en APSR.
-            e.Emit(0xE1A00000u | (kRm << 12) | (inst & 0xFE0u) | kRm);
+        u32 address = kRs;
+        if (rn == 15 && !reg_offset && !writeback) {
+            // Un literal: la direccion es una constante.
+            const u32 offset = inst & 0xFFFu;
+            e.Mov32(kRs, up ? pc + 8 + offset : pc + 8 - offset);
         } else {
-            e.Mov32(kRm, inst & 0xFFFu);
+            u32 base = kRn;
+            if (writeback) {
+                LoadGuest(kRn, rn, pc);
+            } else {
+                base = OperandHost(kRn, rn, pc);
+            }
+            u32 computed = base;
+            if (reg_offset) {
+                // ADD/SUB kRs, base, rm, <desplazamiento>: los bits 5-11 son los
+                // mismos que en LDR. Con RRX lee el acarreo del juego (APSR).
+                const u32 rm_host = OperandHost(kRm, Bits(inst, 0, 3), pc);
+                e.Emit((up ? 0xE0800000u : 0xE0400000u) | (base << 16) | (kRs << 12) |
+                       (inst & 0xFE0u) | rm_host);
+                computed = kRs;
+            } else if ((inst & 0xFFFu) != 0) {
+                AddImmediate(kRs, base, inst & 0xFFFu, up);
+                computed = kRs;
+            }
+            if (writeback) {
+                StoreGuest(computed, rn);
+            }
+            address = pre ? computed : base;
         }
-        if (up) {
-            e.AddReg(kRs, kRn, kRm);
-        } else {
-            e.SubReg(kRs, kRn, kRm);
-        }
-        if (!pre || wb) {
-            StoreGuest(kRs, rn);
-        }
-        const u32 address = pre ? kRs : kRn;
         const u32 kind = byte ? kByte : kWord;
         if (load && rd == 15) {
             // LDR al PC (fin de bloque): como LDR_INST con Rd = 15, pasa a Thumb
@@ -1858,15 +2093,16 @@ private:
             e.Emit(0xE3C00001u | (kRd << 16) | (kRd << 12)); // BIC kRd, kRd, #1
             StoreGuest(kRd, 15);
         } else if (load) {
-            MemoryAccess(address, false, kind, pc);
-            StoreGuest(kRd, rd);
+            LoadInto(address, kind, pc, rd);
         } else {
-            LoadGuest(kRd, rd, pc); // el PC se guarda como PC+8
-            MemoryAccess(address, true, kind, pc);
+            // Despues de escribir el base; el PC se guarda como PC+8.
+            const u32 value = OperandHost(kRd, rd, pc);
+            MemoryAccess(address, true, kind, pc, value);
         }
     }
 
-    /// LDRH/STRH/LDRSB/LDRSH.
+    /// LDRH/STRH/LDRSB/LDRSH, como LoadStore (0.2.1.0): el inmediato de 8 bits
+    /// siempre cabe en el ADD/SUB.
     void LoadStoreExtra(u32 inst, u32 pc) {
         const bool pre = Bits(inst, 24, 24) == 1;
         const bool up = Bits(inst, 23, 23) == 1;
@@ -1876,29 +2112,39 @@ private:
         const u32 rn = Bits(inst, 16, 19);
         const u32 rd = Bits(inst, 12, 15);
         const u32 sh = Bits(inst, 5, 6);
+        const bool writeback = !pre || wb;
+        const u32 imm = (Bits(inst, 8, 11) << 4) | Bits(inst, 0, 3);
 
-        LoadGuest(kRn, rn, pc);
-        if (imm_offset) {
-            e.Mov32(kRm, (Bits(inst, 8, 11) << 4) | Bits(inst, 0, 3));
+        u32 address = kRs;
+        if (rn == 15 && imm_offset && !writeback) {
+            e.Mov32(kRs, up ? pc + 8 + imm : pc + 8 - imm);
         } else {
-            LoadGuest(kRm, Bits(inst, 0, 3), pc);
+            u32 base = kRn;
+            if (writeback) {
+                LoadGuest(kRn, rn, pc);
+            } else {
+                base = OperandHost(kRn, rn, pc);
+            }
+            u32 computed = base;
+            if (!imm_offset) {
+                const u32 rm_host = OperandHost(kRm, Bits(inst, 0, 3), pc);
+                e.Emit((up ? 0xE0800000u : 0xE0400000u) | (base << 16) | (kRs << 12) | rm_host);
+                computed = kRs;
+            } else if (imm != 0) {
+                AddImmediate(kRs, base, imm, up);
+                computed = kRs;
+            }
+            if (writeback) {
+                StoreGuest(computed, rn);
+            }
+            address = pre ? computed : base;
         }
-        if (up) {
-            e.AddReg(kRs, kRn, kRm);
-        } else {
-            e.SubReg(kRs, kRn, kRm);
-        }
-        if (!pre || wb) {
-            StoreGuest(kRs, rn);
-        }
-        const u32 address = pre ? kRs : kRn;
         const u32 kind = sh == 1 ? kHalf : sh == 2 ? kSignedByte : kSignedHalf;
         if (load) {
-            MemoryAccess(address, false, kind, pc);
-            StoreGuest(kRd, rd);
+            LoadInto(address, kind, pc, rd);
         } else {
-            LoadGuest(kRd, rd, pc);
-            MemoryAccess(address, true, kHalf, pc);
+            const u32 value = OperandHost(kRd, rd, pc);
+            MemoryAccess(address, true, kHalf, pc, value);
         }
     }
 
@@ -1969,6 +2215,48 @@ private:
     }
 
     /**
+     * LDREX/STREX por JitLoadExclusive/JitStoreExclusive (0.2.1.0). Leen y
+     * escriben el monitor exclusivo y la memoria como el interprete. La
+     * variante de comprobacion no puede tocar ninguno de los dos: se abandona,
+     * como con las escrituras de CP15.
+     */
+    void Exclusive(u32 inst, u32 pc) {
+        const u32 op = Bits(inst, 20, 27);
+        const bool load = (op & 1) != 0;
+        const u32 kind = (op & 0x6) == 0x4 ? kByte : (op & 0x6) == 0x6 ? kHalf : kWord;
+        // A temporales que la llamada conserva ANTES de usar r0-r3: pueden
+        // venir de huecos de la cache.
+        LoadGuest(kRn, Bits(inst, 16, 19), pc);
+        if (!load) {
+            LoadGuest(kRm, Bits(inst, 0, 3), pc);
+        }
+        FlushCachedRegs();
+        e.Mrs(kFlags);
+        e.MovReg(kT0, kFlags);
+        if (check_mode) {
+            e.Call(reinterpret_cast<const void*>(&CheckAbortThunk));
+        } else {
+            e.Mov32(R0, pc);
+            e.StrImm(R0, kCpu, RegOffset(15));
+            e.MovReg(R0, kCpu);
+            e.MovReg(R1, kRn);
+            if (load) {
+                e.Mov32(R2, kind);
+                e.Call(reinterpret_cast<const void*>(&JitLoadExclusive));
+            } else {
+                e.MovReg(R2, kRm);
+                e.Mov32(R3, kind);
+                e.Call(reinterpret_cast<const void*>(&JitStoreExclusive));
+            }
+        }
+        // kRd y no un hueco: ReloadCachedRegs lo pisaria.
+        e.MovReg(kRd, R0);
+        e.MsrFlags(kT0);
+        ReloadCachedRegs();
+        StoreGuest(kRd, Bits(inst, 12, 15));
+    }
+
+    /**
      * MRC/MCR del coprocesador 15 (0.1.4.9): las mismas funciones que el
      * interprete (ReadCP15Register / WriteCP15Register). La lectura del TLS
      * ("mrc p15, 0, rX, c13, c0, 3") esta por todas partes en el codigo del 3DS.
@@ -1976,6 +2264,27 @@ private:
      * anotar en el diario: en la variante de comprobacion, se abandona.
      */
     void Cp15(u32 inst, u32 pc, bool read) {
+        /**
+         * EL TLS EN LINEA (0.2.1.0). "mrc p15, 0, rX, c13, c0, 3" esta en casi
+         * cada funcion del 3DS, y era un vuelco de la cache, una llamada a C y
+         * una recarga. Los registros de hilo (c13, c0, 2 y 3) los devuelve
+         * ReadCP15Register tal cual de CP15[], sin mirar el modo: un LDR.
+         */
+        const u32 opc2 = Bits(inst, 5, 7);
+        if (read && Bits(inst, 16, 19) == 13 && Bits(inst, 21, 23) == 0 && Bits(inst, 0, 3) == 0 &&
+            (opc2 == 2 || opc2 == 3)) {
+            const u32 index = opc2 == 2 ? CP15_THREAD_UPRW : CP15_THREAD_URO;
+            const u32 rt = Bits(inst, 12, 15);
+            const s8 cached = CacheHost(rt);
+            if (cached >= 0) {
+                e.LdrImm(static_cast<u32>(cached), kCpu, g_offsets.cp15 + index * 4);
+                cache_written[rt] = true;
+            } else {
+                e.LdrImm(kRd, kCpu, g_offsets.cp15 + index * 4);
+                e.StrImm(kRd, kCpu, RegOffset(rt));
+            }
+            return;
+        }
         FlushCachedRegs();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
@@ -2042,12 +2351,12 @@ private:
         // Indice igual que en VSTR_INST/VLDR_INST del interprete.
         const u32 d = single ? ((vd_field << 1) | bit22) : (vd_field | (bit22 << 4));
 
-        LoadGuest(kRn, rn, pc);
-        e.Mov32(kRm, imm32);
-        if (add) {
-            e.AddReg(kRs, kRn, kRm);
+        // 0.2.1.0: el inmediato (8 bits por 4) siempre cabe en el ADD/SUB, y con
+        // el PC de base (las constantes en coma flotante) es una constante.
+        if (rn == 15) {
+            e.Mov32(kRs, add ? pc + 8 + imm32 : pc + 8 - imm32);
         } else {
-            e.SubReg(kRs, kRn, kRm);
+            AddImmediate(kRs, OperandHost(kRn, rn, pc), imm32, add);
         }
         // kRs = direccion base+/-imm. Para double, la segunda palabra es +4.
         if (single) {
@@ -2063,18 +2372,17 @@ private:
         // Double: dos accesos LE, word1 en addr+0 y word2 en addr+4.
         // ARREGLO 0.1.5.5: el double dN vive en ExtReg[N*2] y ExtReg[N*2+1]
         // (VLDR_INST/VSTR_INST del interprete), no en ExtReg[N] y [N+1].
+        const u32 next_word = 0xE2800004u | (kRs << 16) | (kRs << 12); // ADD kRs, kRs, #4
         if (load) {
             MemoryAccess(kRs, false, kWord, pc);
             e.StrImm(kRd, kCpu, ExtOffset(d * 2));
-            e.Mov32(kRm, 4);
-            e.AddReg(kRs, kRs, kRm);
+            e.Emit(next_word);
             MemoryAccess(kRs, false, kWord, pc);
             e.StrImm(kRd, kCpu, ExtOffset(d * 2 + 1));
         } else {
             e.LdrImm(kRd, kCpu, ExtOffset(d * 2));
             MemoryAccess(kRs, true, kWord, pc);
-            e.Mov32(kRm, 4);
-            e.AddReg(kRs, kRs, kRm);
+            e.Emit(next_word);
             e.LdrImm(kRd, kCpu, ExtOffset(d * 2 + 1));
             MemoryAccess(kRs, true, kWord, pc);
         }
@@ -2138,7 +2446,11 @@ private:
         }
         const u32 fpscr_offset = g_offsets.vfp + VFP_FPSCR * 4;
 
-        e.Mrs(kT0); // los flags del juego: TST los pisa
+        // Los flags del juego: el TST los pisa (si alguien los lee despues).
+        const bool keep_flags = flags_live_after;
+        if (keep_flags) {
+            e.Mrs(kT0);
+        }
         e.LdrImm(kRd, kCpu, fpscr_offset);
         // TST kRd, #0x370000 (LEN y STRIDE): con vectores, a la funcion.
         e.Emit(0xE3100000u | (kRd << 16) | (8u << 8) | 0x37u);
@@ -2185,17 +2497,20 @@ private:
         e.Emit(0xEEF10A10u | (kRd << 12)); // VMRS kRd, FPSCR (el del juego, con flags)
         e.StrImm(kRd, kCpu, fpscr_offset);
         e.Emit(0xEEE10A10u | (kRn << 12)); // VMSR FPSCR, kRn (vuelve el del emulador)
-        const u32 to_done = e.BranchPlaceholder(kAlways);
-
-        e.PatchBranch(to_slow, e.Position());
-        FlushCachedRegs();
-        e.MovReg(R0, kCpu);
-        e.Mov32(R1, inst);
-        e.Call(reinterpret_cast<const void*>(&HelperVfpCdp));
-        ReloadCachedRegs();
-
-        e.PatchBranch(to_done, e.Position());
-        e.MsrFlags(kT0);
+        const u32 back = e.Position();
+        if (keep_flags) {
+            e.MsrFlags(kT0);
+        }
+        // Con vectores, la funcion del interprete (fuera de linea: kT0 es de
+        // los que la llamada conserva).
+        DeferCold({to_slow}, [this, inst, back] {
+            FlushCachedRegs();
+            e.MovReg(R0, kCpu);
+            e.Mov32(R1, inst);
+            e.Call(reinterpret_cast<const void*>(&HelperVfpCdp));
+            ReloadCachedRegs();
+            e.BranchTo(kAlways, back);
+        });
     }
 
     /// La aritmetica VFP por la funcion del interprete (lo de 0.1.6.1).
@@ -2235,18 +2550,18 @@ private:
      * LDM/STM con BlockTransfer. Lee y escribe cpu->Reg (el base), asi que la
      * cache se vuelca antes y se recarga despues. Reg[15] = pc antes, porque
      * VSTM/VLDM con base PC lo leen de ahi (mas 8), como en el interprete.
+     * Lo normal va en linea (VfpTransferFast).
      */
     void VfpTransferCall(u32 inst, u32 pc) {
+        int index = -1;
+        DecodeARMInstruction(inst, &index); // una vez, al compilar (0.1.8.5)
+        if (!check_mode && VfpTransferInlinable(inst, index)) {
+            VfpTransferFast(inst, pc, index);
+            return;
+        }
         FlushCachedRegs();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
-        int index = -1;
-        DecodeARMInstruction(inst, &index); // una vez, al compilar (0.1.8.5)
-        const bool inline_path = !check_mode && VfpTransferInlinable(inst, index);
-        u32 to_done = 0;
-        if (inline_path) {
-            to_done = VfpTransferInline(inst, index);
-        }
         e.Mov32(R0, pc);
         e.StrImm(R0, kCpu, RegOffset(15));
         e.MovReg(R0, kCpu);
@@ -2254,9 +2569,6 @@ private:
         e.Mov32(R2, static_cast<u32>(index));
         e.Call(check_mode ? reinterpret_cast<const void*>(&CheckVfpTransfer)
                           : reinterpret_cast<const void*>(&HelperVfpTransfer));
-        if (inline_path) {
-            e.PatchBranch(to_done, e.Position());
-        }
         e.MsrFlags(kT0);
         ReloadCachedRegs();
     }
@@ -2271,23 +2583,42 @@ private:
     }
 
     /**
+     * kT1 = puntero directo a 'words' palabras seguidas desde 'start', o un
+     * salto a 'slow' si no se puede: desalineada, en dos paginas o sin
+     * puntero de pagina (hardware). Pisa kRm y los flags.
+     */
+    void DirectSpan(u32 start, u32 words, std::vector<u32>& slow) {
+        e.Emit(0xE3100003u | (start << 16)); // TST start, #3
+        slow.push_back(e.BranchPlaceholder(kCondNe));
+        if (words > 1) {
+            AddSmall(kRm, start, 4 * static_cast<s32>(words) - 4);   // ultima palabra
+            e.Emit(0xE0200000u | (kRm << 16) | (kRm << 12) | start); // EOR kRm, kRm, start
+            e.Emit(0xE1B00620u | (kRm << 12) | kRm);                 // LSRS kRm, kRm, #12
+            slow.push_back(e.BranchPlaceholder(kCondNe));            // dos paginas
+        }
+        e.LsrImm(kRm, start, 12);
+        e.LdrRegLsl2(kT1, kPages, kRm);
+        e.CmpImm0(kT1);
+        slow.push_back(e.BranchPlaceholder(kCondEq)); // sin puntero
+        e.Ubfx(kRm, start, 0, 12);
+        e.AddReg(kT1, kT1, kRm);
+    }
+
+    /**
      * VPUSH/VPOP/VSTM/VLDM EN LINEA (0.1.8.7). crash.txt de 0.1.8.6 en el 3D
      * de Zafiro Alfa: "lento" 8 ms por vblank con ~6.500 llamadas, casi todas
-     * estas (los d8-d15 que guarda y recupera cada funcion con coma flotante):
-     * una llamada a C y un ReadMemory32/WriteMemory32 por palabra.
+     * estas (los d8-d15 que guarda y recupera cada funcion con coma flotante).
      *
      * Camino rapido con EXACTAMENTE las cuentas de VfpTransfer: la primera
      * direccion y el base nuevo salen del mismo inmediato (imm32, que en
      * FSTMX/FLDMX lleva una palabra de mas que no se copia), y las palabras van
      * seguidas en ExtReg (s(d+i), o d(d+i) en ExtReg[2(d+i)] y [2(d+i)+1]).
      * Solo si el tramo entero esta alineado a 4 y cae en UNA pagina con
-     * puntero; si no, la funcion de siempre, que va justo detras. La escritura
-     * del base, despues de los accesos, como alli.
-     *
-     * Entra con la cache volcada y los flags del juego en kT0. Devuelve el
-     * salto a parchear al final (despues de la llamada lenta).
+     * puntero; si no, la funcion de siempre, en un camino frio. La escritura
+     * del base, despues de los accesos, como alli. Desde 0.2.1.0 sin volcar
+     * la cache: el base se lee de su hueco (los accesos no tocan registros ARM).
      */
-    u32 VfpTransferInline(u32 inst, int index) {
+    void VfpTransferFast(u32 inst, u32 pc, int index) {
         const bool push = index == kVfpVpush;
         const bool pop = index == kVfpVpop;
         const bool single = Bits(inst, 8, 8) == 0;
@@ -2303,23 +2634,17 @@ private:
         const bool writeback = push || pop || Bits(inst, 21, 21) == 1;
         const s32 first = (push || (!pop && !add)) ? -imm32 : 0;
         const s32 delta = (push || (!pop && !add)) ? -imm32 : imm32;
+        const bool keep_flags = flags_live_after;
+        const std::array<bool, 16> written_before = cache_written;
 
-        std::vector<u32> slow_jumps;
-        e.LdrImm(kRn, kCpu, RegOffset(rn)); // base original
-        AddConst(kRs, kRn, first);          // primera direccion
-        e.Emit(0xE3100003u | (kRs << 16));  // TST kRs, #3
-        slow_jumps.push_back(e.BranchPlaceholder(kCondNe));
-        AddConst(kRm, kRs, 4 * static_cast<s32>(words) - 4); // ultima palabra
-        e.Emit(0xE0200000u | (kRm << 16) | (kRm << 12) | kRs); // EOR kRm, kRm, kRs
-        e.Emit(0xE1B00620u | (kRm << 12) | kRm);               // LSRS kRm, kRm, #12
-        slow_jumps.push_back(e.BranchPlaceholder(kCondNe));    // dos paginas
-        e.LsrImm(kRm, kRs, 12);
-        e.LdrRegLsl2(kT1, kPages, kRm);
-        e.CmpImm0(kT1);
-        slow_jumps.push_back(e.BranchPlaceholder(kCondEq)); // sin puntero
-        e.Ubfx(kRm, kRs, 0, 12);
-        e.AddReg(kT1, kT1, kRm); // kT1 = puntero a la primera palabra
-
+        if (keep_flags) {
+            e.Mrs(kFlags);
+        }
+        const u32 base = OperandHost(kRn, rn, pc);
+        const u32 start = first != 0 ? kRs : base;
+        AddSmall(start, base, first);
+        std::vector<u32> slow;
+        DirectSpan(start, words, slow);
         for (u32 k = 0; k < words; k++) {
             if (load) {
                 e.LdrImm(kRd, kT1, 4 * k);
@@ -2330,48 +2655,55 @@ private:
             }
         }
         if (writeback) {
-            AddConst(kRm, kRn, delta);
-            e.StrImm(kRm, kCpu, RegOffset(rn));
+            AddSmall(kRm, base, delta);
+            StoreGuest(kRm, rn);
         }
-        const u32 to_done = e.BranchPlaceholder(kAlways);
-        for (const u32 jump : slow_jumps) {
-            e.PatchBranch(jump, e.Position());
+        const u32 back = e.Position();
+        if (keep_flags) {
+            e.MsrFlags(kFlags);
         }
-        return to_done;
+        DeferCold(std::move(slow), written_before, [this, inst, pc, index, keep_flags, back] {
+            FlushCachedRegs();
+            if (keep_flags) {
+                e.MovReg(kT0, kFlags);
+            }
+            e.Mov32(R0, pc);
+            e.StrImm(R0, kCpu, RegOffset(15));
+            e.MovReg(R0, kCpu);
+            e.Mov32(R1, inst);
+            e.Mov32(R2, static_cast<u32>(index));
+            e.Call(reinterpret_cast<const void*>(&HelperVfpTransfer));
+            if (keep_flags) {
+                e.MovReg(kFlags, kT0);
+            }
+            ReloadCachedRegs();
+            e.BranchTo(kAlways, back);
+        });
     }
 
-    /// LDM/STM: una llamada a la misma logica que el interprete. El PC del
-    /// juego se deja escrito antes (STM con el PC lo guarda como PC+8).
+    /// LDM/STM: en linea (BlockTransferFast); la variante de comprobacion, por
+    /// la misma logica que el interprete con el diario. El PC del juego se deja
+    /// escrito antes (STM con el PC lo guarda como PC+8).
     void BlockTransferCall(u32 inst, u32 pc) {
-        // BlockTransfer lee y escribe cpu->Reg entero (la lista del LDM/STM):
-        // la cache se vuelca antes y se recarga despues.
+        if (!check_mode) {
+            BlockTransferFast(inst, pc);
+            return;
+        }
         FlushCachedRegs();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
-        u32 to_done = 0;
-        bool inline_path = false;
-        if (!check_mode && (inst & 0xFFFFu) != 0) {
-            inline_path = true;
-            to_done = BlockTransferInline(inst, pc);
-        }
         e.Mov32(R0, pc);
         e.StrImm(R0, kCpu, RegOffset(15));
         e.MovReg(R0, kCpu);
         e.Mov32(R1, inst);
-        e.Call(check_mode ? reinterpret_cast<const void*>(&CheckBlockTransfer)
-                          : reinterpret_cast<const void*>(&HelperBlockTransfer));
-        if (inline_path) {
-            e.PatchBranch(to_done, e.Position());
-        }
+        e.Call(reinterpret_cast<const void*>(&CheckBlockTransfer));
         e.MsrFlags(kT0);
         ReloadCachedRegs();
     }
 
     /**
      * LDM/STM EN LINEA (0.1.7.0). Medido en 0.1.6.3: ~15.000 llamadas lentas
-     * por fotograma, casi todas LDM/STM (los push/pop de cada funcion), que
-     * siempre iban a HelperBlockTransfer: una llamada a C y un ReadMemory32 o
-     * WriteMemory32 por registro.
+     * por fotograma, casi todas LDM/STM (los push/pop de cada funcion).
      *
      * Camino rapido, con EXACTAMENTE la cuenta de BlockTransfer: si el tramo
      * de memoria entero esta alineado a 4 y cae en UNA pagina con puntero (RAM
@@ -2380,12 +2712,15 @@ private:
      * (en un LDM que carga el propio base gana lo cargado), STM guarda el base
      * ORIGINAL si esta en la lista y el PC como PC+8, y un LDM que carga el PC
      * pasa a Thumb si el bit 0 viene puesto. Cualquier otra cosa (dos paginas,
-     * hardware, desalineado) cae a la funcion de siempre, que va justo detras.
+     * hardware, desalineado) va a la funcion de siempre, en un camino frio.
      *
-     * Entra con la cache volcada y los flags del juego en kT0. Devuelve el
-     * salto a parchear al final (despues de la llamada lenta).
+     * 0.2.1.0: SIN volcar ni recargar la cache. Los registros cacheados se
+     * guardan y se cargan directamente desde y hacia su hueco; antes cada
+     * push/pop volcaba los cinco huecos, los releia de cpu->Reg y los
+     * recargaba al acabar. El camino frio vuelca lo escrito ANTES de la
+     * instruccion: se entra en el antes de tocar nada.
      */
-    u32 BlockTransferInline(u32 inst, u32 pc) {
+    void BlockTransferFast(u32 inst, u32 pc) {
         const u32 rn = Bits(inst, 16, 19);
         const u32 list = inst & 0xFFFFu;
         const u32 count = static_cast<u32>(std::popcount(list));
@@ -2396,26 +2731,27 @@ private:
         // Desde el base hasta la primera palabra, y el base nuevo.
         const s32 first = up ? (pre ? 4 : 0) : (pre ? -4 * s32(count) : -4 * s32(count) + 4);
         const s32 delta = up ? 4 * s32(count) : -4 * s32(count);
+        const bool keep_flags = flags_live_after;
+        const std::array<bool, 16> written_before = cache_written;
 
-        std::vector<u32> slow_jumps;
-        e.LdrImm(kRn, kCpu, RegOffset(rn)); // base original
-        AddConst(kRs, kRn, first);          // primera direccion
-        e.Emit(0xE3100003u | (kRs << 16));  // TST kRs, #3
-        slow_jumps.push_back(e.BranchPlaceholder(kCondNe));
-        AddConst(kRm, kRs, 4 * s32(count) - 4); // ultima palabra
-        e.Emit(0xE0200000u | (kRm << 16) | (kRm << 12) | kRs); // EOR kRm, kRm, kRs
-        e.Emit(0xE1B00620u | (kRm << 12) | kRm);               // LSRS kRm, kRm, #12
-        slow_jumps.push_back(e.BranchPlaceholder(kCondNe));    // dos paginas
-        e.LsrImm(kRm, kRs, 12);
-        e.LdrRegLsl2(kT1, kPages, kRm);
-        e.CmpImm0(kT1);
-        slow_jumps.push_back(e.BranchPlaceholder(kCondEq)); // sin puntero
-        e.Ubfx(kRm, kRs, 0, 12);
-        e.AddReg(kT1, kT1, kRm); // kT1 = puntero a la primera palabra
-
+        if (keep_flags) {
+            e.Mrs(kFlags);
+        }
+        // El base ORIGINAL. Con escritura del base, en kRn: su hueco recibe el
+        // nuevo antes de los accesos, y STM guarda el original.
+        u32 base = kRn;
         if (writeback) {
-            AddConst(kRm, kRn, delta);
-            e.StrImm(kRm, kCpu, RegOffset(rn));
+            LoadGuest(kRn, rn, pc);
+        } else {
+            base = OperandHost(kRn, rn, pc);
+        }
+        const u32 start = first != 0 ? kRs : base;
+        AddSmall(start, base, first);
+        std::vector<u32> slow;
+        DirectSpan(start, count, slow);
+        if (writeback) {
+            AddSmall(kRm, base, delta);
+            StoreGuest(kRm, rn);
         }
         u32 slot = 0;
         for (u32 i = 0; i < 16; i++) {
@@ -2425,72 +2761,103 @@ private:
             const u32 offset = slot * 4;
             slot++;
             if (load) {
-                e.LdrImm(kRd, kT1, offset);
                 if (i == 15) {
+                    e.LdrImm(kRd, kT1, offset);
                     e.Ubfx(kRm, kRd, 0, 1);
                     e.StrImm(kRm, kCpu, g_offsets.t);
                     e.Emit(0xE3C00001u | (kRd << 16) | (kRd << 12)); // BIC kRd, kRd, #1
+                    e.StrImm(kRd, kCpu, RegOffset(15));
+                    continue;
                 }
-                e.StrImm(kRd, kCpu, RegOffset(i));
-            } else {
-                if (i == 15) {
-                    e.Mov32(kRd, pc + 8);
-                    e.StrImm(kRd, kT1, offset);
-                } else if (i == rn) {
-                    e.StrImm(kRn, kT1, offset); // el base ORIGINAL
+                const s8 cached = CacheHost(i);
+                if (cached >= 0) {
+                    e.LdrImm(static_cast<u32>(cached), kT1, offset);
+                    cache_written[i] = true;
                 } else {
-                    e.LdrImm(kRd, kCpu, RegOffset(i));
-                    e.StrImm(kRd, kT1, offset);
+                    e.LdrImm(kRd, kT1, offset);
+                    e.StrImm(kRd, kCpu, RegOffset(i));
                 }
+                continue;
             }
+            u32 value = base; // el base ORIGINAL si esta en la lista
+            if (i == 15) {
+                e.Mov32(kRd, pc + 8);
+                value = kRd;
+            } else if (i != rn) {
+                value = OperandHost(kRd, i, pc);
+            }
+            e.StrImm(value, kT1, offset);
         }
-        const u32 to_done = e.BranchPlaceholder(kAlways);
-        for (const u32 jump : slow_jumps) {
-            e.PatchBranch(jump, e.Position());
+        const u32 back = e.Position();
+        if (keep_flags) {
+            e.MsrFlags(kFlags);
         }
-        return to_done;
+        DeferCold(std::move(slow), written_before, [this, inst, pc, keep_flags, back] {
+            FlushCachedRegs();
+            if (keep_flags) {
+                e.MovReg(kT0, kFlags);
+            }
+            e.Mov32(R0, pc);
+            e.StrImm(R0, kCpu, RegOffset(15));
+            e.MovReg(R0, kCpu);
+            e.Mov32(R1, inst);
+            e.Call(reinterpret_cast<const void*>(&HelperBlockTransfer));
+            if (keep_flags) {
+                e.MovReg(kFlags, kT0);
+            }
+            ReloadCachedRegs();
+            e.BranchTo(kAlways, back);
+        });
     }
 
-    /// rd = rn + value (value con signo), sin tocar flags. Usa r12 de
-    /// temporal: en BlockTransferInline esta libre (los flags van en kT0) y
-    /// kT1 no se puede tocar (es el puntero de pagina).
-    void AddConst(u32 rd, u32 rn, s32 value) {
-        if (value == 0) {
-            e.MovReg(rd, rn);
+    /// Con enlaces en el codigo generado (nunca en la variante de comprobacion).
+    bool Linking() const {
+        return !check_mode && direct_link.load(std::memory_order_relaxed) != 0;
+    }
+
+    /**
+     * Salida a un destino FIJO (B, BL, el camino no tomado de un salto
+     * condicional, el final de pagina). Con enlace, Reg[15] solo se escribe si
+     * el enlace falla (0.2.1.0): el bloque destino no lo lee -- los caminos
+     * lentos y las llamadas que lo necesitan escriben el suyo, y cada salida
+     * deja el de su destino --, y eran tres instrucciones en cada salida.
+     */
+    void ExitDirect(u32 target_pc) {
+        if (Linking()) {
+            EmitLink(LinkFor(target_pc), target_pc);
             return;
         }
-        e.Mov32(kFlags, static_cast<u32>(value < 0 ? -value : value));
-        if (value < 0) {
-            e.SubReg(rd, rn, kFlags);
-        } else {
-            e.AddReg(rd, rn, kFlags);
+        e.Mov32(kT0, target_pc);
+        e.StrImm(kT0, kCpu, RegOffset(15));
+        to_epilogue.push_back(e.BranchPlaceholder(kAlways));
+    }
+
+    /// Salida con Reg[15] (y TFlag) ya escritos (BX, LDM con el PC...).
+    void ExitIndirect() {
+        if (Linking()) {
+            EmitLink(nullptr, 0);
+            return;
         }
+        to_epilogue.push_back(e.BranchPlaceholder(kAlways));
     }
 
     /**
      * ENLACE AL SIGUIENTE BLOQUE, EN LINEA (0.1.5.7). Ver LinkContext.
      *
-     * Se emite en cada salida del bloque, con Reg[15] (y TFlag) ya escritos en
-     * cpu como los dejaria el interprete. 'target' es el LinkInfo del destino
-     * si el destino es FIJO (B, BL, el camino no tomado de un salto
-     * condicional, el final de pagina): va en un literal dentro del codigo.
-     * Con nullptr el salto es INDIRECTO (BX, LDM con el PC, "mov pc, lr",
-     * "ldr pc, [...]"): se lee Reg[15] y se busca en g_fast, la tabla rapida de
-     * TryRun, con su misma clave; si el hueco es de otro PC, no se enlaza.
+     * 'target' es el LinkInfo del destino si el destino es FIJO (va como
+     * constante en el codigo) y 'target_pc' su direccion. Con nullptr el salto
+     * es INDIRECTO (BX, LDM con el PC, "mov pc, lr", "ldr pc, [...]"): se lee
+     * Reg[15] y se busca en g_fast, la tabla rapida de TryRun, con su misma
+     * clave; si el hueco es de otro PC, no se enlaza.
      *
      * Las condiciones son EXACTAMENTE las del bucle de TryRun (y las del
-     * despacho del interprete). Si alguna falla, se cae por el final con la
-     * cache y los flags como estaban, hacia el epilogo, y TryRun sigue por su
-     * camino. Los flags del juego se guardan en kT0 (r10) porque aqui se usan
-     * CMP/SUBS; r0-r3 y r6-r9 estan libres (la cache se vuelca al empezar).
-     *
-     * La variante de comprobacion no enlaza nunca: termina en su epilogo, como
-     * siempre, y la compara el despacho.
+     * despacho del interprete). Si alguna falla, un camino frio repone los
+     * flags, escribe el PC del destino fijo y sale sin volver a volcar la
+     * cache (exit_noflush). Los flags del juego se guardan en kT0 (r10) porque
+     * aqui se usan CMP/SUBS; r0-r3 y r6-r9 estan libres (la cache se vuelca
+     * al empezar).
      */
-    void EmitLink(const LinkInfo* target) {
-        if (check_mode || direct_link.load(std::memory_order_relaxed) == 0) {
-            return;
-        }
+    void EmitLink(const LinkInfo* target, u32 target_pc) {
         std::vector<u32> fails;
         FlushCachedRegs();
         e.Mrs(kT0);
@@ -2535,28 +2902,30 @@ private:
          * r0 = LinkInfo* del destino. Enlazable? (0.1.8.1) entry ya implica que
          * el bloque ha pasado sus kFullChecks comprobaciones (TryRun no lo
          * publica antes, ver PublishLinkEntry), asi que aqui no se mira ni se
-         * incrementa 'runs': eran cinco instrucciones, dos saltos y un guardado
-         * por enlace. Las comprobaciones por muestreo siguen en las entradas
-         * por TryRun.
+         * incrementa 'runs'. Las comprobaciones por muestreo siguen en las
+         * entradas por TryRun.
          */
         e.LdrImm(R1, R0, kLinkEntry);
         e.CmpImm0(R1);
         fails.push_back(e.BranchPlaceholder(kCondEq));
         // Presupuesto y enlaces de una vez: LDRD kRn (budget), kRm (hops).
-        e.Mov32(R3, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_link_ctx)));
-        e.Emit(0xE1C000D0u | (R3 << 16) | (kRn << 12)); // LDRD kRn, kRm, [r3]
+        e.LdrdImm(kRn, kCpu, g_offsets.link);
         e.LdrImm(R2, R0, kLinkCount);
         e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | R2); // SUBS kRn, kRn, r2
         fails.push_back(e.BranchPlaceholder(kCondLo));
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
-        e.Emit(0xE1C000F0u | (R3 << 16) | (kRn << 12)); // STRD kRn, kRm, [r3]
+        e.StrdImm(kRn, kCpu, g_offsets.link);
         e.MsrFlags(kT0);
         e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
-        for (const u32 fail : fails) {
-            e.PatchBranch(fail, e.Position());
-        }
-        e.MsrFlags(kT0);
-        ReloadCachedRegs();
+        const bool store_pc = target != nullptr;
+        DeferCold(std::move(fails), [this, store_pc, target_pc] {
+            e.MsrFlags(kT0);
+            if (store_pc) {
+                e.Mov32(kRd, target_pc);
+                e.StrImm(kRd, kCpu, RegOffset(15));
+            }
+            e.BranchTo(kAlways, exit_noflush);
+        });
     }
 
     /// El LinkInfo del bloque de 'pc', creando su entrada si hace falta (un
@@ -2567,19 +2936,29 @@ private:
         return &target.link;
     }
 
+    /// Una constante a un registro del juego, directa a su hueco si esta
+    /// cacheado (0.2.1.0: el LR de BL).
+    void StoreGuestConst(u32 guest, u32 value) {
+        const s8 cached = CacheHost(guest);
+        if (cached >= 0) {
+            e.Mov32(static_cast<u32>(cached), value);
+            cache_written[guest] = true;
+            return;
+        }
+        e.Mov32(kT0, value);
+        e.StrImm(kT0, kCpu, RegOffset(guest));
+    }
+
     /**
      * Instrucciones que terminan el bloque. Dejan en Reg[15] (y en TFlag, si
      * cambian de modo) lo mismo que el interprete: el destino si la condicion
-     * se cumple y la instruccion siguiente si no.
+     * se cumple y la instruccion siguiente si no. Cada camino acaba en una
+     * salida (ExitDirect o ExitIndirect), que intenta enlazar.
      */
     void Terminator(u32 inst, u32 pc, const Decoded& decoded, u32 cond) {
         // kT0/kT1 en vez de R0-R2: R0-R3 y lr son los huecos de la cache de
         // registros. Un Mov32 ahi pisaria un valor cacheado y el Epilogue
         // (que si vuelca) escribiria basura sobre los registros del juego.
-        //
-        // 0.1.5.7: cada salida intenta enlazar con el bloque siguiente
-        // (EmitLink). Con condicion, el camino NO tomado es otra salida con
-        // destino fijo (pc + 4) y tambien se enlaza: son los bucles.
         u32 skip = 0;
         if (cond != kAlways) {
             skip = e.BranchPlaceholder(cond ^ 1u);
@@ -2590,12 +2969,9 @@ private:
             const s32 offset = static_cast<s32>(offset24 << 8) >> 6; // extiende signo, x4
             const u32 target = pc + 8 + static_cast<u32>(offset);
             if (Bits(inst, 24, 24) == 1) {
-                e.Mov32(kT0, pc + 4);
-                StoreGuest(kT0, 14);
+                StoreGuestConst(14, pc + 4);
             }
-            e.Mov32(kT0, target);
-            StoreGuest(kT0, 15);
-            EmitLinkDirect(target);
+            ExitDirect(target);
             break;
         }
         case Kind::BranchLinkExchangeImm: {
@@ -2604,13 +2980,12 @@ private:
             const u32 offset24 = inst & 0x00FFFFFFu;
             const s32 offset = static_cast<s32>(offset24 << 8) >> 6;
             const u32 target = pc + 8 + static_cast<u32>(offset) + (Bits(inst, 24, 24) << 1);
-            e.Mov32(kT0, pc + 4);
-            StoreGuest(kT0, 14);
+            StoreGuestConst(14, pc + 4);
             e.Mov32(kT1, 1);
             e.StrImm(kT1, kCpu, g_offsets.t);
             e.Mov32(kT0, target);
             StoreGuest(kT0, 15);
-            EmitLinkIndirect();
+            ExitIndirect();
             break;
         }
         case Kind::BranchExchange: {
@@ -2626,50 +3001,35 @@ private:
             e.StrImm(kT1, kCpu, g_offsets.t);
             e.Emit(0xE3C00001u | (kT0 << 16) | (kT0 << 12)); // BIC kT0, kT0, #1
             StoreGuest(kT0, 15);
-            EmitLinkIndirect();
+            ExitIndirect();
             break;
         }
         case Kind::BlockTransfer:
-            // LDM con el PC: la funcion pone Reg[15] y TFlag.
+            // LDM con el PC: pone Reg[15] y TFlag.
             BlockTransferCall(inst, pc);
-            EmitLinkIndirect();
+            ExitIndirect();
             break;
         case Kind::DataProcessing:
             // "mov pc, lr" y compania: el resultado va a Reg[15] (Rd = 15), sin
             // flags (el bit S esta excluido) y sin cambio de modo, igual que
             // MOV_INST y demas en el interprete.
             DataProcessing(inst, pc);
-            EmitLinkIndirect();
+            ExitIndirect();
             break;
         case Kind::LoadStore:
             // "ldr pc, [...]": LoadStore pone Reg[15] y TFlag.
             LoadStore(inst, pc);
-            EmitLinkIndirect();
+            ExitIndirect();
             break;
         default:
+            to_epilogue.push_back(e.BranchPlaceholder(kAlways));
             break;
         }
         if (cond != kAlways) {
-            // El camino tomado (si no enlazo) salta el no tomado y va al
-            // epilogo; el no tomado deja PC = siguiente e intenta enlazar alli.
-            const u32 to_end = e.BranchPlaceholder(kAlways);
+            // El camino no tomado: PC = siguiente.
             e.PatchBranch(skip, e.Position());
-            e.Mov32(kT0, pc + 4);
-            e.StrImm(kT0, kCpu, RegOffset(15));
-            EmitLinkDirect(pc + 4);
-            e.PatchBranch(to_end, e.Position());
+            ExitDirect(pc + 4);
         }
-    }
-
-    void EmitLinkDirect(u32 target_pc) {
-        if (check_mode || direct_link.load(std::memory_order_relaxed) == 0) {
-            return;
-        }
-        EmitLink(LinkFor(target_pc));
-    }
-
-    void EmitLinkIndirect() {
-        EmitLink(nullptr);
     }
 };
 
@@ -2701,9 +3061,10 @@ void ResetAll() {
     g_blocks.clear();
     g_fast.fill(FastSlot{});
     g_code_used_words = 0;
+    g_code_blocks = 0;
     g_pending.active = false;
     g_flush_requested = false;
-    g_link_ctx = LinkContext{};
+    g_link_withdrawn = 0;
 }
 
 /**
@@ -2840,6 +3201,13 @@ bool Analyze(ARMul_State* cpu, Block& block) {
         case Kind::VfpLoadStore:
             use(Bits(inst, 16, 19));
             break;
+        case Kind::Exclusive:
+            use(Bits(inst, 16, 19));
+            use(Bits(inst, 12, 15));
+            if ((Bits(inst, 20, 27) & 1) == 0) {
+                use(Bits(inst, 0, 3));
+            }
+            break;
         case Kind::VfpMove:
             use(Bits(inst, 12, 15));
             break;
@@ -2970,6 +3338,7 @@ BlockFn EmitBlock(Block& block, bool check_mode) {
         compiler.FallThrough(pc);
     }
     compiler.Epilogue();
+    compiler.EmitColdStubs();
     if (e.Overflowed()) {
         sceKernelCloseVMDomain();
         g_flush_requested = true;
@@ -2980,6 +3349,7 @@ BlockFn EmitBlock(Block& block, bool check_mode) {
     sceKernelSyncVMDomain(g_code_block, start, e.Position() * 4);
     sceKernelCloseVMDomain();
     g_code_used_words += e.Position();
+    g_code_blocks++;
     if (!check_mode) {
         // Punto de entrada de los enlaces (0.1.5.7): pila, kCpu, kPages y
         // flags ya los pone el bloque origen; aqui empieza BodyEnter. NO se
@@ -3156,14 +3526,15 @@ bool DueForCheck(const Block& block) {
 u64 RunCompiled(ARMul_State* cpu, Block& block, u8* const* pages, u64 chain_budget) {
     block.link.runs++;
     const u32 budget = chain_budget > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<u32>(chain_budget);
-    g_link_ctx.budget = budget;
-    g_link_ctx.hops = 0;
-    g_link_ctx.withdrawn = 0;
+    cpu->jit_link_budget = budget;
+    cpu->jit_link_hops = 0;
+    g_link_withdrawn = 0;
     block.code(cpu, pages);
-    const u64 linked = budget - g_link_ctx.budget - g_link_ctx.withdrawn;
-    g_local.dispatches += g_link_ctx.hops;
-    g_local.links += g_link_ctx.hops;
-    g_local.jit_dispatches += 1 + g_link_ctx.hops;
+    const u32 hops = cpu->jit_link_hops;
+    const u64 linked = budget - cpu->jit_link_budget - g_link_withdrawn;
+    g_local.dispatches += hops;
+    g_local.links += hops;
+    g_local.jit_dispatches += 1 + hops;
     g_local.jit_instructions += block.link.count + linked;
     return block.link.count + linked;
 }
@@ -3219,12 +3590,13 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
         block->link.entry = block->chain_entry;
     }
     /**
-     * 0.1.8.1: se cronometran TODAS las entradas, no una de cada 16. Son pocas
-     * (las demas son enlaces dentro del codigo generado) y muy desiguales: una
-     * puede encadenar miles de bloques, y con el muestreo el reparto entre
-     * "jit" y "resto" del overlay salia con mucho ruido.
+     * Una entrada de cada kTimeSampleEvery otra vez (0.2.1.0). En 0.1.8.1 se
+     * cronometraban todas para quitar ruido al reparto entre "jit" y "resto",
+     * pero son ~1.000 por fotograma y cada una leia el reloj dos veces, que en
+     * la Vita es una llamada al kernel. Con el intervalo de 10 s del registro
+     * salen miles de muestras: el ruido se promedia.
      */
-    const ScopedMicros timer{g_jit_us};
+    const SampledMicros timer{g_jit_us, TimeThisCall(++g_jit_entries)};
     // Los enlazados dentro del codigo generado (EmitLink) ven lo que queda de
     // la rodaja DESPUES de este bloque, igual que el bucle de abajo.
     u64 done = RunCompiled(cpu, *block, pages, budget_left - block->link.count);
@@ -3459,6 +3831,11 @@ void AddSvcTime(u64 microseconds) {
 
 void CountInstructions(u32 instructions) {
     g_local.instructions += instructions;
+}
+
+void CodeUsage(u32& bytes, u32& blocks) {
+    bytes = g_code_used_words * 4;
+    blocks = g_code_blocks;
 }
 
 void TakeStats(Stats& out) {

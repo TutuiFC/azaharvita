@@ -240,6 +240,15 @@ public:
     Core::System& system;
     Memory::MemorySystem& memory;
 
+    /**
+     * Del JIT de la Vita (arm_dyncom_jit.cpp, LinkContext): instrucciones que
+     * quedan para los bloques enlazados y enlaces hechos. Aqui, al principio y
+     * alineados a 8, para que el codigo generado los lea con un solo LDRD desde
+     * el puntero al estado.
+     */
+    alignas(8) u32 jit_link_budget = 0;
+    u32 jit_link_hops = 0;
+
     std::array<u32, 16> Reg{}; // The current register file
     std::array<u32, 2> Reg_usr{};
     std::array<u32, 2> Reg_svc{};   // R13_SVC R14_SVC

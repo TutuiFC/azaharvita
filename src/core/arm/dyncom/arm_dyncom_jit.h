@@ -191,6 +191,10 @@ struct Stats {
 };
 void TakeStats(Stats& out);
 
+/// Codigo generado desde el ultimo vaciado: bytes y bloques (0.2.1.0, para
+/// ver en crash.txt cuanto ocupa un bloque).
+void CodeUsage(u32& bytes, u32& blocks);
+
 /// Tiempo de una rodaja del ARM (lo mide ARM_DynCom::ExecuteInstructions).
 void AddSliceTime(u64 microseconds);
 /// Tiempo dentro de las llamadas al sistema de esa rodaja (SWI_INST): se resta.
