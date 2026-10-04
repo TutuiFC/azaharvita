@@ -158,12 +158,11 @@ public:
     /// Interruptor del menu ("Copia de pantalla en GPU"). Encendido.
     static std::atomic<u32> transfer_on_gpu;
     /**
-     * Resolucion de dibujado en la GPU, 1 o 2 (0.2.0.3, ajuste "Resolucion
-     * GPU"). Con 2 las superficies tienen el doble de pixeles en cada eje: la
-     * GPU de la Vita dibuja a 800x480 lo que el 3DS a 400x240 y el presentador
-     * muestra esa imagen. La memoria del invitado sigue a 1x (se reduce al
-     * volcar y se amplia al recargar), asi que el juego no nota nada. Se lee
-     * al crear cada superficie.
+     * Resolucion de dibujado en la GPU EN MITADES (ajuste "Resolucion GPU"):
+     * 1 = 0.5x (0.2.0.4), 2 = 1x, 4 = 2x (0.2.0.3). Las superficies tienen
+     * width * escala / 2 pixeles por eje; la memoria del invitado sigue a 1x
+     * (se remuestrea al volcar y al recargar), asi que el juego no nota nada.
+     * Se lee al crear cada superficie.
      */
     static std::atomic<u32> resolution_scale;
     /// Copias hechas asi y copias que hubo que hacer de verdad despues (overlay).
@@ -322,8 +321,8 @@ public:
         u32 stride_bytes = 0;
         /// Formato GXM de la superficie de color (no el del invitado).
         u32 gxm_texture_format = 0;
-        /// Pixeles por pixel del invitado (resolution_scale).
-        u32 scale = 1;
+        /// La de la superficie, en mitades (resolution_scale).
+        u32 scale = 2;
     };
 
     /**

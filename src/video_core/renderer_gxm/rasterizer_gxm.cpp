@@ -53,7 +53,7 @@ std::atomic<u32> RasterizerGXM::no_finish_wait{1};
 std::atomic<u32> RasterizerGXM::present_direct{1};
 std::atomic<u32> RasterizerGXM::specialize_vs{1};
 std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
-std::atomic<u32> RasterizerGXM::resolution_scale{1};
+std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
 std::atomic<u32> RasterizerGXM::gpu_fills{0};
@@ -656,9 +656,9 @@ struct RasterizerGXM::Surface {
     u32 guest_stride = 0;
     /// Stride de la superficie de color, en PIXELES.
     u32 color_stride = 0;
-    /// Pixeles nuestros por pixel del invitado en cada eje (resolution_scale
-    /// al crearla). width/height son siempre los del invitado.
-    u32 scale = 1;
+    /// Escala en mitades (resolution_scale al crearla): Phys() da nuestros
+    /// pixeles. width/height son siempre los del invitado.
+    u32 scale = 2;
     /// Formato de la superficie de color, como SCE_GXM_COLOR_FORMAT_*.
     /// Para presentar directo (4.6) hace falta saberlo: el del invitado y el
     /// nuestro no son el mismo enum aunque describan lo mismo.
@@ -740,8 +740,8 @@ struct RasterizerGXM::ScreenCopy {
     /// bits desde 0.1.9.8).
     u32 stride = 0;
     u32 bpp = 4;
-    /// La de la superficie de origen: la copia es pixel a pixel.
-    u32 scale = 1;
+    /// La de la superficie de origen, en mitades: la copia es pixel a pixel.
+    u32 scale = 2;
     Pica::PixelFormat input_format = Pica::PixelFormat::RGBA8;
     Pica::PixelFormat output_format = Pica::PixelFormat::RGBA8;
     /// Tiene la ultima copia a esa pantalla...
@@ -1028,48 +1028,43 @@ void CopyTiledGuestImpl(u8* guest, u8* linear, u32 width, u32 height, u32 linear
     }
 }
 
+/// Medida en pixeles nuestros de 'guest' pixeles del invitado, con la escala
+/// en mitades (ver RasterizerGXM::resolution_scale).
+constexpr u32 Phys(u32 guest, u32 scale) {
+    return guest * scale / 2;
+}
+
 /**
- * Un pixel de cada scale x scale de 'src' (la superficie escalada) a 'dst' a
- * 1x, o al reves repitiendo cada pixel. Fila a fila por una copia en memoria
- * normal: la superficie esta en CDRAM sin cache, y leerla pixel a pixel
- * salteado costaria una lectura lenta por pixel.
+ * Remuestreo por vecino mas cercano de una imagen lineal a otra de otro
+ * tamano: superficie escalada <-> imagen del invitado a 1x. Fila a fila por
+ * una copia en memoria normal: la superficie esta en CDRAM sin cache, y
+ * leerla pixel a pixel salteado costaria una lectura lenta por pixel.
  */
 template <typename T>
-void ScaleRows(const u8* src, u32 src_stride, u8* dst, u32 dst_stride, u32 width, u32 height,
-               u32 scale, bool down) {
+void ResampleRows(const u8* src, u32 src_stride, u32 src_width, u32 src_height, u8* dst,
+                  u32 dst_stride, u32 dst_width, u32 dst_height) {
     alignas(16) T row[2048];
-    if (width * scale > 2048) {
+    if (src_width > 2048 || src_width == 0 || src_height == 0) {
         return;
     }
-    for (u32 y = 0; y < height; y++) {
-        if (down) {
-            std::memcpy(row, src + static_cast<std::size_t>(y) * scale * src_stride,
-                        width * scale * sizeof(T));
-            T* out = reinterpret_cast<T*>(dst + static_cast<std::size_t>(y) * dst_stride);
-            for (u32 x = 0; x < width; x++) {
-                out[x] = row[x * scale];
-            }
-        } else {
-            const T* in = reinterpret_cast<const T*>(src + static_cast<std::size_t>(y) * src_stride);
-            for (u32 x = 0; x < width; x++) {
-                for (u32 k = 0; k < scale; k++) {
-                    row[x * scale + k] = in[x];
-                }
-            }
-            for (u32 k = 0; k < scale; k++) {
-                std::memcpy(dst + (static_cast<std::size_t>(y) * scale + k) * dst_stride, row,
-                            width * scale * sizeof(T));
-            }
+    for (u32 y = 0; y < dst_height; y++) {
+        const u32 sy = y * src_height / dst_height;
+        std::memcpy(row, src + static_cast<std::size_t>(sy) * src_stride, src_width * sizeof(T));
+        T* out = reinterpret_cast<T*>(dst + static_cast<std::size_t>(y) * dst_stride);
+        for (u32 x = 0; x < dst_width; x++) {
+            out[x] = row[x * src_width / dst_width];
         }
     }
 }
 
-void ScaleSurface(const u8* src, u32 src_stride, u8* dst, u32 dst_stride, u32 width, u32 height,
-                  u32 scale, u32 bpp, bool down) {
+void Resample(const u8* src, u32 src_stride, u32 src_width, u32 src_height, u8* dst,
+              u32 dst_stride, u32 dst_width, u32 dst_height, u32 bpp) {
     if (bpp == 4) {
-        ScaleRows<u32>(src, src_stride, dst, dst_stride, width, height, scale, down);
+        ResampleRows<u32>(src, src_stride, src_width, src_height, dst, dst_stride, dst_width,
+                          dst_height);
     } else if (bpp == 2) {
-        ScaleRows<u16>(src, src_stride, dst, dst_stride, width, height, scale, down);
+        ResampleRows<u16>(src, src_stride, src_width, src_height, dst, dst_stride, dst_width,
+                          dst_height);
     }
 }
 
@@ -2382,11 +2377,12 @@ void RasterizerGXM::WriteBack(Surface& surface) {
     gpu_writebacks.fetch_add(1, std::memory_order_relaxed);
     u8* linear = static_cast<u8*>(surface.color_buffer.Data());
     u32 linear_stride = surface.color_stride * surface.rt_bpp;
-    if (surface.scale != 1) {
+    if (surface.scale != 2) {
         const u32 row_bytes = surface.width * surface.rt_bpp;
         scale_scratch.resize(static_cast<std::size_t>(row_bytes) * surface.height);
-        ScaleSurface(linear, linear_stride, scale_scratch.data(), row_bytes, surface.width,
-                     surface.height, surface.scale, surface.rt_bpp, true);
+        Resample(linear, linear_stride, Phys(surface.width, surface.scale),
+                 Phys(surface.height, surface.scale), scale_scratch.data(), row_bytes,
+                 surface.width, surface.height, surface.rt_bpp);
         linear = scale_scratch.data();
         linear_stride = row_bytes;
     }
@@ -2408,7 +2404,7 @@ void RasterizerGXM::Reload(Surface& surface) {
     if (guest == nullptr) {
         return;
     }
-    if (surface.scale == 1) {
+    if (surface.scale == 2) {
         CopyTiledGuest(guest, static_cast<u8*>(surface.color_buffer.Data()), surface.width,
                        surface.height, surface.color_stride * surface.rt_bpp, surface.bpp, false);
         return;
@@ -2417,9 +2413,10 @@ void RasterizerGXM::Reload(Surface& surface) {
     scale_scratch.resize(static_cast<std::size_t>(row_bytes) * surface.height);
     CopyTiledGuest(guest, scale_scratch.data(), surface.width, surface.height, row_bytes,
                    surface.bpp, false);
-    ScaleSurface(scale_scratch.data(), row_bytes, static_cast<u8*>(surface.color_buffer.Data()),
-                 surface.color_stride * surface.rt_bpp, surface.width, surface.height,
-                 surface.scale, surface.rt_bpp, false);
+    Resample(scale_scratch.data(), row_bytes, surface.width, surface.height,
+             static_cast<u8*>(surface.color_buffer.Data()), surface.color_stride * surface.rt_bpp,
+             Phys(surface.width, surface.scale), Phys(surface.height, surface.scale),
+             surface.rt_bpp);
 }
 
 namespace {
@@ -2467,8 +2464,8 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
             break;
         }
         out.data = static_cast<const u8*>(copy->color_buffer.Data());
-        out.width = copy->width * copy->scale;
-        out.height = copy->height * copy->scale;
+        out.width = Phys(copy->width, copy->scale);
+        out.height = Phys(copy->height, copy->scale);
         out.scale = copy->scale;
         out.stride_bytes = copy->stride * copy->bpp;
         out.gxm_texture_format = static_cast<u32>(tex_format);
@@ -2513,8 +2510,8 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
             return out;
         }
         out.data = static_cast<const u8*>(surface->color_buffer.Data());
-        out.width = surface->width * surface->scale;
-        out.height = surface->height * surface->scale;
+        out.width = Phys(surface->width, surface->scale);
+        out.height = Phys(surface->height, surface->scale);
         out.scale = surface->scale;
         out.stride_bytes = surface->color_stride * surface->rt_bpp;
         out.gxm_texture_format = static_cast<u32>(tex_format);
@@ -2575,14 +2572,16 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
     alignas(16) u8 scaled[2048 * 4];
     for (u32 y = 0; y < copy.height; y++) {
         // CDRAM se lee sin cache: la fila de una vez y despues de memoria normal.
-        if (copy.scale == 1) {
+        if (copy.scale == 2) {
             std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride,
                         copy.width * copy.bpp);
         } else {
-            std::memcpy(scaled, src + static_cast<std::size_t>(y) * copy.scale * src_stride,
-                        copy.width * copy.scale * copy.bpp);
+            const u32 phys_width = Phys(copy.width, copy.scale);
+            std::memcpy(scaled, src + static_cast<std::size_t>(Phys(y, copy.scale)) * src_stride,
+                        phys_width * copy.bpp);
             for (u32 x = 0; x < copy.width; x++) {
-                std::memcpy(row + x * copy.bpp, scaled + x * copy.scale * copy.bpp, copy.bpp);
+                std::memcpy(row + x * copy.bpp, scaled + Phys(x, copy.scale) * copy.bpp,
+                            copy.bpp);
             }
         }
         u8* out = dst + static_cast<std::size_t>(y) * copy.width * out_bpp;
@@ -2757,8 +2756,8 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
     copy->height = height;
     copy->gxm_color_format = gxm_color_format;
     copy->scale = scale;
-    const u32 phys_width = width * scale;
-    const u32 phys_height = height * scale;
+    const u32 phys_width = Phys(width, scale);
+    const u32 phys_height = Phys(height, scale);
     copy->stride = (phys_width + 7) & ~7u;
     copy->bpp = bpp;
     copy->color_buffer =
@@ -2845,9 +2844,9 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     SceGxmTexture& texture = copy.source_texture;
     const u32 source_stride = source.color_stride * source.rt_bpp;
     const u8* first = static_cast<const u8*>(source.color_buffer.Data()) +
-                      static_cast<std::size_t>(first_row) * source.scale * source_stride;
-    if (sceGxmTextureInitLinearStrided(&texture, first, tex_format, copy.width * copy.scale,
-                                       copy.height * copy.scale, source_stride) < 0) {
+                      static_cast<std::size_t>(Phys(first_row, source.scale)) * source_stride;
+    if (sceGxmTextureInitLinearStrided(&texture, first, tex_format, Phys(copy.width, copy.scale),
+                                       Phys(copy.height, copy.scale), source_stride) < 0) {
         return false;
     }
     sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
@@ -2866,8 +2865,8 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
         return false;
     }
     // El estado del contexto es compartido: todo lo que el quad necesita, aqui.
-    const float half_width = static_cast<float>(copy.width * copy.scale) * 0.5f;
-    const float half_height = static_cast<float>(copy.height * copy.scale) * 0.5f;
+    const float half_width = static_cast<float>(Phys(copy.width, copy.scale)) * 0.5f;
+    const float half_height = static_cast<float>(Phys(copy.height, copy.scale)) * 0.5f;
     sceGxmSetViewport(context, half_width, half_width, half_height, -half_height, 0.5f, 0.5f);
     sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_NONE, 0, 0, 0, 0);
     sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
@@ -3204,7 +3203,7 @@ void RasterizerGXM::DrawClearQuad(Surface& surface) {
     sceGxmSetFragmentProgram(context, blit->fragment_program);
     const u8* quad = static_cast<const u8*>(blit->quad.Data());
     sceGxmSetVertexStream(context, 0, quad);
-    const float half_width = static_cast<float>(surface.width * surface.scale) * 0.5f;
+    const float half_width = static_cast<float>(Phys(surface.width, surface.scale)) * 0.5f;
     for (u32 i = 0; i < count; i++) {
         const Surface::PendingClear& clear = surface.clears[i];
         u8* texel = static_cast<u8*>(clear_texels.Data()) + (clear_texel_next % 256) * 16;
@@ -3217,9 +3216,9 @@ void RasterizerGXM::DrawClearQuad(Surface& surface) {
         sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
         sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
         // El quad (de -1 a 1) cubre justo las filas de la franja.
-        const float half_rows = static_cast<float>(clear.rows * surface.scale) * 0.5f;
+        const float half_rows = static_cast<float>(Phys(clear.rows, surface.scale)) * 0.5f;
         sceGxmSetViewport(context, half_width, half_width,
-                          static_cast<float>(clear.first_row * surface.scale) + half_rows,
+                          static_cast<float>(Phys(clear.first_row, surface.scale)) + half_rows,
                           -half_rows, 0.5f, 0.5f);
         sceGxmSetFragmentTexture(context, blit->texture_unit, &texture);
         sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
@@ -3255,15 +3254,15 @@ void RasterizerGXM::ApplyClearOnCpu(Surface& surface) {
     u8* const base = static_cast<u8*>(surface.color_buffer.Data());
     const u32 stride = surface.color_stride * surface.rt_bpp;
     alignas(16) u8 row[2048 * 4];
-    const u32 width = std::min<u32>(surface.width * surface.scale, 2048);
-    const u32 height = surface.height * surface.scale;
+    const u32 width = std::min<u32>(Phys(surface.width, surface.scale), 2048);
+    const u32 height = Phys(surface.height, surface.scale);
     for (u32 i = 0; i < count; i++) {
         const Surface::PendingClear& clear = surface.clears[i];
         for (u32 x = 0; x < width; x++) {
             std::memcpy(row + x * surface.rt_bpp, &clear.texel, surface.rt_bpp);
         }
-        const u32 last = (clear.first_row + clear.rows) * surface.scale;
-        for (u32 y = clear.first_row * surface.scale; y < last && y < height; y++) {
+        const u32 last = Phys(clear.first_row + clear.rows, surface.scale);
+        for (u32 y = Phys(clear.first_row, surface.scale); y < last && y < height; y++) {
             std::memcpy(base + static_cast<std::size_t>(y) * stride, row, width * surface.rt_bpp);
         }
     }
@@ -3674,9 +3673,12 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
      * CurrentSurface devolvia nulo en TODOS los lotes sin decir nada. Ese es el
      * muro que dejo tg a 0 en 0.1.0.11 y 0.1.0.12.
      */
-    const u32 scale = resolution_scale.load(std::memory_order_relaxed) == 2 ? 2u : 1u;
-    const u32 phys_width = width * scale;
-    const u32 phys_height = height * scale;
+    u32 scale = resolution_scale.load(std::memory_order_relaxed);
+    if (scale != 1 && scale != 4) {
+        scale = 2;
+    }
+    const u32 phys_width = Phys(width, scale);
+    const u32 phys_height = Phys(height, scale);
     const u32 color_stride = (phys_width + 7) & ~7u;
     const u32 depth_stride = (phys_width + SCE_GXM_TILE_SIZEX - 1) & ~(SCE_GXM_TILE_SIZEX - 1);
     const u32 tiled_height = (phys_height + SCE_GXM_TILE_SIZEY - 1) & ~(SCE_GXM_TILE_SIZEY - 1);
@@ -4317,7 +4319,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
      * el dialogo de error de NSMB2 se comia las primeras letras de cada linea.
      */
     const float guest_height = static_cast<float>(surface->height);
-    const float scale = static_cast<float>(surface->scale);
+    const float scale = static_cast<float>(surface->scale) * 0.5f;
     sceGxmSetViewport(context, (halfsize_x + corner_x) * scale, halfsize_x * scale,
                       (guest_height - halfsize_y - corner_y) * scale, -halfsize_y * scale,
                       depth_offset, depth_scale);
@@ -4335,13 +4337,14 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
      * la escena, para que el presentador no herede el recorte de un juego.
      */
     RegionClip clip = MakeRegionClip(rasterizer, surface->width, surface->height);
-    if (surface->scale != 1 && (clip.mode == SCE_GXM_REGION_CLIP_OUTSIDE ||
+    if (surface->scale != 2 && (clip.mode == SCE_GXM_REGION_CLIP_OUTSIDE ||
                                 clip.mode == SCE_GXM_REGION_CLIP_INSIDE)) {
         // La caja es de pixeles del invitado, con los dos extremos dentro.
-        clip.x_min *= surface->scale;
-        clip.y_min *= surface->scale;
-        clip.x_max = clip.x_max * surface->scale + surface->scale - 1;
-        clip.y_max = clip.y_max * surface->scale + surface->scale - 1;
+        const u32 s = surface->scale;
+        clip.x_min = Phys(clip.x_min, s);
+        clip.y_min = Phys(clip.y_min, s);
+        clip.x_max = std::max(Phys(clip.x_max + 1, s), clip.x_min + 1) - 1;
+        clip.y_max = std::max(Phys(clip.y_max + 1, s), clip.y_min + 1) - 1;
     }
     sceGxmSetRegionClip(context, clip.mode, clip.x_min, clip.y_min, clip.x_max, clip.y_max);
 
