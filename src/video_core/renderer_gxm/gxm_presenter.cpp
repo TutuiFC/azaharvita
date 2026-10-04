@@ -378,8 +378,13 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
                     screen.height = 0;
                     screen.stride = 0;
                 } else {
-                    sceGxmTextureSetMinFilter(&screen.texture, SCE_GXM_TEXTURE_FILTER_POINT);
-                    sceGxmTextureSetMagFilter(&screen.texture, SCE_GXM_TEXTURE_FILTER_POINT);
+                    // Escalada (resolucion x2): lineal, o al reducirla al
+                    // tamano de la pantalla se perderian filas enteras.
+                    const SceGxmTextureFilter filter = direct.scale > 1
+                                                           ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                                                           : SCE_GXM_TEXTURE_FILTER_POINT;
+                    sceGxmTextureSetMinFilter(&screen.texture, filter);
+                    sceGxmTextureSetMagFilter(&screen.texture, filter);
                     sceGxmTextureSetUAddrMode(&screen.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
                     sceGxmTextureSetVAddrMode(&screen.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
                     screen.width = direct.width;
@@ -405,8 +410,11 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
                     static_cast<SceGxmTextureFormat>(direct.gxm_texture_format), direct.width,
                     direct.height, direct.stride_bytes);
                 if (rc >= 0) {
-                    sceGxmTextureSetMinFilter(&screen.texture, SCE_GXM_TEXTURE_FILTER_POINT);
-                    sceGxmTextureSetMagFilter(&screen.texture, SCE_GXM_TEXTURE_FILTER_POINT);
+                    const SceGxmTextureFilter filter = direct.scale > 1
+                                                           ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                                                           : SCE_GXM_TEXTURE_FILTER_POINT;
+                    sceGxmTextureSetMinFilter(&screen.texture, filter);
+                    sceGxmTextureSetMagFilter(&screen.texture, filter);
                     sceGxmTextureSetUAddrMode(&screen.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
                     sceGxmTextureSetVAddrMode(&screen.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
                     return Source::Texture;

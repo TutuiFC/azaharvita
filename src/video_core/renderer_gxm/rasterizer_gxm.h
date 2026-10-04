@@ -157,6 +157,15 @@ public:
 
     /// Interruptor del menu ("Copia de pantalla en GPU"). Encendido.
     static std::atomic<u32> transfer_on_gpu;
+    /**
+     * Resolucion de dibujado en la GPU, 1 o 2 (0.2.0.3, ajuste "Resolucion
+     * GPU"). Con 2 las superficies tienen el doble de pixeles en cada eje: la
+     * GPU de la Vita dibuja a 800x480 lo que el 3DS a 400x240 y el presentador
+     * muestra esa imagen. La memoria del invitado sigue a 1x (se reduce al
+     * volcar y se amplia al recargar), asi que el juego no nota nada. Se lee
+     * al crear cada superficie.
+     */
+    static std::atomic<u32> resolution_scale;
     /// Copias hechas asi y copias que hubo que hacer de verdad despues (overlay).
     static std::atomic<u32> gpu_transfers;
     static std::atomic<u32> transfer_materialized;
@@ -313,6 +322,8 @@ public:
         u32 stride_bytes = 0;
         /// Formato GXM de la superficie de color (no el del invitado).
         u32 gxm_texture_format = 0;
+        /// Pixeles por pixel del invitado (resolution_scale).
+        u32 scale = 1;
     };
 
     /**
@@ -355,7 +366,8 @@ private:
     bool EnsureBlitProgram();
     /// La copia de esa pantalla, con su render target, creada o rehecha si
     /// hace falta. nullptr si no hay memoria.
-    ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format, u32 bpp);
+    ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format, u32 bpp,
+                              u32 scale);
     /// El quad de la superficie a la copia, en una escena suya.
     bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip);
     /// Rellenos pendientes (ver AccelerateFill): el quad del color dentro de la
@@ -365,6 +377,8 @@ private:
     void ApplyClearOnCpu(Surface& surface);
     /// Texeles de 1x1 con el color de cada relleno, en anillo.
     Allocation clear_texels;
+    /// La imagen a 1x de una superficie escalada, al volcarla o recargarla.
+    std::vector<u8> scale_scratch;
     u32 clear_texel_next = 0;
     /// La direccion es una de las pantallas que el juego ha configurado.
     bool IsDisplayFramebuffer(PAddr addr);
