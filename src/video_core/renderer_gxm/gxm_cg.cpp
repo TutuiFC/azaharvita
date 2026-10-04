@@ -24,6 +24,7 @@
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/vita_diag.h"
+#include "video_core/gpu.h"
 
 /// Tamano del heap de libc, definido en citra_vita/main.cpp (AZAHAR_HEAP_MB).
 extern unsigned int _newlib_heap_size_user;
@@ -872,8 +873,23 @@ std::deque<std::shared_ptr<CgJob>> g_jobs;
 bool g_worker_started = false;
 
 void* CgWorkerMain(void*) {
-    // En los nucleos 1 y 2, con los otros ayudantes: el 0 es el de la emulacion.
-    Common::VitaPinThreadToUserCore(1, "compilador de shaders");
+    unsigned int pinned_core = ~0u;
+    /**
+     * Un punto menos de prioridad (0.2.0.0). Compilar un shader son segundos de
+     * CPU sin soltar el nucleo, y en el mismo nucleo hay un ayudante del
+     * sombreado de vertices y otro del rasterizador por software a los que se
+     * espera en cada lote que los usa. Con la misma prioridad, si el
+     * planificador no reparte entre iguales, esperarian a que acabase la
+     * compilacion entera; asi la interrumpen.
+     */
+    {
+        const int priority = sceKernelGetThreadCurrentPriority();
+        const int rc = sceKernelChangeThreadPriority(sceKernelGetThreadId(), priority + 1);
+        Common::VitaNote("compilador de shaders",
+                         fmt::format("prioridad {} -> {} ({:#x})", priority, priority + 1,
+                                     static_cast<unsigned int>(rc))
+                             .c_str());
+    }
     while (true) {
         std::shared_ptr<CgJob> job;
         {
@@ -881,6 +897,16 @@ void* CgWorkerMain(void*) {
             g_jobs_ready.wait(lock, [] { return !g_jobs.empty(); });
             job = std::move(g_jobs.front());
             g_jobs.pop_front();
+        }
+        // En los nucleos 1 y 2, con los otros ayudantes: el 0 es el de la
+        // emulacion. Con la GPU en otro nucleo el 1 es suyo y este va al 2
+        // (0.2.0.0). Se mira en cada trabajo: el hilo sigue vivo de un juego al
+        // siguiente, y el ajuste puede cambiar entre los dos.
+        const unsigned int core =
+            VideoCore::GPU::async_enabled.load(std::memory_order_relaxed) ? 2u : 1u;
+        if (core != pinned_core) {
+            pinned_core = core;
+            Common::VitaPinThreadToUserCore(core, "compilador de shaders");
         }
         for (std::size_t i = 0; i < job->sources.size(); i++) {
             // Los de vertices dejan de pedirse con el compilador roto; los de
