@@ -14,6 +14,7 @@
 #include <nihstro/shader_bytecode.h>
 #include <psp2/kernel/sysmem.h>
 #include "common/vita_diag.h"
+#include "common/vita_vm.h"
 #include "video_core/pica/shader_setup.h"
 #include "video_core/pica/shader_unit.h"
 #include "video_core/shader/shader_interpreter_fast.h"
@@ -493,6 +494,8 @@ void CompileRuns(Program& program) {
     if (!g_neon_jit.load(std::memory_order_relaxed) || !EnsureMemory()) {
         return;
     }
+    // El dominio VM es de todo el proceso: ver Common::vita_vm_domain_mutex.
+    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
     if (sceKernelOpenVMDomain() < 0) {
         return;
     }
@@ -575,6 +578,7 @@ void CompileWhole(Program& program, const ProgramCode& code) {
         }
     }
 
+    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
     if (sceKernelOpenVMDomain() < 0) {
         return;
     }
