@@ -2012,6 +2012,93 @@ public:
     }
 };
 
+namespace {
+/**
+ * Registros que NO deciden el programa de fragmentos ni el de vertices de un
+ * lote (ver BatchMemo): datos que se leen otra vez en cada lote (viewport,
+ * recorte, colores constantes, direcciones y tamanos de textura, niebla, luces,
+ * tablas, punteros de vertices e indices, uniforms de coma flotante) y
+ * registros de disparo. Comprobado contra lo que leen FSConfig, BuildBlend,
+ * PicaVSConfig y la disposicion de atributos. Escribirlos no invalida nada.
+ */
+constexpr u16 kMemoIgnoredRegs[] = {
+    // Rasterizador: cara oculta, viewport, profundidad, caja de recorte.
+    0x040, 0x041, 0x042, 0x043, 0x044, 0x04D, 0x04E, 0x066, 0x067, 0x068,
+    // Unidades de textura: borde, tamano, LOD, direcciones y formato.
+    0x081, 0x082, 0x084, 0x085, 0x086, 0x087, 0x088, 0x089, 0x08A, 0x08E, 0x091, 0x092, 0x094,
+    0x095, 0x096, 0x099, 0x09A, 0x09C, 0x09D, 0x09E,
+    // Colores constantes del combinador, su buffer, la niebla y su tabla.
+    0x0C3, 0x0CB, 0x0D3, 0x0DB, 0x0F3, 0x0FB, 0x0FD, 0x0E1, 0x0E6, 0x0E8, 0x0E9, 0x0EA, 0x0EB,
+    0x0EC, 0x0ED, 0x0EE, 0x0EF,
+    // Plantilla, disparos y buffers del framebuffer.
+    0x105, 0x106, 0x110, 0x111, 0x112, 0x113, 0x114, 0x115, 0x116, 0x117, 0x11C, 0x11D, 0x11E,
+    // Luz ambiente global, indice y datos de las tablas de luz.
+    0x1C0, 0x1C5, 0x1C8, 0x1C9, 0x1CA, 0x1CB, 0x1CC, 0x1CD, 0x1CE, 0x1CF,
+    // Vertices: base, desplazamiento de cada cargador, indices, cuantos,
+    // disparos, atributo fijo, buffers de comandos, modo, topologia.
+    0x200, 0x203, 0x206, 0x209, 0x20C, 0x20F, 0x212, 0x215, 0x218, 0x21B, 0x21E, 0x221, 0x224,
+    0x227, 0x228, 0x22A, 0x22E, 0x22F, 0x232, 0x233, 0x234, 0x235, 0x238, 0x239, 0x23A, 0x23B,
+    0x23C, 0x23D, 0x245, 0x25E, 0x25F,
+    // Uniforms de coma flotante del shader de vertices.
+    0x2C0, 0x2C1, 0x2C2, 0x2C3, 0x2C4, 0x2C5, 0x2C6, 0x2C7, 0x2C8,
+};
+
+constexpr std::array<u64, 12> MemoMask(u32 first, u32 end) {
+    std::array<u64, 12> mask{};
+    for (u32 reg = first; reg < end; reg++) {
+        // Los datos de cada luz (colores, posicion, foco, atenuacion): todo
+        // menos su palabra de configuracion, la novena.
+        bool ignored = reg >= 0x140 && reg < 0x1C0 && (reg & 0xF) != 9;
+        for (const u16 skip : kMemoIgnoredRegs) {
+            ignored = ignored || skip == reg;
+        }
+        if (!ignored) {
+            mask[reg >> 6] |= 1ull << (reg & 63);
+        }
+    }
+    return mask;
+}
+
+/// Deciden el programa de fragmentos (y parte del de vertices: salidas y luz).
+constexpr std::array<u64, 12> kFsMemoMask = MemoMask(0x040, 0x200);
+/// Deciden el resto del de vertices: atributos, programa y geometria.
+constexpr std::array<u64, 12> kVsMemoMask = MemoMask(0x200, 0x300);
+
+constexpr std::array<u64, 12> RegListMask(std::initializer_list<u16> regs) {
+    std::array<u64, 12> mask{};
+    for (const u16 reg : regs) {
+        mask[reg >> 6] |= 1ull << (reg & 63);
+    }
+    return mask;
+}
+
+constexpr std::array<u64, 12> RegRangeMask(u32 first, u32 end) {
+    std::array<u64, 12> mask{};
+    for (u32 reg = first; reg < end; reg++) {
+        mask[reg >> 6] |= 1ull << (reg & 63);
+    }
+    return mask;
+}
+
+/// Las ocho luces y la ambiente global (uniforms de fragmentos ya convertidos).
+constexpr std::array<u64, 12> kLightsMask = RegRangeMask(0x140, 0x1C1);
+/// La tabla de niebla: su indice y sus datos.
+constexpr std::array<u64, 12> kFogLutMask =
+    RegListMask({0x0E6, 0x0E8, 0x0E9, 0x0EA, 0x0EB, 0x0EC, 0x0ED, 0x0EE, 0x0EF});
+/// Los colores constantes de las seis etapas del combinador.
+constexpr std::array<u64, 12> kConstColorMask =
+    RegListMask({0x0C3, 0x0CB, 0x0D3, 0x0DB, 0x0F3, 0x0FB});
+
+bool AnyDirty(const Pica::DirtyRegs& dirty, const std::array<u64, 12>& mask) {
+    for (u32 i = 0; i < mask.size(); i++) {
+        if ((dirty.qwords[i] & mask[i]) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+} // Anonymous namespace
+
 /**
  * LO QUE DECIDIO EL LOTE ANTERIOR (0.2.1.0). Buscar el programa de fragmentos
  * (construir FSConfig, la mezcla, su hash y el mapa) y el de vertices
@@ -2060,11 +2147,32 @@ struct RasterizerGXM::BatchMemo {
     const PipelineCache::Entry* pipeline = nullptr;
     bool vs_valid = false;
     VertexLayout layout;
+
+    /**
+     * Uniforms de fragmentos ya pasados a float (0.2.1.0): las ocho luces, la
+     * tabla de niebla y los colores constantes del combinador. Convertirlos
+     * eran cientos de divisiones en coma flotante por lote (cada luz en cada
+     * lote iluminado, las 128 entradas de la niebla en cada lote con niebla);
+     * ahora solo despues de que se escriban sus registros.
+     */
+    bool lights_dirty = true;
+    bool fog_dirty = true;
+    bool colors_dirty = true;
+    std::array<f32, 32> specular_0{};
+    std::array<f32, 32> specular_1{};
+    std::array<f32, 32> diffuse{};
+    std::array<f32, 32> ambient{};
+    std::array<f32, 32> position{};
+    std::array<f32, 32> spot_direction{};
+    std::array<f32, 32> dist_atten{};
+    std::array<f32, 4> global_ambient{};
+    std::array<f32, 256> fog_lut{};
+    std::array<f32, 24> const_colors{};
 };
 
 RasterizerGXM::RasterizerGXM(VideoCore::RasterizerInterface& software_, Memory::MemorySystem& memory_,
                              Pica::PicaCore& pica_)
-    : software{software_}, memory{memory_}, pica{pica_} {
+    : software{software_}, memory{memory_}, pica{pica_}, batch_memo{std::make_unique<BatchMemo>()} {
     s_instance = this;
 }
 
@@ -2235,7 +2343,6 @@ bool RasterizerGXM::EnsureInitialized() {
     }
     textures = std::make_unique<TextureCache>();
     hw_shaders = std::make_unique<HwShaderCache>(patcher);
-    batch_memo = std::make_unique<BatchMemo>();
     available = true;
     status = "gxm";
     Common::VitaNote("gxm init", "rasterizador listo");
@@ -4535,17 +4642,26 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
     // y se saltan; los samplers quedan para cuando exista el cache de texturas.
     void* uniform_buffer = nullptr;
     if (sceGxmReserveFragmentDefaultUniformBuffer(context, &uniform_buffer) == 0) {
+        /**
+         * Los ya convertidos de BatchMemo, rehechos si se han escrito sus
+         * registros: desde el lote anterior (los apunto AccelerateDrawBatch) o
+         * desde entonces (los dirty_regs que siguen puestos).
+         */
+        BatchMemo& memo = *batch_memo;
         if (pipeline->const_color != nullptr) {
-            f32 colors[6 * 4];
-            const auto tev_stages = pica.regs.internal.texturing.GetTevStages();
-            for (u32 i = 0; i < 6; i++) {
-                const u32 raw = tev_stages[i].const_color;
-                colors[i * 4 + 0] = static_cast<f32>((raw >> 0) & 0xFF) / 255.0f;
-                colors[i * 4 + 1] = static_cast<f32>((raw >> 8) & 0xFF) / 255.0f;
-                colors[i * 4 + 2] = static_cast<f32>((raw >> 16) & 0xFF) / 255.0f;
-                colors[i * 4 + 3] = static_cast<f32>((raw >> 24) & 0xFF) / 255.0f;
+            if (memo.colors_dirty || AnyDirty(pica.dirty_regs, kConstColorMask)) {
+                const auto tev_stages = pica.regs.internal.texturing.GetTevStages();
+                for (u32 i = 0; i < 6; i++) {
+                    const u32 raw = tev_stages[i].const_color;
+                    memo.const_colors[i * 4 + 0] = static_cast<f32>((raw >> 0) & 0xFF) / 255.0f;
+                    memo.const_colors[i * 4 + 1] = static_cast<f32>((raw >> 8) & 0xFF) / 255.0f;
+                    memo.const_colors[i * 4 + 2] = static_cast<f32>((raw >> 16) & 0xFF) / 255.0f;
+                    memo.const_colors[i * 4 + 3] = static_cast<f32>((raw >> 24) & 0xFF) / 255.0f;
+                }
+                memo.colors_dirty = false;
             }
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->const_color, 0, 24, colors);
+            sceGxmSetUniformDataF(uniform_buffer, pipeline->const_color, 0, 24,
+                                  memo.const_colors.data());
         }
         if (pipeline->combiner_buffer_color != nullptr) {
             const auto raw = pica.regs.internal.texturing.tev_combiner_buffer_color;
@@ -4564,13 +4680,15 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         if (pipeline->fog_lut != nullptr) {
             // 128 entradas de dos floats: valor y pendiente (misma LUT que usa
             // el rasterizador de software, leida como 16 bits sin signo).
-            f32 lut[256];
-            for (u32 i = 0; i < 128; i++) {
-                const u32 raw = pica.fog.lut[i].raw;
-                lut[i * 2] = static_cast<f32>(raw & 0xFFFF) / 65535.0f;
-                lut[i * 2 + 1] = static_cast<f32>(raw >> 16) / 65535.0f;
+            if (memo.fog_dirty || AnyDirty(pica.dirty_regs, kFogLutMask)) {
+                for (u32 i = 0; i < 128; i++) {
+                    const u32 raw = pica.fog.lut[i].raw;
+                    memo.fog_lut[i * 2] = static_cast<f32>(raw & 0xFFFF) / 65535.0f;
+                    memo.fog_lut[i * 2 + 1] = static_cast<f32>(raw >> 16) / 65535.0f;
+                }
+                memo.fog_dirty = false;
             }
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->fog_lut, 0, 256, lut);
+            sceGxmSetUniformDataF(uniform_buffer, pipeline->fog_lut, 0, 256, memo.fog_lut.data());
         }
         if (pipeline->fog_color != nullptr) {
             const auto& fog = pica.regs.internal.texturing.fog_color;
@@ -4616,13 +4734,6 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
              * mismo (ver WriteUniforms en cg_fs_shader_gen.cpp).
              */
             const auto& lighting_regs = pica.regs.internal.lighting;
-            f32 specular_0[32]{};
-            f32 specular_1[32]{};
-            f32 diffuse[32]{};
-            f32 ambient[32]{};
-            f32 position[32]{};
-            f32 spot_direction[32]{};
-            f32 dist_atten[32]{};
             const auto put_color = [](const Pica::LightingRegs::LightColor& color, f32* out) {
                 // Diez bits por canal, pero 255 ya es 1.0 (el hardware deja
                 // pasar valores por encima de uno a proposito).
@@ -4631,41 +4742,46 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                 out[2] = static_cast<f32>(color.b) / 255.0f;
                 out[3] = 0.0f;
             };
-            for (u32 i = 0; i < 8; i++) {
-                const auto& light = lighting_regs.light[i];
-                put_color(light.specular_0, specular_0 + i * 4);
-                put_color(light.specular_1, specular_1 + i * 4);
-                put_color(light.diffuse, diffuse + i * 4);
-                put_color(light.ambient, ambient + i * 4);
-                // La posicion son tres medios flotantes de 16 bits.
-                position[i * 4 + 0] = Pica::f16::FromRaw(light.x).ToFloat32();
-                position[i * 4 + 1] = Pica::f16::FromRaw(light.y).ToFloat32();
-                position[i * 4 + 2] = Pica::f16::FromRaw(light.z).ToFloat32();
-                // La direccion del foco va en fijo 1.1.11 (de ahi el 2047).
-                spot_direction[i * 4 + 0] = static_cast<f32>(light.spot_x) / 2047.0f;
-                spot_direction[i * 4 + 1] = static_cast<f32>(light.spot_y) / 2047.0f;
-                spot_direction[i * 4 + 2] = static_cast<f32>(light.spot_z) / 2047.0f;
-                // x sesgo, y escala: el mismo orden que espera el shader.
-                dist_atten[i * 4 + 0] = Pica::f20::FromRaw(light.dist_atten_bias).ToFloat32();
-                dist_atten[i * 4 + 1] = Pica::f20::FromRaw(light.dist_atten_scale).ToFloat32();
+            if (memo.lights_dirty || AnyDirty(pica.dirty_regs, kLightsMask)) {
+                for (u32 i = 0; i < 8; i++) {
+                    const auto& light = lighting_regs.light[i];
+                    put_color(light.specular_0, memo.specular_0.data() + i * 4);
+                    put_color(light.specular_1, memo.specular_1.data() + i * 4);
+                    put_color(light.diffuse, memo.diffuse.data() + i * 4);
+                    put_color(light.ambient, memo.ambient.data() + i * 4);
+                    // La posicion son tres medios flotantes de 16 bits.
+                    memo.position[i * 4 + 0] = Pica::f16::FromRaw(light.x).ToFloat32();
+                    memo.position[i * 4 + 1] = Pica::f16::FromRaw(light.y).ToFloat32();
+                    memo.position[i * 4 + 2] = Pica::f16::FromRaw(light.z).ToFloat32();
+                    // La direccion del foco va en fijo 1.1.11 (de ahi el 2047).
+                    memo.spot_direction[i * 4 + 0] = static_cast<f32>(light.spot_x) / 2047.0f;
+                    memo.spot_direction[i * 4 + 1] = static_cast<f32>(light.spot_y) / 2047.0f;
+                    memo.spot_direction[i * 4 + 2] = static_cast<f32>(light.spot_z) / 2047.0f;
+                    // x sesgo, y escala: el mismo orden que espera el shader.
+                    memo.dist_atten[i * 4 + 0] =
+                        Pica::f20::FromRaw(light.dist_atten_bias).ToFloat32();
+                    memo.dist_atten[i * 4 + 1] =
+                        Pica::f20::FromRaw(light.dist_atten_scale).ToFloat32();
+                }
+                put_color(lighting_regs.global_ambient, memo.global_ambient.data());
+                memo.lights_dirty = false;
             }
-            const auto put = [&](const SceGxmProgramParameter* param, const f32* values) {
+            const auto put = [&](const SceGxmProgramParameter* param,
+                                 const std::array<f32, 32>& values) {
                 if (param != nullptr) {
-                    sceGxmSetUniformDataF(uniform_buffer, param, 0, 32, values);
+                    sceGxmSetUniformDataF(uniform_buffer, param, 0, 32, values.data());
                 }
             };
-            put(pipeline->light_specular_0, specular_0);
-            put(pipeline->light_specular_1, specular_1);
-            put(pipeline->light_diffuse, diffuse);
-            put(pipeline->light_ambient, ambient);
-            put(pipeline->light_position, position);
-            put(pipeline->light_spot_direction, spot_direction);
-            put(pipeline->light_dist_atten, dist_atten);
+            put(pipeline->light_specular_0, memo.specular_0);
+            put(pipeline->light_specular_1, memo.specular_1);
+            put(pipeline->light_diffuse, memo.diffuse);
+            put(pipeline->light_ambient, memo.ambient);
+            put(pipeline->light_position, memo.position);
+            put(pipeline->light_spot_direction, memo.spot_direction);
+            put(pipeline->light_dist_atten, memo.dist_atten);
             if (pipeline->lighting_global_ambient != nullptr) {
-                f32 global[4]{};
-                put_color(lighting_regs.global_ambient, global);
                 sceGxmSetUniformDataF(uniform_buffer, pipeline->lighting_global_ambient, 0, 4,
-                                      global);
+                                      memo.global_ambient.data());
             }
         }
     }
@@ -4847,59 +4963,6 @@ void RasterizerGXM::ClearAll(bool flush) {
  * forma de saber por que 'vsg' se quedaba en 12 de 177 lotes. Los motivos son
  * siempre literales de texto, que viven lo que el programa.
  */
-namespace {
-/**
- * Registros que NO deciden el programa de fragmentos ni el de vertices de un
- * lote (ver BatchMemo): datos que se leen otra vez en cada lote (viewport,
- * recorte, colores constantes, direcciones y tamanos de textura, niebla, luces,
- * tablas, punteros de vertices e indices, uniforms de coma flotante) y
- * registros de disparo. Comprobado contra lo que leen FSConfig, BuildBlend,
- * PicaVSConfig y la disposicion de atributos. Escribirlos no invalida nada.
- */
-constexpr u16 kMemoIgnoredRegs[] = {
-    // Rasterizador: cara oculta, viewport, profundidad, caja de recorte.
-    0x040, 0x041, 0x042, 0x043, 0x044, 0x04D, 0x04E, 0x066, 0x067, 0x068,
-    // Unidades de textura: borde, tamano, LOD, direcciones y formato.
-    0x081, 0x082, 0x084, 0x085, 0x086, 0x087, 0x088, 0x089, 0x08A, 0x08E, 0x091, 0x092, 0x094,
-    0x095, 0x096, 0x099, 0x09A, 0x09C, 0x09D, 0x09E,
-    // Colores constantes del combinador, su buffer, la niebla y su tabla.
-    0x0C3, 0x0CB, 0x0D3, 0x0DB, 0x0F3, 0x0FB, 0x0FD, 0x0E1, 0x0E6, 0x0E8, 0x0E9, 0x0EA, 0x0EB,
-    0x0EC, 0x0ED, 0x0EE, 0x0EF,
-    // Plantilla, disparos y buffers del framebuffer.
-    0x105, 0x106, 0x110, 0x111, 0x112, 0x113, 0x114, 0x115, 0x116, 0x117, 0x11C, 0x11D, 0x11E,
-    // Luz ambiente global, indice y datos de las tablas de luz.
-    0x1C0, 0x1C5, 0x1C8, 0x1C9, 0x1CA, 0x1CB, 0x1CC, 0x1CD, 0x1CE, 0x1CF,
-    // Vertices: base, desplazamiento de cada cargador, indices, cuantos,
-    // disparos, atributo fijo, buffers de comandos, modo, topologia.
-    0x200, 0x203, 0x206, 0x209, 0x20C, 0x20F, 0x212, 0x215, 0x218, 0x21B, 0x21E, 0x221, 0x224,
-    0x227, 0x228, 0x22A, 0x22E, 0x22F, 0x232, 0x233, 0x234, 0x235, 0x238, 0x239, 0x23A, 0x23B,
-    0x23C, 0x23D, 0x245, 0x25E, 0x25F,
-    // Uniforms de coma flotante del shader de vertices.
-    0x2C0, 0x2C1, 0x2C2, 0x2C3, 0x2C4, 0x2C5, 0x2C6, 0x2C7, 0x2C8,
-};
-
-constexpr std::array<u64, 12> MemoMask(u32 first, u32 end) {
-    std::array<u64, 12> mask{};
-    for (u32 reg = first; reg < end; reg++) {
-        // Los datos de cada luz (colores, posicion, foco, atenuacion): todo
-        // menos su palabra de configuracion, la novena.
-        bool ignored = reg >= 0x140 && reg < 0x1C0 && (reg & 0xF) != 9;
-        for (const u16 skip : kMemoIgnoredRegs) {
-            ignored = ignored || skip == reg;
-        }
-        if (!ignored) {
-            mask[reg >> 6] |= 1ull << (reg & 63);
-        }
-    }
-    return mask;
-}
-
-/// Deciden el programa de fragmentos (y parte del de vertices: salidas y luz).
-constexpr std::array<u64, 12> kFsMemoMask = MemoMask(0x040, 0x200);
-/// Deciden el resto del de vertices: atributos, programa y geometria.
-constexpr std::array<u64, 12> kVsMemoMask = MemoMask(0x200, 0x300);
-} // Anonymous namespace
-
 static bool HwVsReject(const char* why) {
     RasterizerGXM::hw_vs_last_reject.store(why, std::memory_order_relaxed);
     RasterizerGXM::hw_vs_rejects.fetch_add(1, std::memory_order_relaxed);
@@ -5058,6 +5121,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         if (fs_dirty || vs_dirty) {
             memo.vs_valid = false;
         }
+        memo.lights_dirty = memo.lights_dirty || AnyDirty(pica.dirty_regs, kLightsMask);
+        memo.fog_dirty = memo.fog_dirty || AnyDirty(pica.dirty_regs, kFogLutMask);
+        memo.colors_dirty = memo.colors_dirty || AnyDirty(pica.dirty_regs, kConstColorMask);
         pica.dirty_regs.Reset();
     }
     const char* fs_reason = nullptr;
