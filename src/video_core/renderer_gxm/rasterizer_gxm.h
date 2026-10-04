@@ -314,6 +314,16 @@ public:
     static std::atomic<u32> specialize_vs;
 
     /**
+     * SHADERS DE VERTICES ASINCRONOS (0.2.1.1). Mientras el shader de vertices
+     * de un lote se compila (segundos en esta consola, y en una escena 3D nueva
+     * son decenas), el lote se salta, como ya pasaba con los de fragmentos. Lo
+     * de antes era sombrearlo en la CPU: en Pokemon Sol, ~25 us por vertice,
+     * 3 FPS hasta que acababan de compilar. A cambio, lo que use ese shader
+     * aparece un poco despues. Se guarda en ajustes.txt.
+     */
+    static std::atomic<u32> async_vs;
+
+    /**
      * Lo que el presentador necesita para dibujar una pantalla desde la
      * superficie de la GPU sin copiar. data == nullptr: no hay (usa el
      * camino normal).
@@ -412,9 +422,9 @@ private:
                         const SceGxmVertexProgram* vertex_program,
                         const SceGxmFragmentProgram* fragment_program);
 
-    /// Hueco de 'bytes' (alineado a 16) en el buffer de vertices de la escena.
-    /// Si no cabe, cierra la escena y empieza de cero. nullptr si no cabe ni
-    /// en un buffer vacio o no hay memoria.
+    /// Hueco de 'bytes' (alineado a 16) en el anillo de vertices. Espera solo
+    /// si la GPU puede estar leyendo ese tramo (ver el .cpp). nullptr si no
+    /// hay memoria.
     u8* ReserveVertexSpace(u32 bytes);
 
     /// La ablacion activa manda este estado a la CPU (ver Ablation).
@@ -579,6 +589,9 @@ private:
     /// La valla de la ultima escena que leyo cada version (0.1.9.4).
     std::array<u32, kLutVersions> lut_fence{};
     Allocation lighting_lut_buffer;
+    /// Las 24 tablas ya convertidas, en memoria normal (0.2.1.1): ver
+    /// UpdateLightingLut.
+    std::vector<f32> lighting_lut_shadow;
     std::array<SceGxmTexture, kLutVersions> lighting_lut_textures{};
     /// La version que se ata a los dibujados a partir de ahora.
     u32 lighting_lut_version = 0;
@@ -601,9 +614,14 @@ private:
     Allocation vertex_buffer;
     Allocation index_buffer;
     /// Bytes ya repartidos del buffer de vertices. Desde 0.1.9.4 es un anillo:
-    /// no vuelve a cero al cerrar la escena, solo al llegar al final, y ahi se
-    /// espera a la GPU entera (una vez cada 4 MB de vertices).
+    /// no vuelve a cero al cerrar la escena, solo al llegar al final.
     u32 vertex_used = 0;
+    /// El anillo, en kVertexSegments tramos (0.2.1.1): la valla de la ultima
+    /// escena que leyo cada uno, y los que tienen datos de la escena abierta.
+    static constexpr u32 kVertexBufferBytes = 8u * 1024u * 1024u;
+    static constexpr u32 kVertexSegments = 8;
+    std::array<u32, kVertexSegments> vertex_segment_fence{};
+    u32 vertex_segments_pending = 0;
     u32 index_capacity = 0;
     /// El lote en curso es de los que se cronometran por fases.
     bool profile_state = false;

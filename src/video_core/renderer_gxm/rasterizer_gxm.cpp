@@ -52,6 +52,7 @@ std::atomic<u32> RasterizerGXM::Ablation::mode{0};
 std::atomic<u32> RasterizerGXM::no_finish_wait{1};
 std::atomic<u32> RasterizerGXM::present_direct{1};
 std::atomic<u32> RasterizerGXM::specialize_vs{1};
+std::atomic<u32> RasterizerGXM::async_vs{1};
 std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
@@ -2388,6 +2389,14 @@ void RasterizerGXM::NoteSkip(u32 index, const char* reason) {
 
 void RasterizerGXM::EndScene() {
     if (open_surface == nullptr) {
+        // Vertices repartidos sin llegar a dibujarse: no los lee nadie, pero
+        // cualquier valla ya enviada sirve para soltarlos.
+        for (u32 segment = 0; segment < kVertexSegments; segment++) {
+            if (((vertex_segments_pending >> segment) & 1u) != 0) {
+                vertex_segment_fence[segment] = fence_sent;
+            }
+        }
+        vertex_segments_pending = 0;
         // Lo retirado sin escena abierta lo pudo leer, como mucho, la ultima
         // escena enviada.
         if (textures != nullptr && textures->HasRetired()) {
@@ -2449,6 +2458,13 @@ void RasterizerGXM::EndScene() {
     if (frame_first_fence == 0) {
         frame_first_fence = fence_sent;
     }
+    // Los tramos del anillo de vertices que ha leido esta escena (0.2.1.1).
+    for (u32 segment = 0; segment < kVertexSegments; segment++) {
+        if (((vertex_segments_pending >> segment) & 1u) != 0) {
+            vertex_segment_fence[segment] = fence_sent;
+        }
+    }
+    vertex_segments_pending = 0;
     // Las versiones de las tablas de luz que ha atado esta escena: la actual
     // si la ha usado, y las retiradas a mitad de escena.
     for (u32 back = lighting_lut_in_scene ? 0 : 1; back <= lighting_lut_retired_in_scene;
@@ -3486,6 +3502,7 @@ bool RasterizerGXM::UpdateLightingLut() {
         lighting_lut_version = 0;
         lighting_lut_retired_in_scene = 0;
         lighting_lut_ready = true;
+        lighting_lut_shadow.assign(static_cast<std::size_t>(kLutCount) * kLutEntries * 2, 0.0f);
         // Recien creada no tiene nada dentro: se suben las 24.
         pica.lighting.lut_dirty = Pica::PicaCore::Lighting::LutAllDirty;
     }
@@ -3494,15 +3511,40 @@ bool RasterizerGXM::UpdateLightingLut() {
         return true;
     }
 
-    const auto write_row = [this](u32 version, u32 index) {
-        auto* data = reinterpret_cast<f32*>(static_cast<u8*>(lighting_lut_buffer.Data()) +
-                                            static_cast<std::size_t>(version) * kLutBytes);
-        const auto& source = pica.lighting.luts[index];
-        f32* row = data + static_cast<std::size_t>(index) * kLutEntries * 2;
-        for (u32 i = 0; i < kLutEntries; i++) {
-            row[i * 2] = source[i].ToFloat();
-            row[i * 2 + 1] = source[i].DiffToFloat();
+    /**
+     * SOLO SE CONVIERTEN LAS QUE CAMBIAN (0.2.1.1). Al estrenar una version
+     * hay que escribirla entera, y antes eso eran las 24 tablas convertidas
+     * otra vez entrada a entrada (12.288 conversiones) aunque el juego hubiera
+     * cambiado una sola, varias veces por fotograma en Pokemon. Ahora las
+     * cambiadas se convierten a lighting_lut_shadow y cada version se copia
+     * de ahi.
+     */
+    {
+        u32 dirty = pica.lighting.lut_dirty;
+        while (dirty != 0) {
+            const u32 index = static_cast<u32>(std::countr_zero(dirty));
+            dirty &= ~(1u << index);
+            const auto& source = pica.lighting.luts[index];
+            f32* row =
+                lighting_lut_shadow.data() + static_cast<std::size_t>(index) * kLutEntries * 2;
+            for (u32 i = 0; i < kLutEntries; i++) {
+                row[i * 2] = source[i].ToFloat();
+                row[i * 2 + 1] = source[i].DiffToFloat();
+            }
         }
+    }
+    constexpr std::size_t kRowBytes = static_cast<std::size_t>(kLutEntries) * 2 * sizeof(f32);
+    const auto version_data = [this](u32 version) {
+        return static_cast<u8*>(lighting_lut_buffer.Data()) +
+               static_cast<std::size_t>(version) * kLutBytes;
+    };
+    const auto write_row = [&](u32 version, u32 index) {
+        std::memcpy(version_data(version) + index * kRowBytes,
+                    reinterpret_cast<const u8*>(lighting_lut_shadow.data()) + index * kRowBytes,
+                    kRowBytes);
+    };
+    const auto write_all = [&](u32 version) {
+        std::memcpy(version_data(version), lighting_lut_shadow.data(), kLutBytes);
     };
 
     /**
@@ -3530,9 +3572,7 @@ bool RasterizerGXM::UpdateLightingLut() {
             lighting_lut_version = (lighting_lut_version + 1) % kLutVersions;
             // Una escena ya enviada puede seguir leyendo esa version.
             WaitFence(lut_fence[lighting_lut_version]);
-            for (u32 index = 0; index < kLutCount; index++) {
-                write_row(lighting_lut_version, index);
-            }
+            write_all(lighting_lut_version);
             pica.lighting.lut_dirty = 0;
             // La version nueva todavia no la ha atado nadie.
             lighting_lut_in_scene = false;
@@ -3551,9 +3591,7 @@ bool RasterizerGXM::UpdateLightingLut() {
         const u32 next = (lighting_lut_version + 1) % kLutVersions;
         if (FenceDone(lut_fence[next])) {
             lighting_lut_version = next;
-            for (u32 index = 0; index < kLutCount; index++) {
-                write_row(lighting_lut_version, index);
-            }
+            write_all(lighting_lut_version);
             pica.lighting.lut_dirty = 0;
             return true;
         }
@@ -4206,46 +4244,19 @@ bool RasterizerGXM::DrawBatchOnGpu() {
      * se reservaba justo eso. Como un fotograma son muchos lotes, se llenaba
      * enseguida, y llenarse es cerrar la escena -- sceGxmFinish, esperar a que
      * la GPU acabe todo lo apuntado -- y volver a cargar color y profundidad
-     * de la superficie en la escena nueva. En la cinematica de Rubi Omega eso
-     * pasaba varias veces por fotograma, dentro de los 90 ms de 'lote'.
-     *
-     * Un fotograma de esa escena son unos 13.000 triangulos iluminados, 39.000
-     * vertices de 84 bytes: ~3,3 MB. Con 4 MB cabe entero y el buffer solo se
-     * llena en escenas excepcionales, donde lo de antes sigue siendo correcto.
+     * de la superficie en la escena nueva. Un fotograma de la cinematica de
+     * Rubi Omega son unos 13.000 triangulos iluminados, 39.000 vertices de 84
+     * bytes: ~3,3 MB. Desde 0.2.1.1 el anillo es el mismo que el de
+     * AccelerateDrawBatch, de 8 MB y por tramos (ver ReserveVertexSpace).
      *
      * En CDRAM porque la GPU lo lee una vez por vertice dibujado y la CPU solo
      * escribe en orden, que la memoria de video admite bien; si no hay sitio,
      * memoria normal, como antes.
      */
-    constexpr u32 kVertexBufferBytes = 4u * 1024u * 1024u;
-    if (!vertex_buffer.Valid() && needed <= kVertexBufferBytes) {
-        EndScene();
-        Allocation buffer = Allocate(Pool::Cdram, kVertexBufferBytes);
-        if (!buffer.Valid()) {
-            buffer = Allocate(Pool::Host, kVertexBufferBytes);
-        }
-        if (buffer.Valid()) {
-            vertex_buffer = std::move(buffer);
-        }
-    }
-    if (vertex_used + needed > vertex_buffer.Size()) {
-        // Lleno: se cierra la escena (que espera a la GPU) y se empieza de cero.
-        // Cambiar de bloque con la escena abierta seria soltarle la memoria
-        // debajo. WaitGpu ademas: con 4.5 la espera puede quedar difirida y la
-        // GPU seguir leyendo el buffer mientras se reutiliza.
-        scene_close_full.fetch_add(1, std::memory_order_relaxed);
-        EndScene();
-        WaitGpu();
-        vertex_used = 0;
-        if (needed > vertex_buffer.Size()) {
-            Allocation buffer = Allocate(Pool::Host, needed);
-            if (!buffer.Valid()) {
-                NoteOnce(fb_noted[10], "gxm draw", "sin memoria para {} bytes de vertices",
-                         needed);
-                return false;
-            }
-            vertex_buffer = std::move(buffer);
-        }
+    u8* const vertex_slice = ReserveVertexSpace(needed);
+    if (vertex_slice == nullptr) {
+        NoteOnce(fb_noted[10], "gxm draw", "sin memoria para {} bytes de vertices", needed);
+        return false;
     }
     if (index_capacity == 0) {
         Allocation buffer = Allocate(Pool::Host, kMaxVerticesPerDraw * sizeof(u16));
@@ -4261,7 +4272,6 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         }
     }
 
-    u8* const vertex_slice = static_cast<u8*>(vertex_buffer.Data()) + vertex_used;
     auto* vertices = reinterpret_cast<float*>(vertex_slice);
 
     /**
@@ -4352,7 +4362,6 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         }
         drawn += chunk;
     }
-    vertex_used += needed;
     surface->dirty = true;
     {
         // Nota unica: con esto, un volcado posterior sabe si la GPU llego a
@@ -4970,33 +4979,68 @@ static bool HwVsReject(const char* why) {
 }
 
 u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
-    // El mismo anillo que usa DrawBatchOnGpu, con la misma regla (ver alli). Aqui se
-    // alinea a 16 porque los flujos de vertices y los indices lo prefieren y
-    // DrawBatchOnGpu deja el contador en multiplos de 4.
-    constexpr u32 kVertexBufferBytes = 4u * 1024u * 1024u;
-    if (!vertex_buffer.Valid()) {
+    /**
+     * EL ANILLO EN TRAMOS (0.2.1.1). Al llegar al final del anillo se cerraba
+     * la escena y se esperaba a la GPU ENTERA antes de volver al principio
+     * (sceGxmFinish): en 3D, con varios MB de vertices por fotograma, la CPU
+     * se paraba a esperar a la GPU cada uno o dos fotogramas, en vez de dejar
+     * que la GPU dibujara el fotograma anterior mientras la CPU prepara el
+     * siguiente. Ahora son 8 MB en ocho tramos, cada uno con la valla de la
+     * ultima escena que lo leyo: al entrar otra vez en un tramo solo se espera
+     * a esa escena, que casi siempre ha terminado hace rato. Solo si la escena
+     * abierta ya tiene datos en el tramo (ha llenado el anillo entero) se cierra
+     * y se espera como antes. Se alinea a 16 porque los flujos de vertices y
+     * los indices lo prefieren.
+     */
+    if (!vertex_buffer.Valid() || bytes > vertex_buffer.Size()) {
+        // Nuevo, o mas grande para un lote enorme: antes, que nadie lea el viejo.
         EndScene();
         WaitGpu();
-        Allocation buffer = Allocate(Pool::Cdram, kVertexBufferBytes);
+        const u32 size = std::max(kVertexBufferBytes, (bytes + 0xFFFFFu) & ~0xFFFFFu);
+        Allocation buffer;
+        if (size == kVertexBufferBytes) {
+            buffer = Allocate(Pool::Cdram, size);
+        }
         if (!buffer.Valid()) {
-            buffer = Allocate(Pool::Host, kVertexBufferBytes);
+            buffer = Allocate(Pool::Host, size);
         }
         if (!buffer.Valid()) {
             return nullptr;
         }
         vertex_buffer = std::move(buffer);
+        vertex_used = 0;
+        vertex_segment_fence.fill(fence_sent);
+        vertex_segments_pending = 0;
     }
+    const u32 size = vertex_buffer.Size();
+    const u32 span = std::max(bytes, 1u);
     u32 offset = (vertex_used + 15u) & ~15u;
-    if (offset + bytes > vertex_buffer.Size()) {
-        if (bytes > vertex_buffer.Size()) {
-            return nullptr;
-        }
-        scene_close_full.fetch_add(1, std::memory_order_relaxed);
-        EndScene();
-        WaitGpu();
+    const bool wrapped = offset + span > size;
+    if (wrapped) {
         offset = 0;
     }
-    vertex_used = offset + bytes;
+    const u32 segment_bytes = size / kVertexSegments;
+    const u32 first = offset / segment_bytes;
+    const u32 last = (offset + span - 1) / segment_bytes;
+    // El tramo donde acabo la reserva anterior: seguir en el no pisa nada.
+    const u32 current =
+        vertex_used == 0 || wrapped ? kVertexSegments : (vertex_used - 1) / segment_bytes;
+    for (u32 segment = first; segment <= last; segment++) {
+        if (segment == current) {
+            continue;
+        }
+        if (((vertex_segments_pending >> segment) & 1u) != 0) {
+            scene_close_full.fetch_add(1, std::memory_order_relaxed);
+            EndScene();
+            WaitGpu();
+            break;
+        }
+        WaitFence(vertex_segment_fence[segment]);
+    }
+    for (u32 segment = first; segment <= last; segment++) {
+        vertex_segments_pending |= 1u << segment;
+    }
+    vertex_used = offset + span;
     return static_cast<u8*>(vertex_buffer.Data()) + offset;
 }
 
@@ -5341,6 +5385,12 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             }
         }
         if (program == nullptr) {
+            // Compilandose (el generico o su especializado): el lote se salta.
+            if (reason != nullptr && std::strcmp(reason, "vs compilando") == 0 &&
+                async_vs.load(std::memory_order_relaxed) != 0) {
+                skipped_batches.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
             NoteSkip(5, reason != nullptr ? reason : "vs");
             return HwVsReject(reason != nullptr ? reason : "vs");
         }

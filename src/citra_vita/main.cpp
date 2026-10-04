@@ -378,6 +378,9 @@ struct UserSettings {
     /// Resolucion de la GPU en mitades: 1 = 0.5x, 2 = 1x, 4 = 2x
     /// (RasterizerGXM::resolution_scale).
     int gpu_scale = 2;
+    /// 0.2.1.1: saltar el lote mientras compila su shader de vertices
+    /// (RasterizerGXM::async_vs). ON.
+    bool async_shaders = true;
 };
 UserSettings g_user;
 
@@ -449,6 +452,7 @@ void ApplyUserSettings() {
     VitaFrontend::g_unlimited_speed.store(g_user.unlimited_speed, std::memory_order_relaxed);
     Gxm::RasterizerGXM::resolution_scale.store(static_cast<u32>(g_user.gpu_scale),
                                                std::memory_order_relaxed);
+    Gxm::RasterizerGXM::async_vs.store(g_user.async_shaders ? 1u : 0u, std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -510,6 +514,7 @@ void LoadUserSettings() {
     if (read_int("resolucion_gpu2=", value)) {
         g_user.gpu_scale = value == 1 || value == 4 ? value : 2;
     }
+    read_bool("shaders_asinc=", g_user.async_shaders);
 }
 
 /// El contenido de ajustes.txt, una clave por linea.
@@ -520,14 +525,14 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
         "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
-        "resolucion_gpu2=%d\n",
+        "resolucion_gpu2=%d\nshaders_asinc=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
         g_user.vs_escapes ? 1 : 0, g_user.full_vertex_dedup ? 1 : 0, g_user.sound ? 1 : 0,
         g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0,
         g_user.gpu_screen_copy ? 1 : 0, g_user.gpu_thread ? 1 : 0,
-        g_user.unlimited_speed ? 1 : 0, g_user.gpu_scale);
+        g_user.unlimited_speed ? 1 : 0, g_user.gpu_scale, g_user.async_shaders ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
@@ -555,12 +560,12 @@ void SaveUserSettings() {
     sceIoClose(fd);
 }
 
-constexpr int kSettingsRows = 18;
+constexpr int kSettingsRows = 19;
 
 void DrawSettings(vita2d_pgf* font, int row) {
     constexpr int kFirstY = 100;
-    // 17 desde la fila 18 (0.2.0.3): con mas la ultima pisaba la ayuda.
-    constexpr int kRowStep = 17;
+    // 16 desde la fila 19 (0.2.1.1): con mas la ultima pisaba la ayuda.
+    constexpr int kRowStep = 16;
     constexpr int kValueX = 330;
 
     vita2d_start_drawing();
@@ -587,7 +592,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
                                          "Copia y borrado en GPU",
                                          "GPU en otro nucleo",
                                          "Limite de velocidad",
-                                         "Resolucion GPU"};
+                                         "Resolucion GPU",
+                                         "Shaders asincronos"};
     char volume_text[16];
     std::snprintf(volume_text, sizeof(volume_text), "%d %%", g_user.volume_percent);
     const char* values[kSettingsRows] = {
@@ -608,7 +614,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
         g_user.gpu_screen_copy ? "ON" : "OFF",
         g_user.gpu_thread ? "ON" : "OFF",
         g_user.unlimited_speed ? "Sin limite" : "100% (refresco)",
-        g_user.gpu_scale == 4 ? "2x (experimental)" : g_user.gpu_scale == 1 ? "0.5x" : "1x"};
+        g_user.gpu_scale == 4 ? "2x (experimental)" : g_user.gpu_scale == 1 ? "0.5x" : "1x",
+        g_user.async_shaders ? "ON" : "OFF"};
 
     for (int i = 0; i < kSettingsRows; i++) {
         const int y = kFirstY + i * kRowStep;
@@ -684,6 +691,9 @@ void DrawSettings(vita2d_pgf* font, int row) {
         {"0.5x: la GPU dibuja la mitad por eje (menos nitido). 2x: el doble (mas nitido).",
          "0.5x alivia la GPU de la Vita; 2x cuesta GPU y memoria de video. Al arrancar el juego.",
          "Contra: experimental. Lo que vaya por software sigue a 1x. Si va lento o raro, 1x."},
+        {"ON: mientras se compila el shader de vertices de un modelo, ese modelo no se dibuja.",
+         "Ganancia: la 1a vez que se entra a una escena 3D va fluida en vez de a 2-3 FPS.",
+         "Contra: los modelos aparecen unos segundos despues. OFF: se ven ya, pero a saltos."},
     };
     vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
     vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);
@@ -720,6 +730,7 @@ void RunSettingsMenu(vita2d_pgf* font) {
     g_user.unlimited_speed = VitaFrontend::g_unlimited_speed.load(std::memory_order_relaxed);
     g_user.gpu_scale =
         static_cast<int>(Gxm::RasterizerGXM::resolution_scale.load(std::memory_order_relaxed));
+    g_user.async_shaders = Gxm::RasterizerGXM::async_vs.load(std::memory_order_relaxed) != 0;
 
     int row = 0;
     // Todo lo que ya este pulsado al entrar (el START que la abrio) cuenta como
@@ -798,6 +809,9 @@ void RunSettingsMenu(vita2d_pgf* font) {
                 break;
             case 16:
                 g_user.unlimited_speed = !g_user.unlimited_speed;
+                break;
+            case 18:
+                g_user.async_shaders = !g_user.async_shaders;
                 break;
             default:
                 // 0.5x -> 1x -> 2x con DERECHA, al reves con IZQUIERDA.
