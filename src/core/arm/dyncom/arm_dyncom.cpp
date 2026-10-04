@@ -60,8 +60,8 @@ void ARM_DynCom::ClearInstructionCache() {
     ResetTransCacheFromInvalidation();
 }
 
-void ARM_DynCom::InvalidateCacheRange(u32, std::size_t) {
-    ClearInstructionCache();
+void ARM_DynCom::InvalidateCacheRange(u32 start_address, std::size_t length) {
+    ResetTransCacheFromRange(start_address, length);
 }
 
 void ARM_DynCom::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {

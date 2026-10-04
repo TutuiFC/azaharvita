@@ -20,6 +20,7 @@
 #include <fmt/format.h>
 #include <psp2/kernel/sysmem.h>
 #include "common/vita_diag.h"
+#include "common/vita_vm.h"
 #include "core/arm/dyncom/arm_dyncom_dec.h"
 #include "core/arm/skyeye_common/armstate.h"
 #include "core/arm/skyeye_common/vfp/vfp.h"
@@ -2692,7 +2693,11 @@ struct PendingCheck {
 };
 PendingCheck g_pending;
 
+/// Tramos [inicio, fin) invalidados desde la ultima vez (ver InvalidateRange).
+std::vector<std::pair<u32, u32>> g_invalid_ranges;
+
 void ResetAll() {
+    g_invalid_ranges.clear();
     g_blocks.clear();
     g_fast.fill(FastSlot{});
     g_code_used_words = 0;
@@ -2928,6 +2933,7 @@ std::vector<bool> ComputeFlagsLiveAfter(const std::vector<u32>& words) {
 /// no hace falta (esos bloques no encadenan).
 BlockFn EmitBlock(Block& block, bool check_mode) {
     const u32 capacity = kCodeBytes / 4 - g_code_used_words;
+    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
     const int open_rc = sceKernelOpenVMDomain();
     if (open_rc < 0) {
         static bool noted = false;
@@ -3481,6 +3487,61 @@ void Reset() {
         return;
     }
     ResetAll();
+}
+
+void InvalidateRange(u32 start, u32 size) {
+    if (!g_ready || size == 0) {
+        return;
+    }
+    g_invalid_ranges.emplace_back(start, start + size);
+}
+
+void ApplyInvalidations() {
+    if (!g_ready || g_invalid_ranges.empty()) {
+        g_invalid_ranges.clear();
+        return;
+    }
+    // Miles de palabras sueltas, casi siempre seguidas: se juntan en tramos.
+    std::sort(g_invalid_ranges.begin(), g_invalid_ranges.end());
+    std::vector<std::pair<u32, u32>> merged;
+    for (const auto& range : g_invalid_ranges) {
+        if (!merged.empty() && range.first <= merged.back().second) {
+            merged.back().second = std::max(merged.back().second, range.second);
+        } else {
+            merged.push_back(range);
+        }
+    }
+    g_invalid_ranges.clear();
+    for (auto& [pc, block] : g_blocks) {
+        // Un bloque no pasa del final de su pagina. Sin palabras (rechazado),
+        // se cuenta hasta ahi: rehacer de mas no rompe nada.
+        const u32 words = block.words.empty() ? kMaxBlockInstructions
+                                               : static_cast<u32>(block.words.size());
+        const u32 end = std::min(pc + words * 4, (pc & ~0xFFFu) + 0x1000u);
+        const auto next = std::upper_bound(
+            merged.begin(), merged.end(), pc,
+            [](u32 value, const std::pair<u32, u32>& range) { return value < range.first; });
+        bool hit = next != merged.end() && next->first < end;
+        if (!hit && next != merged.begin()) {
+            hit = std::prev(next)->second > pc;
+        }
+        if (!hit) {
+            continue;
+        }
+        if (g_pending.active && g_pending.block == &block) {
+            g_pending.active = false;
+        }
+        // El Block se queda (los enlaces y g_fast lo apuntan); vuelve a nuevo.
+        block.state = BlockState::New;
+        block.visits = 0;
+        block.code = nullptr;
+        block.check_code = nullptr;
+        block.chain_entry = 0;
+        block.link.entry = 0;
+        block.link.runs = 0;
+        block.reject = kRejectNone;
+        block.words.clear();
+    }
 }
 
 } // namespace Core::ArmJit

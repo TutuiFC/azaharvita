@@ -203,6 +203,17 @@ void CountInstructions(u32 instructions);
 /// interprete tira sus traducciones, el JIT tira las suyas por lo mismo.
 void Reset();
 
+/**
+ * INVALIDACION POR TRAMOS (0.2.0.5). Al cargar un modulo .cro, LDR:RO invalida
+ * las palabras que reubica (miles) y el tramo del modulo; hasta ahora cada
+ * tanda tiraba TODO el JIT, y Pokemon Sol recompilaba ~200.000 bloques al
+ * pasar al 3D ("compilar" 500 ms por fotograma en crash.txt de 0.2.0.4).
+ * InvalidateRange apunta el tramo; ApplyInvalidations, antes de volver a
+ * ejecutar codigo del juego, devuelve a "nuevo" solo los bloques que lo tocan.
+ */
+void InvalidateRange(u32 start, u32 size);
+void ApplyInvalidations();
+
 } // namespace Core::ArmJit
 
 #endif // __PSVITA__

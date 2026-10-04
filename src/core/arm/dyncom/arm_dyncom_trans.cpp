@@ -60,6 +60,8 @@ void GetTransCacheFlushCounts(std::size_t& by_capacity, std::size_t& by_invalida
     by_invalidation = g_flushes_by_invalidation;
 }
 
+static void ResetInterpreterTranslations();
+
 void ResetTransCache() {
 #ifdef __PSVITA__
     // El JIT se vacia en los mismos momentos que las traducciones del
@@ -67,6 +69,10 @@ void ResetTransCache() {
     // puede haber cambiado. Ver arm_dyncom_jit.h.
     Core::ArmJit::Reset();
 #endif
+    ResetInterpreterTranslations();
+}
+
+static void ResetInterpreterTranslations() {
     for (ARMul_State* cpu : trans_cache_users) {
         cpu->instruction_cache.clear();
         // OBLIGATORIO junto al de arriba: block_cache es un atajo delante del
@@ -98,7 +104,22 @@ void ResetTransCache() {
  * que el resultado es el mismo que vaciar en el acto.
  */
 bool g_invalidation_pending = false;
+/// Solo tramos: el interprete se vacia entero (rehacer sus traducciones es
+/// barato), el JIT solo en esos tramos (0.2.0.5, ver ArmJit::InvalidateRange).
+bool g_range_invalidation_pending = false;
 #endif
+
+void ResetTransCacheFromRange(u32 start, std::size_t size) {
+#ifdef __PSVITA__
+    Core::ArmJit::InvalidateRange(start, static_cast<u32>(size));
+    g_range_invalidation_pending = true;
+    for (ARMul_State* cpu : trans_cache_users) {
+        cpu->NumInstrsToExecute = 0;
+    }
+    return;
+#endif
+    ResetTransCacheFromInvalidation();
+}
 
 void ResetTransCacheFromInvalidation() {
 #ifdef __PSVITA__
@@ -116,8 +137,16 @@ bool FlushTransCacheIfNeeded() {
 #ifdef __PSVITA__
     if (g_invalidation_pending) {
         g_invalidation_pending = false;
+        g_range_invalidation_pending = false;
         g_flushes_by_invalidation++;
         ResetTransCache();
+        return true;
+    }
+    if (g_range_invalidation_pending) {
+        g_range_invalidation_pending = false;
+        g_flushes_by_invalidation++;
+        ResetInterpreterTranslations();
+        Core::ArmJit::ApplyInvalidations();
         return true;
     }
 #endif
