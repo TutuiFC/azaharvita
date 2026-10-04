@@ -1299,6 +1299,17 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 Gxm::RasterizerGXM::skipped_batches.exchange(
                                     0, std::memory_order_relaxed))
                         .c_str());
+                // Lo que cuesta cargar modelos nuevos (0.2.1.1): texturas
+                // decodificadas o revisadas, y las esperas enteras a la GPU.
+                Common::VitaNote(
+                    "texturas",
+                    fmt::format("decodificadas {} ({:.1f} ms/fot) | revisadas iguales {} "
+                                "cambiadas {} expulsadas {} | escenas cerradas por vertices {} "
+                                "por tablas de luz {} | espera a la gpu {:.1f} ms/fot",
+                                stats_texdecodes, stats_texdecode_ms, stats_texreuses,
+                                stats_texchanged, stats_texevictions, stats_close_full,
+                                stats_close_lut, stats_finish_ms)
+                        .c_str());
                 Common::VitaNote(
                     "gpu hilo",
                     fmt::format("{} | ocupado {:.0f}% ({:.1f} ms/fot) | juego esperando {:.0f}% "

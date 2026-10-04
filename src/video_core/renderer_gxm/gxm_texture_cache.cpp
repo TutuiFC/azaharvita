@@ -15,6 +15,7 @@
 #include "video_core/pica/regs_texturing.h"
 #include "video_core/texture/etc1.h"
 #include "video_core/texture/texture_decode.h"
+#include "video_core/utils.h"
 
 namespace Gxm {
 
@@ -87,6 +88,107 @@ constexpr u32 PackRGBA(const Common::Vec4<u8>& color) {
  * LookupTexelInTile texel a texel: son baratos y asi no hay un segundo
  * decodificador por formato que pueda divergir del de referencia.
  */
+/**
+ * UN MOSAICO DE 8x8 SIN COMPRIMIR, POR FORMATO (0.2.1.1). LookupTexelInTile
+ * pasaba por su switch de formatos y calculaba la posicion Morton en cada
+ * texel; aqui la posicion sale de una tabla y cada formato tiene su bucle.
+ * Los valores son los mismos que alli (con disable_alpha a falso): las mismas
+ * conversiones de Common::Color, empaquetadas como PackRGBA.
+ */
+template <u32 kBytes, typename Decode>
+void DecodeTileTexels(const u8* tile, u32 width, u32* tile_out, Decode&& decode) {
+    for (u32 y = 0; y < 8; y++) {
+        u32* out = tile_out + y * width;
+        const u32* morton = VideoCore::kMortonValues.data() + y * 8;
+        for (u32 x = 0; x < 8; x++) {
+            out[x] = decode(tile + morton[x] * kBytes);
+        }
+    }
+}
+
+/// Lo mismo con cuatro bits por texel: el texel m va en el byte m / 2, en el
+/// medio byte alto si m es impar.
+template <typename Decode>
+void DecodeTileNibbles(const u8* tile, u32 width, u32* tile_out, Decode&& decode) {
+    for (u32 y = 0; y < 8; y++) {
+        u32* out = tile_out + y * width;
+        const u32* morton = VideoCore::kMortonValues.data() + y * 8;
+        for (u32 x = 0; x < 8; x++) {
+            const u32 m = morton[x];
+            const u8 byte = tile[m / 2];
+            out[x] = decode(static_cast<u8>((m & 1) != 0 ? (byte >> 4) : (byte & 0xF)));
+        }
+    }
+}
+
+/// false si el formato no tiene bucle propio (lo hace LookupTexelInTile).
+bool DecodeTileFast(const u8* tile, TexturingRegs::TextureFormat format, u32 width,
+                    u32* tile_out) {
+    using Format = TexturingRegs::TextureFormat;
+    namespace Color = Common::Color;
+    const auto gray = [](u8 i, u8 a) {
+        return static_cast<u32>(i) * 0x010101u | (static_cast<u32>(a) << 24);
+    };
+    switch (format) {
+    case Format::RGBA8:
+        DecodeTileTexels<4>(tile, width, tile_out, [](const u8* p) {
+            return static_cast<u32>(p[3]) | (static_cast<u32>(p[2]) << 8) |
+                   (static_cast<u32>(p[1]) << 16) | (static_cast<u32>(p[0]) << 24);
+        });
+        return true;
+    case Format::RGB8:
+        DecodeTileTexels<3>(tile, width, tile_out, [](const u8* p) {
+            return static_cast<u32>(p[2]) | (static_cast<u32>(p[1]) << 8) |
+                   (static_cast<u32>(p[0]) << 16) | 0xFF000000u;
+        });
+        return true;
+    case Format::RGB5A1:
+        DecodeTileTexels<2>(tile, width, tile_out,
+                            [](const u8* p) { return PackRGBA(Color::DecodeRGB5A1(p)); });
+        return true;
+    case Format::RGB565:
+        DecodeTileTexels<2>(tile, width, tile_out,
+                            [](const u8* p) { return PackRGBA(Color::DecodeRGB565(p)); });
+        return true;
+    case Format::RGBA4:
+        DecodeTileTexels<2>(tile, width, tile_out,
+                            [](const u8* p) { return PackRGBA(Color::DecodeRGBA4(p)); });
+        return true;
+    case Format::IA8:
+        DecodeTileTexels<2>(tile, width, tile_out, [&gray](const u8* p) { return gray(p[1], p[0]); });
+        return true;
+    case Format::RG8:
+        DecodeTileTexels<2>(tile, width, tile_out, [](const u8* p) {
+            return static_cast<u32>(p[1]) | (static_cast<u32>(p[0]) << 8) | 0xFF000000u;
+        });
+        return true;
+    case Format::I8:
+        DecodeTileTexels<1>(tile, width, tile_out, [&gray](const u8* p) { return gray(*p, 255); });
+        return true;
+    case Format::A8:
+        DecodeTileTexels<1>(tile, width, tile_out,
+                            [](const u8* p) { return static_cast<u32>(*p) << 24; });
+        return true;
+    case Format::IA4:
+        DecodeTileTexels<1>(tile, width, tile_out, [&gray](const u8* p) {
+            return gray(Color::Convert4To8(static_cast<u8>((*p & 0xF0) >> 4)),
+                        Color::Convert4To8(static_cast<u8>(*p & 0xF)));
+        });
+        return true;
+    case Format::I4:
+        DecodeTileNibbles(tile, width, tile_out,
+                          [&gray](u8 nibble) { return gray(Color::Convert4To8(nibble), 255); });
+        return true;
+    case Format::A4:
+        DecodeTileNibbles(tile, width, tile_out, [](u8 nibble) {
+            return static_cast<u32>(Color::Convert4To8(nibble)) << 24;
+        });
+        return true;
+    default:
+        return false;
+    }
+}
+
 void DecodeTileRow(const u8* row_source, const Pica::Texture::TextureInfo& info, u32 width,
                    u32* band) {
     const bool etc1 = info.format == TexturingRegs::TextureFormat::ETC1;
@@ -123,7 +225,7 @@ void DecodeTileRow(const u8* row_source, const Pica::Texture::TextureInfo& info,
                     }
                 }
             }
-        } else {
+        } else if (!DecodeTileFast(tile, info.format, width, tile_out)) {
             for (u32 y = 0; y < 8; y++) {
                 u32* out = tile_out + y * width;
                 for (u32 x = 0; x < 8; x++) {

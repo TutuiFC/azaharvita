@@ -81,7 +81,7 @@ public:
      * llamadas al sistema que no son baratas -- pero el tope real lo pone el
      * presupuesto de abajo, no este numero.
      */
-    static constexpr u32 kMaxEntries = 192;
+    static constexpr u32 kMaxEntries = 384;
 
     /**
      * Tope de memoria de GPU para las texturas decodificadas, en bytes.

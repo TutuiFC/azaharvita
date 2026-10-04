@@ -126,14 +126,60 @@ Common::Vec3<u8> SampleETC1Subtile(u64 value, unsigned int x, unsigned int y) {
 }
 
 void DecodeETC1Block(u64 value, u32* out_rgba) {
-    ETC1Tile tile{value};
-
-    for (unsigned int y = 0; y < 4; y++) {
-        for (unsigned int x = 0; x < 4; x++) {
-            const auto rgb = tile.GetRGB(x, y);
-            out_rgba[x + y * 4] = static_cast<u32>(rgb.r()) |
-                                  (static_cast<u32>(rgb.g()) << 8) |
-                                  (static_cast<u32>(rgb.b()) << 16) | 0xFF000000u;
+    /**
+     * POR BLOQUE, NO POR TEXEL (0.2.1.1). GetRGB rehacia para cada uno de los
+     * 16 texeles el color base de su mitad, la tabla y el recorte, con campos
+     * de 64 bits que en ARMv7 cuestan varias instrucciones cada uno. Un bloque
+     * solo tiene OCHO colores posibles (dos mitades por cuatro modificadores):
+     * se calculan una vez y cada texel elige el suyo con sus dos bits. Mismas
+     * cuentas que GetRGB, comprobadas bloque a bloque contra ella (tambien los
+     * desbordes del modo diferencial, que pasan por Convert5To8 truncados a
+     * ocho bits igual que alli).
+     */
+    const u32 low = static_cast<u32>(value);
+    const u32 high = static_cast<u32>(value >> 32);
+    const auto signed3 = [](u32 bits) { return static_cast<s32>(bits << 29) >> 29; };
+    std::array<std::array<int, 3>, 2> base;
+    if ((high & 2) != 0) {
+        const int r = static_cast<int>((high >> 27) & 0x1F);
+        const int g = static_cast<int>((high >> 19) & 0x1F);
+        const int b = static_cast<int>((high >> 11) & 0x1F);
+        base[0] = {Common::Color::Convert5To8(static_cast<u8>(r)),
+                   Common::Color::Convert5To8(static_cast<u8>(g)),
+                   Common::Color::Convert5To8(static_cast<u8>(b))};
+        base[1] = {Common::Color::Convert5To8(static_cast<u8>(r + signed3(high >> 24))),
+                   Common::Color::Convert5To8(static_cast<u8>(g + signed3(high >> 16))),
+                   Common::Color::Convert5To8(static_cast<u8>(b + signed3(high >> 8)))};
+    } else {
+        base[0] = {Common::Color::Convert4To8(static_cast<u8>(high >> 28)),
+                   Common::Color::Convert4To8(static_cast<u8>((high >> 20) & 0xF)),
+                   Common::Color::Convert4To8(static_cast<u8>((high >> 12) & 0xF))};
+        base[1] = {Common::Color::Convert4To8(static_cast<u8>((high >> 24) & 0xF)),
+                   Common::Color::Convert4To8(static_cast<u8>((high >> 16) & 0xF)),
+                   Common::Color::Convert4To8(static_cast<u8>((high >> 8) & 0xF))};
+    }
+    const std::array<u32, 2> tables{(high >> 5) & 7, (high >> 2) & 7};
+    u32 palette[2][4];
+    for (u32 half = 0; half < 2; half++) {
+        for (u32 index = 0; index < 4; index++) {
+            int modifier = etc1_modifier_table[tables[half]][index & 1];
+            if ((index & 2) != 0) {
+                modifier = -modifier;
+            }
+            const u32 r = static_cast<u32>(std::clamp(base[half][0] + modifier, 0, 255));
+            const u32 g = static_cast<u32>(std::clamp(base[half][1] + modifier, 0, 255));
+            const u32 b = static_cast<u32>(std::clamp(base[half][2] + modifier, 0, 255));
+            palette[half][index] = r | (g << 8) | (b << 16) | 0xFF000000u;
+        }
+    }
+    // La mitad: columnas 0-1 / 2-3, o filas si el bloque va volteado. Los dos
+    // bits del texel van por columnas (4x + y), como en GetRGB.
+    const bool flip = (high & 1) != 0;
+    for (u32 y = 0; y < 4; y++) {
+        for (u32 x = 0; x < 4; x++) {
+            const u32 texel = 4 * x + y;
+            const u32 index = ((low >> texel) & 1) | (((low >> (16 + texel)) & 1) << 1);
+            out_rgba[x + y * 4] = palette[flip ? (y >> 1) : (x >> 1)][index];
         }
     }
 }
