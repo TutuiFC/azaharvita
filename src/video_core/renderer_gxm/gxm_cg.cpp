@@ -1088,8 +1088,18 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         return nullptr;
     }
     // Lo que tarda compilar (para saber cuanto ahorra la cache) y a la cache.
-    NoteCache(fmt::format("{} compilado en {} ms", name,
-                          (Common::VitaMicros() - compile_begin_us) / 1000));
+    const unsigned long long compile_ms = (Common::VitaMicros() - compile_begin_us) / 1000;
+    NoteCache(fmt::format("{} compilado en {} ms", name, compile_ms));
+    {
+        // Aparte de las notas de la cache, que se gastan al arrancar (0.2.1.1):
+        // es lo que tarda en aparecer un modelo con los shaders asincronos.
+        static u32 time_notes = 0;
+        if (time_notes < 60) {
+            time_notes++;
+            Common::VitaNote("gxm compila",
+                             fmt::format("{}: compilado en {} ms", name, compile_ms).c_str());
+        }
+    }
     StoreCached(key, cache_path, *output);
     // 0.1.7.9: la salida pasa a un bloque nuestro y el compilador suelta todo
     // lo suyo. Si no hay memoria ni para la copia, se devuelve la original

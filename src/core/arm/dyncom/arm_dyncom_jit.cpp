@@ -3353,22 +3353,9 @@ std::vector<bool> ComputeFlagsLiveAfter(const std::vector<u32>& words) {
 /// entonces se pide vaciar y el bloque se queda en el interprete esta vez.
 /// block.link.entry se rellena en el camino normal (0.1.5.7); en comprobacion
 /// no hace falta (esos bloques no encadenan).
-BlockFn EmitBlock(Block& block, bool check_mode) {
-    const u32 capacity = kCodeBytes / 4 - g_code_used_words;
-    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
-    const int open_rc = sceKernelOpenVMDomain();
-    if (open_rc < 0) {
-        static bool noted = false;
-        if (!noted) {
-            noted = true;
-            Common::VitaNote("jit arm",
-                             fmt::format("no se puede abrir el dominio VM ({:#x})",
-                                         static_cast<u32>(open_rc))
-                                 .c_str());
-        }
-        return nullptr;
-    }
-    u32* const start = g_code + g_code_used_words;
+/// Una variante del bloque en 'start', con el dominio VM ya abierto. Las
+/// palabras escritas, o 0 si no cabe.
+u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity) {
     Emitter e{start, capacity};
     Compiler compiler{e, check_mode};
     compiler.SetCacheMap(block.cache_map);
@@ -3413,16 +3400,8 @@ BlockFn EmitBlock(Block& block, bool check_mode) {
     compiler.Epilogue();
     compiler.EmitColdStubs();
     if (e.Overflowed()) {
-        sceKernelCloseVMDomain();
-        g_flush_requested = true;
-        return nullptr;
+        return 0;
     }
-    // Sin esto la cache de instrucciones puede tener lo que hubiera antes en
-    // esa memoria y se ejecuta basura.
-    sceKernelSyncVMDomain(g_code_block, start, e.Position() * 4);
-    sceKernelCloseVMDomain();
-    g_code_used_words += e.Position();
-    g_code_blocks++;
     if (!check_mode) {
         // Punto de entrada de los enlaces (0.1.5.7): pila, kCpu, kPages y
         // flags ya los pone el bloque origen; aqui empieza BodyEnter. NO se
@@ -3430,7 +3409,80 @@ BlockFn EmitBlock(Block& block, bool check_mode) {
         // ha pasado sus comprobaciones iniciales (0.1.8.1).
         block.chain_entry = static_cast<u32>(reinterpret_cast<uintptr_t>(start + chain_entry));
     }
-    return reinterpret_cast<BlockFn>(start);
+    return e.Position();
+}
+
+/**
+ * El codigo del bloque: la variante normal, la de comprobacion o las dos
+ * seguidas, con UNA apertura del dominio VM y una sincronizacion de caches
+ * (0.2.1.1). Cada bloque nuevo pide las dos (su primera ejecucion es una
+ * comprobacion) y eran dos rondas de tres llamadas al kernel; en las cargas
+ * de zona se compilan miles por segundo ("compilar" en crash.txt). Deja
+ * block.code y block.check_code; false si no cabe (se pide vaciar).
+ */
+bool EmitBlockCode(Block& block, bool normal, bool check) {
+    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
+    const int open_rc = sceKernelOpenVMDomain();
+    if (open_rc < 0) {
+        static bool noted = false;
+        if (!noted) {
+            noted = true;
+            Common::VitaNote("jit arm",
+                             fmt::format("no se puede abrir el dominio VM ({:#x})",
+                                         static_cast<u32>(open_rc))
+                                 .c_str());
+        }
+        return false;
+    }
+    u32* const start = g_code + g_code_used_words;
+    const u32 capacity = kCodeBytes / 4 - g_code_used_words;
+    u32 used = 0;
+    BlockFn code = nullptr;
+    BlockFn check_code = nullptr;
+    if (normal) {
+        used = EmitVariant(block, false, start, capacity);
+        if (used == 0) {
+            sceKernelCloseVMDomain();
+            g_flush_requested = true;
+            return false;
+        }
+        code = reinterpret_cast<BlockFn>(start);
+    }
+    if (check) {
+        // Si no cabe, la normal vale igual: la de comprobacion se pide otra
+        // vez en StartCheck, que entonces vaciara.
+        const u32 words = EmitVariant(block, true, start + used, capacity - used);
+        if (words != 0) {
+            check_code = reinterpret_cast<BlockFn>(start + used);
+            used += words;
+        } else if (!normal) {
+            sceKernelCloseVMDomain();
+            g_flush_requested = true;
+            return false;
+        }
+    }
+    // Sin esto la cache de instrucciones puede tener lo que hubiera antes en
+    // esa memoria y se ejecuta basura.
+    sceKernelSyncVMDomain(g_code_block, start, used * 4);
+    sceKernelCloseVMDomain();
+    g_code_used_words += used;
+    if (code != nullptr) {
+        block.code = code;
+        g_code_blocks++;
+    }
+    if (check_code != nullptr) {
+        block.check_code = check_code;
+        g_code_blocks++;
+    }
+    return true;
+}
+
+/// Una sola variante (la de comprobacion que falte en StartCheck).
+BlockFn EmitBlock(Block& block, bool check_mode) {
+    if (!EmitBlockCode(block, !check_mode, check_mode)) {
+        return nullptr;
+    }
+    return check_mode ? block.check_code : block.code;
 }
 
 void NoteMismatch(const Block& block, const std::string& what) {
@@ -3511,6 +3563,8 @@ namespace {
  * El bloque compilado para 'pc', compilandolo si toca, o nullptr si ese
  * despacho es del interprete (y entonces anota por que). Cuenta el despacho.
  */
+bool DueForCheck(const Block& block);
+
 Block* Acquire(ARMul_State* cpu, u32 pc) {
     g_local.dispatches++;
     FastSlot& slot = g_fast[(pc >> 2) & (kFastSlots - 1)];
@@ -3551,8 +3605,10 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
         return nullptr;
     }
     block->link.count = static_cast<u32>(block->words.size());
-    block->code = EmitBlock(*block, false);
-    if (block->code == nullptr) {
+    block->code = nullptr;
+    block->check_code = nullptr;
+    // Las dos variantes de una vez si le toca comprobacion (la primera vez, siempre).
+    if (!EmitBlockCode(*block, true, DueForCheck(*block))) {
         // Sin sitio: se vacia en la siguiente llamada y se vuelve a intentar.
         block->visits = 0;
         return nullptr;
