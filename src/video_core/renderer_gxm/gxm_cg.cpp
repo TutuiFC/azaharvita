@@ -128,7 +128,14 @@ void* CgAlloc(unsigned int size) {
         g_compile_over_budget = true;
         return nullptr;
     }
-    void* pointer = std::malloc(size);
+    /**
+     * Alineado y redondeado a 16 (0.2.0.7). malloc de newlib da 8, y el
+     * compilador de Sony se caia SIEMPRE en el mismo punto, justo despues de
+     * pedir memoria aqui (volcados de 0.2.0.1, 0.2.0.5 y 0.2.0.6: acceso a
+     * memoria invalido dentro de libshacccg con la pila pasando por CgAlloc),
+     * lo que encaja con accesos NEON de 16 bytes que exigen esa alineacion.
+     */
+    void* pointer = memalign(16, (size + 15u) & ~15u);
     if (pointer == nullptr) {
         return nullptr;
     }
