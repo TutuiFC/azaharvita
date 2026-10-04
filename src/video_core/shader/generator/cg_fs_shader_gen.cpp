@@ -99,8 +99,9 @@ bool IsSupported(const FSConfig& config, const char** out_reason) {
 /// Emite el Cg de una configuracion, o deja el motivo del rechazo en el LOG.
 class FragmentWriter {
 public:
-    explicit FragmentWriter(const FSConfig& config_, const char** reason_)
-        : config{config_}, reason{reason_} {}
+    explicit FragmentWriter(const FSConfig& config_, const char** reason_,
+                            bool alpha_from_blend_const_)
+        : config{config_}, reason{reason_}, alpha_from_blend_const{alpha_from_blend_const_} {}
 
     std::optional<std::string> Generate() {
         if (!IsSupported(config, reason)) {
@@ -219,6 +220,10 @@ public:
         // El redondeo final: la PICA escribe siempre 8 bits por canal.
         out += "    combiner_output = byteround(combiner_output);\n";
         out += "    gl_FragColor = combiner_output;\n";
+        // Despues de la prueba de alfa, que sigue usando el alfa calculado.
+        if (alpha_from_blend_const) {
+            out += "    gl_FragColor.a = blend_const_alpha;\n";
+        }
         out += "}\n";
         return out;
     }
@@ -410,6 +415,9 @@ private:
          * que el rasterizador ya sabe saltarse.
          */
         out += "uniform float4 tev_combiner_buffer_color;\n";
+        if (alpha_from_blend_const) {
+            out += "uniform float blend_const_alpha;\n";
+        }
         if (config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always) {
             out += "uniform float alphatest_ref;\n";
         }
@@ -1099,6 +1107,7 @@ private:
 
     const FSConfig& config;
     const char** reason = nullptr;
+    bool alpha_from_blend_const = false;
     std::string out;
     bool uses_tex0 = false;
     bool uses_tex1 = false;
@@ -1110,8 +1119,9 @@ private:
 } // Anonymous namespace
 
 std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
-                                                  const char** out_reason) {
-    FragmentWriter writer{config, out_reason};
+                                                  const char** out_reason,
+                                                  bool alpha_from_blend_const) {
+    FragmentWriter writer{config, out_reason, alpha_from_blend_const};
     return writer.Generate();
 }
 

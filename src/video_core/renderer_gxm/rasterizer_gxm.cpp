@@ -401,8 +401,53 @@ bool MapBlendFactor(FramebufferRegs::BlendFactor factor, SceGxmBlendFactor* out)
         return true;
     default:
         // Quedan los cuatro factores con color/alfa CONSTANTE: GXM no tiene
-        // color de mezcla constante, asi que esos lotes se van a software.
+        // color de mezcla constante (ver MapCarrierFactor).
         return false;
+    }
+}
+
+bool IsConstantFactor(FramebufferRegs::BlendFactor factor) {
+    return factor == FramebufferRegs::BlendFactor::ConstantColor ||
+           factor == FramebufferRegs::BlendFactor::OneMinusConstantColor ||
+           factor == FramebufferRegs::BlendFactor::ConstantAlpha ||
+           factor == FramebufferRegs::BlendFactor::OneMinusConstantAlpha;
+}
+
+bool ReadsSourceAlpha(FramebufferRegs::BlendFactor factor) {
+    return factor == FramebufferRegs::BlendFactor::SourceAlpha ||
+           factor == FramebufferRegs::BlendFactor::OneMinusSourceAlpha ||
+           factor == FramebufferRegs::BlendFactor::SourceAlphaSaturate;
+}
+
+/**
+ * FACTORES CONSTANTES LLEVADOS EN EL ALFA DE LA FUENTE (0.2.0.1).
+ *
+ * GXM no tiene color de mezcla constante, pero si el alfa que sale del shader
+ * no hace falta para nada mas, el shader puede sacar ahi la constante y GXM la
+ * usa como SRC_ALPHA. 'alpha_slot': factor del alfa, donde el color constante
+ * vale por su componente alfa; en los del color seria un valor por canal, y
+ * eso no cabe en un alfa. Las condiciones de que el alfa este libre las mira
+ * BuildBlend. Kirby Triple Deluxe dibuja asi (color = destino, alfa = alfa del
+ * destino por la constante: "eq 0/0 fac 0/1 0/12" en crash.txt), y esos lotes
+ * iban a software con una sincronizacion cada uno.
+ */
+bool MapCarrierFactor(FramebufferRegs::BlendFactor factor, bool alpha_slot,
+                      SceGxmBlendFactor* out) {
+    switch (factor) {
+    case FramebufferRegs::BlendFactor::ConstantAlpha:
+        *out = SCE_GXM_BLEND_FACTOR_SRC_ALPHA;
+        return true;
+    case FramebufferRegs::BlendFactor::OneMinusConstantAlpha:
+        *out = SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        return true;
+    case FramebufferRegs::BlendFactor::ConstantColor:
+        *out = SCE_GXM_BLEND_FACTOR_SRC_ALPHA;
+        return alpha_slot;
+    case FramebufferRegs::BlendFactor::OneMinusConstantColor:
+        *out = SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        return alpha_slot;
+    default:
+        return MapBlendFactor(factor, out);
     }
 }
 
@@ -1039,6 +1084,8 @@ struct RasterizerGXM::PipelineCache {
         const SceGxmProgramParameter* const_color = nullptr;
         const SceGxmProgramParameter* combiner_buffer_color = nullptr;
         const SceGxmProgramParameter* alphatest_ref = nullptr;
+        /// La constante de mezcla en el alfa de salida (0.2.0.1, MapCarrierFactor).
+        const SceGxmProgramParameter* blend_const_alpha = nullptr;
         const SceGxmProgramParameter* samplers[3] = {nullptr, nullptr, nullptr};
         u8 sampler_units[3] = {0, 0, 0};
         const SceGxmProgramParameter* fog_lut = nullptr;
@@ -1253,7 +1300,8 @@ struct RasterizerGXM::PipelineCache {
          */
         SceGxmBlendInfo blend{};
         u32 blend_bits = 0;
-        if (!BuildBlend(regs, blend, blend_bits)) {
+        bool alpha_carrier = false;
+        if (!BuildBlend(regs, blend, blend_bits, alpha_carrier)) {
             return fail("mezcla");
         }
 
@@ -1295,7 +1343,7 @@ struct RasterizerGXM::PipelineCache {
         auto entry = std::make_unique<Entry>();
         entry->cg_generation = CgGeneration();
         const char* reason = nullptr;
-        if (!Build(entry.get(), config, blend, &reason)) {
+        if (!Build(entry.get(), config, blend, alpha_carrier, &reason)) {
             entry->usable = false;
             entry->reason = reason != nullptr ? reason : "shader";
         }
@@ -1317,7 +1365,7 @@ struct RasterizerGXM::PipelineCache {
      * veces un programa del parcheador no perdona.
      */
     bool Build(Entry* entry, const Pica::Shader::FSConfig& config, const SceGxmBlendInfo& blend,
-               const char** out_reason) {
+               bool alpha_carrier, const char** out_reason) {
         const auto fail = [out_reason](const char* reason) {
             if (out_reason != nullptr) {
                 *out_reason = reason;
@@ -1326,8 +1374,8 @@ struct RasterizerGXM::PipelineCache {
         };
 
         const char* generator_reason = nullptr;
-        const auto source =
-            Pica::Shader::Generator::GXM::GenerateFragmentShader(config, &generator_reason);
+        const auto source = Pica::Shader::Generator::GXM::GenerateFragmentShader(
+            config, &generator_reason, alpha_carrier);
         if (!source.has_value()) {
             return fail(generator_reason != nullptr ? generator_reason : "shader");
         }
@@ -1421,6 +1469,7 @@ struct RasterizerGXM::PipelineCache {
         entry->combiner_buffer_color =
             sceGxmProgramFindParameterByName(gxp, "tev_combiner_buffer_color");
         entry->alphatest_ref = sceGxmProgramFindParameterByName(gxp, "alphatest_ref");
+        entry->blend_const_alpha = sceGxmProgramFindParameterByName(gxp, "blend_const_alpha");
         entry->samplers[0] = sceGxmProgramFindParameterByName(gxp, "tex0");
         entry->samplers[1] = sceGxmProgramFindParameterByName(gxp, "tex1");
         entry->samplers[2] = sceGxmProgramFindParameterByName(gxp, "tex2");
@@ -1452,7 +1501,9 @@ struct RasterizerGXM::PipelineCache {
         return true;
     }
 
-    bool BuildBlend(const Pica::RegsInternal& regs, SceGxmBlendInfo& blend, u32& bits) {
+    bool BuildBlend(const Pica::RegsInternal& regs, SceGxmBlendInfo& blend, u32& bits,
+                    bool& alpha_carrier) {
+        alpha_carrier = false;
         const auto& merger = regs.framebuffer.output_merger;
         if (merger.fragment_operation_mode !=
             FramebufferRegs::FragmentOperationMode::Default) {
@@ -1505,12 +1556,38 @@ struct RasterizerGXM::PipelineCache {
             SceGxmBlendFactor color_dst{};
             SceGxmBlendFactor alpha_src{};
             SceGxmBlendFactor alpha_dst{};
+            const auto& factors = merger.alpha_blending;
+            const auto src_rgb = factors.factor_source_rgb.Value();
+            const auto dst_rgb = factors.factor_dest_rgb.Value();
+            const auto src_a = factors.factor_source_a.Value();
+            const auto dst_a = factors.factor_dest_a.Value();
+            bool mapped = false;
+            if (!IsConstantFactor(src_rgb) && !IsConstantFactor(dst_rgb) &&
+                !IsConstantFactor(src_a) && !IsConstantFactor(dst_a)) {
+                mapped = MapBlendFactor(src_rgb, &color_src) &&
+                         MapBlendFactor(dst_rgb, &color_dst) &&
+                         MapBlendFactor(src_a, &alpha_src) && MapBlendFactor(dst_a, &alpha_dst);
+            } else {
+                // El alfa de la fuente queda libre si ningun factor lo lee y el
+                // alfa resultante no depende de el: o no se escribe, o se mezcla
+                // con factores (no min/max) y el de la fuente es cero.
+                const auto equation_a = factors.blend_equation_a.Value();
+                const bool alpha_free =
+                    !merger.alpha_enable ||
+                    (src_a == FramebufferRegs::BlendFactor::Zero &&
+                     equation_a != FramebufferRegs::BlendEquation::Min &&
+                     equation_a != FramebufferRegs::BlendEquation::Max);
+                mapped = alpha_free && !ReadsSourceAlpha(src_rgb) && !ReadsSourceAlpha(dst_rgb) &&
+                         !ReadsSourceAlpha(src_a) && !ReadsSourceAlpha(dst_a) &&
+                         MapCarrierFactor(src_rgb, false, &color_src) &&
+                         MapCarrierFactor(dst_rgb, false, &color_dst) &&
+                         MapCarrierFactor(src_a, true, &alpha_src) &&
+                         MapCarrierFactor(dst_a, true, &alpha_dst);
+                alpha_carrier = mapped;
+            }
             if (!MapBlendEquation(merger.alpha_blending.blend_equation_rgb.Value(), &color_func) ||
                 !MapBlendEquation(merger.alpha_blending.blend_equation_a.Value(), &alpha_func) ||
-                !MapBlendFactor(merger.alpha_blending.factor_source_rgb.Value(), &color_src) ||
-                !MapBlendFactor(merger.alpha_blending.factor_dest_rgb.Value(), &color_dst) ||
-                !MapBlendFactor(merger.alpha_blending.factor_source_a.Value(), &alpha_src) ||
-                !MapBlendFactor(merger.alpha_blending.factor_dest_a.Value(), &alpha_dst)) {
+                !mapped) {
                 // Con los seis valores crudos en crash.txt se sabe CUAL de
                 // ellos no tiene equivalente (los factores constantes) sin
                 // gastar otra prueba en consola.
@@ -1530,7 +1607,10 @@ struct RasterizerGXM::PipelineCache {
             blend.alphaSrc = alpha_src;
             blend.alphaDst = alpha_dst;
         }
-        bits = static_cast<u32>(blend.colorMask) | (static_cast<u32>(blend.colorFunc) << 8) |
+        // El bit 4 esta libre (la mascara ocupa 0-3): el shader con la
+        // constante en el alfa es otro, aunque la mezcla de GXM coincida.
+        bits = static_cast<u32>(blend.colorMask) | (alpha_carrier ? 1u << 4 : 0u) |
+               (static_cast<u32>(blend.colorFunc) << 8) |
                (static_cast<u32>(blend.alphaFunc) << 12) |
                (static_cast<u32>(blend.colorSrc) << 16) |
                (static_cast<u32>(blend.colorDst) << 20) |
@@ -4307,6 +4387,10 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         if (pipeline->alphatest_ref != nullptr) {
             const f32 reference = static_cast<f32>(merger.alpha_test.ref);
             sceGxmSetUniformDataF(uniform_buffer, pipeline->alphatest_ref, 0, 1, &reference);
+        }
+        if (pipeline->blend_const_alpha != nullptr) {
+            const f32 constant = static_cast<f32>(merger.blend_const.a) / 255.0f;
+            sceGxmSetUniformDataF(uniform_buffer, pipeline->blend_const_alpha, 0, 1, &constant);
         }
         if (pipeline->fog_lut != nullptr) {
             // 128 entradas de dos floats: valor y pendiente (misma LUT que usa

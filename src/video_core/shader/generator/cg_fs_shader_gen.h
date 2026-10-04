@@ -74,7 +74,12 @@ namespace Pica::Shader::Generator::GXM {
  * uno se declara SOLO si la configuracion lo usa; el que llama los busca por
  * nombre y se salta los que no existan.
  */
+/// 'alpha_from_blend_const' (0.2.0.1): el alfa de salida es la constante de
+/// mezcla (uniform blend_const_alpha) y no el calculado. Lo pide el
+/// rasterizador cuando lleva en el alfa de la fuente un factor de mezcla
+/// constante, que GXM no tiene (ver BuildBlend en rasterizer_gxm.cpp).
 std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
-                                                  const char** out_reason = nullptr);
+                                                  const char** out_reason = nullptr,
+                                                  bool alpha_from_blend_const = false);
 
 } // namespace Pica::Shader::Generator::GXM
