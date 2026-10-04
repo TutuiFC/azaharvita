@@ -2413,12 +2413,100 @@ private:
          * La comprobacion contra el interprete sigue: si el hardware diera otro
          * resultado, el bloque vuelve al interprete (ver CompletePendingCheck).
          */
-        int index = -1;
-        DecodeARMInstruction(inst, &index);
-        if (vfp_native.load(std::memory_order_relaxed) == 0 || index == kVfpVcvtBds) {
+        if (!VfpNative(inst)) {
             VfpCdpHelper(inst);
             return;
         }
+        // Las nativas llegan por VfpCdpRun desde EmitBlock; aqui solo si no.
+        VfpCdpRun(&inst, 1, flags_live_after, false);
+    }
+
+public:
+    /// La aritmetica VFP de 'inst' va por el VFP de la Vita (ver VfpCdp).
+    static bool VfpNative(u32 inst) {
+        int index = -1;
+        DecodeARMInstruction(inst, &index);
+        return vfp_native.load(std::memory_order_relaxed) != 0 && index != kVfpVcvtBds;
+    }
+
+    /**
+     * ARITMETICA VFP SEGUIDA CON UN SOLO CAMBIO DE FPSCR (0.2.1.0). Cada
+     * operacion guardaba el FPSCR del emulador, ponia el del juego, lo leia de
+     * vuelta y reponia el del emulador: cuatro accesos al FPSCR por cada VMUL
+     * o VMLA, y en el Cortex-A9 cada uno espera a que el VFP vacie su tuberia.
+     * Las seguidas (las cuentas de matrices y vectores del 3D) comparten uno al
+     * principio y otro al final: entre ellas no hay nada que lea el FPSCR del
+     * juego en memoria ni codigo de C que espere el del emulador, y los
+     * acumulados y los flags de VCMP quedan igual que una a una. LEN y STRIDE
+     * se miran una vez: solo los cambia un VMSR, que no se compila. Con
+     * vectores, todas por la funcion del interprete, en un camino frio.
+     * 'conditions': las condiciones de cada una se emiten aqui (falso cuando
+     * Instruction ya puso la de una sola).
+     */
+    void VfpCdpRun(const u32* insts, u32 count, bool keep_flags, bool conditions) {
+        const u32 fpscr_offset = g_offsets.vfp + VFP_FPSCR * 4;
+        // Los flags del juego: el TST los pisa.
+        if (keep_flags) {
+            e.Mrs(kT0);
+        }
+        e.LdrImm(kRd, kCpu, fpscr_offset);
+        // TST kRd, #0x370000 (LEN y STRIDE): con vectores, a la funcion.
+        e.Emit(0xE3100000u | (kRd << 16) | (8u << 8) | 0x37u);
+        const u32 to_slow = e.BranchPlaceholder(kCondNe);
+        if (keep_flags) {
+            e.MsrFlags(kT0);
+        }
+        // kT1 = &ExtReg[0]
+        e.Mov32(kT1, g_offsets.ext);
+        e.AddReg(kT1, kCpu, kT1);
+        e.Emit(0xEEF10A10u | (kRn << 12)); // VMRS kRn, FPSCR (el del emulador)
+        e.Emit(0xEEE10A10u | (kRd << 12)); // VMSR FPSCR, kRd (el del juego)
+        for (u32 k = 0; k < count; k++) {
+            const u32 cond = insts[k] >> 28;
+            const bool conditional = conditions && cond != kAlways;
+            const u32 skip = conditional ? e.BranchPlaceholder(cond ^ 1u) : 0;
+            VfpCdpBody(insts[k]);
+            if (conditional) {
+                e.PatchBranch(skip, e.Position());
+            }
+        }
+        e.Emit(0xEEF10A10u | (kRd << 12)); // VMRS kRd, FPSCR (el del juego, con flags)
+        e.StrImm(kRd, kCpu, fpscr_offset);
+        e.Emit(0xEEE10A10u | (kRn << 12)); // VMSR FPSCR, kRn (vuelve el del emulador)
+        const u32 back = e.Position();
+        // kT0 es de los que la llamada conserva; los flags se reponen despues
+        // de cada una para la condicion de la siguiente.
+        std::vector<u32> ops(insts, insts + count);
+        DeferCold({to_slow}, [this, ops = std::move(ops), keep_flags, conditions, back] {
+            if (keep_flags) {
+                e.MsrFlags(kT0);
+            }
+            for (const u32 inst : ops) {
+                const u32 cond = inst >> 28;
+                const bool conditional = conditions && cond != kAlways;
+                const u32 skip = conditional ? e.BranchPlaceholder(cond ^ 1u) : 0;
+                FlushCachedRegs();
+                e.MovReg(R0, kCpu);
+                e.Mov32(R1, inst);
+                e.Call(reinterpret_cast<const void*>(&HelperVfpCdp));
+                ReloadCachedRegs();
+                if (keep_flags) {
+                    e.MsrFlags(kT0);
+                }
+                if (conditional) {
+                    e.PatchBranch(skip, e.Position());
+                }
+            }
+            e.BranchTo(kAlways, back);
+        });
+    }
+
+private:
+    /// Operandos, operacion y resultado de una aritmetica VFP, con el FPSCR del
+    /// juego ya puesto y kT1 = &ExtReg[0] (ver VfpCdpRun).
+    void VfpCdpBody(u32 inst) {
+        int index = -1;
+        DecodeARMInstruction(inst, &index);
         const bool sz = Bits(inst, 8, 8) == 1;
         bool d_read = false, d_write = true, d_double = sz, uses_n = false, uses_m = true;
         bool m_double = sz;
@@ -2444,23 +2532,6 @@ private:
                 d_double = false;
             }
         }
-        const u32 fpscr_offset = g_offsets.vfp + VFP_FPSCR * 4;
-
-        // Los flags del juego: el TST los pisa (si alguien los lee despues).
-        const bool keep_flags = flags_live_after;
-        if (keep_flags) {
-            e.Mrs(kT0);
-        }
-        e.LdrImm(kRd, kCpu, fpscr_offset);
-        // TST kRd, #0x370000 (LEN y STRIDE): con vectores, a la funcion.
-        e.Emit(0xE3100000u | (kRd << 16) | (8u << 8) | 0x37u);
-        const u32 to_slow = e.BranchPlaceholder(kCondNe);
-
-        // kT1 = &ExtReg[0]
-        e.Mov32(kT1, g_offsets.ext);
-        e.AddReg(kT1, kCpu, kT1);
-        e.Emit(0xEEF10A10u | (kRn << 12)); // VMRS kRn, FPSCR (el del emulador)
-        e.Emit(0xEEE10A10u | (kRd << 12)); // VMSR FPSCR, kRd (el del juego)
         // Operandos: d -> s0/d0, n -> s2/d1, m -> s4/d2 (campo Vx 0, 1, 2).
         const auto guest_offset = [](u32 field, u32 bit, bool is_double) {
             return is_double ? (field | (bit << 4)) * 8 : ((field << 1) | bit) * 4;
@@ -2494,23 +2565,6 @@ private:
         if (d_write) {
             e.Emit((d_double ? 0xED800B00u : 0xED800A00u) | (kT1 << 16) | (d_off / 4));
         }
-        e.Emit(0xEEF10A10u | (kRd << 12)); // VMRS kRd, FPSCR (el del juego, con flags)
-        e.StrImm(kRd, kCpu, fpscr_offset);
-        e.Emit(0xEEE10A10u | (kRn << 12)); // VMSR FPSCR, kRn (vuelve el del emulador)
-        const u32 back = e.Position();
-        if (keep_flags) {
-            e.MsrFlags(kT0);
-        }
-        // Con vectores, la funcion del interprete (fuera de linea: kT0 es de
-        // los que la llamada conserva).
-        DeferCold({to_slow}, [this, inst, back] {
-            FlushCachedRegs();
-            e.MovReg(R0, kCpu);
-            e.Mov32(R1, inst);
-            e.Call(reinterpret_cast<const void*>(&HelperVfpCdp));
-            ReloadCachedRegs();
-            e.BranchTo(kAlways, back);
-        });
     }
 
     /// La aritmetica VFP por la funcion del interprete (lo de 0.1.6.1).
@@ -3328,6 +3382,25 @@ BlockFn EmitBlock(Block& block, bool check_mode) {
     for (std::size_t i = 0; i < block.words.size(); i++) {
         const u32 inst = block.words[i];
         const Decoded decoded = Classify(inst);
+        // La aritmetica VFP seguida, con un solo cambio de FPSCR (0.2.1.0).
+        if (decoded.kind == Kind::VfpCdp && Compiler::VfpNative(inst)) {
+            std::size_t end = i + 1;
+            while (end < block.words.size() && Classify(block.words[end]).kind == Kind::VfpCdp &&
+                   Compiler::VfpNative(block.words[end])) {
+                end++;
+            }
+            // Los flags se guardan si se leen despues o si alguna lleva condicion.
+            bool keep_flags = flags_live[end - 1];
+            for (std::size_t k = i; k < end; k++) {
+                keep_flags = keep_flags || (block.words[k] >> 28) != kAlways;
+            }
+            const u32 count = static_cast<u32>(end - i);
+            compiler.VfpCdpRun(&block.words[i], count, keep_flags, true);
+            terminated = false;
+            pc += 4 * count;
+            i = end - 1;
+            continue;
+        }
         compiler.SetFlagsLiveAfter(flags_live[i]);
         compiler.Instruction(inst, pc, decoded);
         terminated = decoded.terminator;
