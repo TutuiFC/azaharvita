@@ -6,6 +6,7 @@
 #include <psp2/audioout.h>
 #include "audio_core/vita_sink.h"
 #include "common/logging/log.h"
+#include "common/vita_diag.h"
 
 namespace AudioCore {
 
@@ -63,6 +64,11 @@ void VitaSink::SetCallback(std::function<void(s16*, std::size_t)> cb) {
 }
 
 void VitaSink::OutputThread() {
+    // Alta (0.2.0.2): pasa casi todo el tiempo bloqueado en sceAudioOutOutput,
+    // pero cuando le toca tiene 21 ms para rellenar el bloque o el sonido se
+    // corta. Con la prioridad por defecto de std::thread (la mas baja) y los
+    // tres nucleos ocupados, no llegaba.
+    Common::VitaSetThreadPriority(Common::kVitaPriorityAudio, "audio");
     while (running) {
         std::memset(buffer.data(), 0, buffer.size() * sizeof(s16));
         if (callback) {

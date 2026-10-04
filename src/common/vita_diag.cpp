@@ -149,6 +149,26 @@ void VitaAssertFail(const char* file, int line) noexcept {
     std::terminate();
 }
 
+void VitaSetThreadPriority(int priority, const char* role) {
+    const int before = sceKernelGetThreadCurrentPriority();
+    const int rc = sceKernelChangeThreadPriority(sceKernelGetThreadId(), priority);
+    char buffer[128];
+    std::size_t n = 0;
+    const auto append = [&](const char* text) {
+        for (std::size_t i = 0; text[i] != 0 && n < 96; i++) {
+            buffer[n++] = text[i];
+        }
+    };
+    append(role != nullptr ? role : "?");
+    append(" ");
+    n += AppendUInt(buffer + n, static_cast<unsigned int>(before));
+    append(" -> ");
+    n += AppendUInt(buffer + n, static_cast<unsigned int>(priority));
+    append(rc >= 0 ? ", ok" : ", ERROR");
+    buffer[n] = 0;
+    VitaNote("prioridad", buffer);
+}
+
 void VitaPinThreadToUserCore(unsigned int index, const char* role) {
     // Tres nucleos de usuario: 0x10000, 0x20000, 0x40000 (psp2/kernel/cpu.h).
     // El cuarto, SCE_KERNEL_CPU_MASK_SYSTEM, lo reserva el sistema y no se toca.

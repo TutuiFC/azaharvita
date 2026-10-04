@@ -874,22 +874,10 @@ bool g_worker_started = false;
 
 void* CgWorkerMain(void*) {
     unsigned int pinned_core = ~0u;
-    /**
-     * Un punto menos de prioridad (0.2.0.0). Compilar un shader son segundos de
-     * CPU sin soltar el nucleo, y en el mismo nucleo hay un ayudante del
-     * sombreado de vertices y otro del rasterizador por software a los que se
-     * espera en cada lote que los usa. Con la misma prioridad, si el
-     * planificador no reparte entre iguales, esperarian a que acabase la
-     * compilacion entera; asi la interrumpen.
-     */
-    {
-        const int priority = sceKernelGetThreadCurrentPriority();
-        const int rc = sceKernelChangeThreadPriority(sceKernelGetThreadId(), priority + 1);
-        Common::VitaNote("compilador de shaders",
-                         fmt::format("prioridad {} -> {} ({:#x})", priority, priority + 1,
-                                     static_cast<unsigned int>(rc))
-                             .c_str());
-    }
+    // La mas baja (0.2.0.2): compilar un shader son segundos de CPU sin soltar
+    // el nucleo, y comparte nucleo con ayudantes a los que espera el hilo de
+    // la GPU en cada lote. Ver kVitaPriorityBackground.
+    Common::VitaSetThreadPriority(Common::kVitaPriorityBackground, "compilador de shaders");
     while (true) {
         std::shared_ptr<CgJob> job;
         {

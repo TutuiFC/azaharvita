@@ -308,6 +308,22 @@ const char* LastFatalMessage();
 void VitaPinThreadToUserCore(unsigned int index, const char* role);
 
 /**
+ * PRIORIDADES EXPLICITAS (0.2.0.2). Menor numero = mas prioridad. Un hilo de
+ * std::thread nace con 191, la MAS BAJA de usuario, y uno de pthread con
+ * atributos con 159: el volcado de la 0.2.0.1 tenia a los ayudantes del
+ * sombreado de vertices y al audio por debajo del compilador de shaders. Con
+ * la GPU en otro nucleo ya no queda un nucleo libre, asi que el compilador los
+ * dejaba sin CPU segundos enteros: el hilo de la GPU esperando a un ayudante
+ * (Pokemon Sol congelado al pasar al 3D) y el audio a trompicones.
+ */
+constexpr int kVitaPriorityAudio = 96;
+constexpr int kVitaPriorityHelper = 159;
+constexpr int kVitaPriorityBackground = 191;
+
+/// Cambia la prioridad del hilo actual y lo anota en crash.txt con su papel.
+void VitaSetThreadPriority(int priority, const char* role);
+
+/**
  * Reloj REAL de la CPU en MHz, leido de vuelta despues de pedir el overclock.
  *
  * scePowerSetArmClockFrequency(444) puede ser rechazada en una compilacion
