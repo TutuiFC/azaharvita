@@ -36,6 +36,10 @@ constexpr int kScreenLayoutCount = 5;
 /// No volver a subir ni dibujar una imagen que no ha cambiado (0.1.7.1).
 inline std::atomic<bool> g_skip_repeated_frames{true};
 
+/// Sin esperar al refresco de la pantalla al presentar (0.2.0.3): el juego
+/// puede pasar del 100 % de velocidad. Con la espera, como mucho 60 por segundo.
+inline std::atomic<bool> g_unlimited_speed{false};
+
 /**
  * Ventana de emulacion para PS Vita.
  *
@@ -140,6 +144,8 @@ private:
     /// Atomicos desde 0.2.0.0: con la GPU en otro nucleo, la presentacion (que
     /// los escribe) y el bucle de main.cpp (que los lee) van en hilos distintos.
     std::atomic<bool> should_exit{false};
+    /// Lo ultimo que se le dijo a vita2d_set_vblank_wait (ver g_unlimited_speed).
+    int applied_vblank_wait = 1;
     bool is_touching = false;
     /// Evita que mantener SELECT+gatillo recorra todo el rango de golpe.
     bool frameskip_combo_held = false;

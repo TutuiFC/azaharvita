@@ -588,6 +588,11 @@ void EmuWindow_Vita::PresentScreens() {
     // vita2d_swap_buffers espera a que la GPU acabe y al barrido de pantalla.
     // Casi todo lo que se mida aqui es la consola PARADA, no trabajo: por eso va
     // en su propio contador y el overlay lo pinta aparte.
+    const int vblank_wait = g_unlimited_speed.load(std::memory_order_relaxed) ? 0 : 1;
+    if (vblank_wait != applied_vblank_wait) {
+        applied_vblank_wait = vblank_wait;
+        vita2d_set_vblank_wait(vblank_wait);
+    }
     const unsigned long long swap_begin = Common::VitaMicros();
     Common::VitaStageSlot().store("presentar: swap", std::memory_order_relaxed);
     vita2d_swap_buffers();

@@ -49,8 +49,10 @@
 #include "core/frontend/image_interface.h"
 #include "core/hle/service/cfg/cfg.h"
 #include "core/hle/service/service.h"
+#include "core/loader/loader.h"
 #include "video_core/gpu.h"
 #include "video_core/pica/pica_core.h"
+#include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/rasterizer_gxm.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
 #include "video_core/renderer_software/sw_rasterizer.h"
@@ -371,6 +373,10 @@ struct UserSettings {
     /// 0.2.0.0: la GPU emulada en otro nucleo (VideoCore::GPU::async_enabled).
     /// OFF hasta probarlo en consola con varios juegos.
     bool gpu_thread = false;
+    /// 0.2.0.3: sin esperar al refresco al presentar (VitaFrontend::g_unlimited_speed).
+    bool unlimited_speed = false;
+    /// 0.2.0.3: resolucion de la GPU, 1 o 2 (RasterizerGXM::resolution_scale).
+    int gpu_scale = 1;
 };
 UserSettings g_user;
 
@@ -439,6 +445,9 @@ void ApplyUserSettings() {
     Gxm::RasterizerGXM::transfer_on_gpu.store(g_user.gpu_screen_copy ? 1u : 0u,
                                               std::memory_order_relaxed);
     VideoCore::GPU::async_enabled.store(g_user.gpu_thread, std::memory_order_relaxed);
+    VitaFrontend::g_unlimited_speed.store(g_user.unlimited_speed, std::memory_order_relaxed);
+    Gxm::RasterizerGXM::resolution_scale.store(g_user.gpu_scale == 2 ? 2u : 1u,
+                                               std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -495,6 +504,10 @@ void LoadUserSettings() {
     read_bool("vs_especializar2=", g_user.vs_specialize);
     read_bool("copia_gpu=", g_user.gpu_screen_copy);
     read_bool("gpu_hilo=", g_user.gpu_thread);
+    read_bool("sin_limite=", g_user.unlimited_speed);
+    if (read_int("resolucion_gpu=", value)) {
+        g_user.gpu_scale = value == 2 ? 2 : 1;
+    }
 }
 
 /// El contenido de ajustes.txt, una clave por linea.
@@ -504,13 +517,15 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "volumen=%d\nidioma=%d\nresolucion_media=%d\njit_cache_reg=%d\n"
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
-        "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\n",
+        "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
+        "resolucion_gpu=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
         g_user.vs_escapes ? 1 : 0, g_user.full_vertex_dedup ? 1 : 0, g_user.sound ? 1 : 0,
         g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0,
-        g_user.gpu_screen_copy ? 1 : 0, g_user.gpu_thread ? 1 : 0);
+        g_user.gpu_screen_copy ? 1 : 0, g_user.gpu_thread ? 1 : 0,
+        g_user.unlimited_speed ? 1 : 0, g_user.gpu_scale);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
@@ -538,12 +553,12 @@ void SaveUserSettings() {
     sceIoClose(fd);
 }
 
-constexpr int kSettingsRows = 16;
+constexpr int kSettingsRows = 18;
 
 void DrawSettings(vita2d_pgf* font, int row) {
     constexpr int kFirstY = 100;
-    // 19 y no 20 desde la fila 16 (0.2.0.0): con 20 la ultima pisaba la ayuda.
-    constexpr int kRowStep = 19;
+    // 17 desde la fila 18 (0.2.0.3): con mas la ultima pisaba la ayuda.
+    constexpr int kRowStep = 17;
     constexpr int kValueX = 330;
 
     vita2d_start_drawing();
@@ -568,7 +583,9 @@ void DrawSettings(vita2d_pgf* font, int row) {
                                          "Omitir imagenes repetidas",
                                          "Vertices especializados a GPU",
                                          "Copia y borrado en GPU",
-                                         "GPU en otro nucleo"};
+                                         "GPU en otro nucleo",
+                                         "Limite de velocidad",
+                                         "Resolucion GPU"};
     char volume_text[16];
     std::snprintf(volume_text, sizeof(volume_text), "%d %%", g_user.volume_percent);
     const char* values[kSettingsRows] = {
@@ -587,7 +604,9 @@ void DrawSettings(vita2d_pgf* font, int row) {
         g_user.skip_repeated ? "ON" : "OFF",
         g_user.vs_specialize ? "ON" : "OFF",
         g_user.gpu_screen_copy ? "ON" : "OFF",
-        g_user.gpu_thread ? "ON" : "OFF"};
+        g_user.gpu_thread ? "ON" : "OFF",
+        g_user.unlimited_speed ? "Sin limite" : "100% (refresco)",
+        g_user.gpu_scale == 2 ? "2x (experimental)" : "1x"};
 
     for (int i = 0; i < kSettingsRows; i++) {
         const int y = kFirstY + i * kRowStep;
@@ -657,6 +676,12 @@ void DrawSettings(vita2d_pgf* font, int row) {
         {"ON: la GPU emulada y la imagen van en el nucleo 1; el juego, solo en el 0.",
          "Ganancia: lo que tarde la GPU por fotograma (calculo: +20-50% donde pesa). Al arrancar juego.",
          "Contra: nuevo. Si un juego se cuelga, va a saltos o se ve raro, apagar."},
+        {"Sin limite: no espera al refresco de la pantalla; puede pasar del 100% de velocidad.",
+         "Ganancia: menus y escenas ligeras van mas rapido que en la consola.",
+         "Contra: el juego puede ir acelerado y el sonido estirado. Se aplica al momento."},
+        {"2x: la GPU de la Vita dibuja el doble de pixeles por eje (800x480 la de arriba).",
+         "Mejora la nitidez; cuesta GPU y memoria de video. Se aplica al arrancar el juego.",
+         "Contra: experimental. Lo que vaya por software sigue a 1x. Si va lento o raro, 1x."},
     };
     vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
     vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);
@@ -690,6 +715,9 @@ void RunSettingsMenu(vita2d_pgf* font) {
     g_user.gpu_screen_copy =
         Gxm::RasterizerGXM::transfer_on_gpu.load(std::memory_order_relaxed) != 0;
     g_user.gpu_thread = VideoCore::GPU::async_enabled.load(std::memory_order_relaxed);
+    g_user.unlimited_speed = VitaFrontend::g_unlimited_speed.load(std::memory_order_relaxed);
+    g_user.gpu_scale =
+        Gxm::RasterizerGXM::resolution_scale.load(std::memory_order_relaxed) == 2 ? 2 : 1;
 
     int row = 0;
     // Todo lo que ya este pulsado al entrar (el START que la abrio) cuenta como
@@ -763,8 +791,14 @@ void RunSettingsMenu(vita2d_pgf* font) {
             case 14:
                 g_user.gpu_screen_copy = !g_user.gpu_screen_copy;
                 break;
-            default:
+            case 15:
                 g_user.gpu_thread = !g_user.gpu_thread;
+                break;
+            case 16:
+                g_user.unlimited_speed = !g_user.unlimited_speed;
+                break;
+            default:
+                g_user.gpu_scale = g_user.gpu_scale == 2 ? 1 : 2;
                 break;
             }
             ApplyUserSettings();
@@ -1426,6 +1460,21 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
     }
 
     LOG_INFO(Frontend, "Juego cargado (memoria libre: {} KB)", FreeMemoryKB());
+    if (Settings::GetWorkingGraphicsAPI() == Settings::GraphicsAPI::GXM) {
+        // Los shaders que este juego uso en partidas anteriores, a memoria antes
+        // de empezar (ver PreloadCgCache). Aun no hay emulacion: vita2d es solo
+        // de este hilo.
+        u64 program_id = 0;
+        system.GetAppLoader().ReadProgramId(program_id);
+        Gxm::PreloadCgCache(program_id, [font](u32 done, u32 total) {
+            if (total == 0) {
+                return;
+            }
+            char line[64];
+            std::snprintf(line, sizeof(line), "Shaders guardados: %u / %u", done, total);
+            DrawMessage(font, "Cargando shaders...", line);
+        });
+    }
     WriteCrashLog("carga", "System::Load OK, entrando al bucle de emulacion");
     system.RegisterCoreLoopThreadId();
 
@@ -1621,6 +1670,8 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
     }
 
     system.Shutdown();
+    // El menu se dibuja con la espera al refresco, aunque la partida fuera sin limite.
+    vita2d_set_vblank_wait(1);
 }
 
 /**
