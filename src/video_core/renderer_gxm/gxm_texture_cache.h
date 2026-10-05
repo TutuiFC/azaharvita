@@ -115,6 +115,11 @@ public:
     /// Tira las texturas que solapen el rango.
     void InvalidateRange(PAddr addr, u32 size);
 
+    /// El filtro y el repetido de la unidad en una textura que no es de la
+    /// cache (0.2.2.4, ver RasterizerGXM::TextureFromCopy). false si GXM no
+    /// tiene ese repetido.
+    static bool ApplyUnitSampler(u32 unit, const Pica::RegsInternal& regs, SceGxmTexture& texture);
+
     /// Tira todas.
     void Clear();
 

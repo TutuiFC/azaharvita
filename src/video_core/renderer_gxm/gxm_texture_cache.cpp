@@ -366,6 +366,43 @@ TextureCache::Entry& TextureCache::MakeRoom(u32 needed) {
     return *slot;
 }
 
+bool TextureCache::ApplyUnitSampler(u32 unit, const Pica::RegsInternal& regs,
+                                    SceGxmTexture& texture) {
+    const auto& texturing = regs.texturing;
+    const TexturingRegs::TextureConfig* config = nullptr;
+    switch (unit) {
+    case 0:
+        config = &texturing.texture0;
+        break;
+    case 1:
+        config = &texturing.texture1;
+        break;
+    case 2:
+        config = &texturing.texture2;
+        break;
+    default:
+        return false;
+    }
+    SceGxmTextureAddrMode wrap_s{};
+    SceGxmTextureAddrMode wrap_t{};
+    if (!MapWrap(config->wrap_s.Value(), &wrap_s) || !MapWrap(config->wrap_t.Value(), &wrap_t)) {
+        return false;
+    }
+    const bool min_linear =
+        config->min_filter == TexturingRegs::TextureConfig::TextureFilter::Linear;
+    const bool mag_linear =
+        config->mag_filter == TexturingRegs::TextureConfig::TextureFilter::Linear;
+    sceGxmTextureSetMinFilter(&texture, min_linear ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                                                   : SCE_GXM_TEXTURE_FILTER_POINT);
+    sceGxmTextureSetMagFilter(&texture, mag_linear ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                                                   : SCE_GXM_TEXTURE_FILTER_POINT);
+    sceGxmTextureSetMipFilter(&texture, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+    sceGxmTextureSetMipmapCount(&texture, 1);
+    sceGxmTextureSetUAddrMode(&texture, wrap_s);
+    sceGxmTextureSetVAddrMode(&texture, wrap_t);
+    return true;
+}
+
 const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
                                        Memory::MemorySystem& memory) {
     const auto& texturing = regs.texturing;

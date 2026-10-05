@@ -61,6 +61,8 @@ std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
+std::atomic<u32> RasterizerGXM::gpu_texture_transfers{0};
+std::atomic<u32> RasterizerGXM::texture_source_writebacks{0};
 std::atomic<u32> RasterizerGXM::gpu_fills{0};
 std::array<std::atomic<u32>, 3> RasterizerGXM::reload_causes{};
 std::atomic<u32> RasterizerGXM::soft_fills{0};
@@ -679,6 +681,9 @@ struct RasterizerGXM::Surface {
     /// Su contenido ya se lo ha llevado una copia de pantalla en la GPU y no
     /// ha cambiado desde (0.1.8.7): FlushForPresent no la vuelca.
     bool copied = false;
+    /// Origen de una copia de mosaico a mosaico (0.2.2.4): si el juego la usa
+    /// tambien de textura, se vuelca entonces (ver TextureFromCopy).
+    bool tiled_source = false;
     /// Rellenos de color del invitado que todavia no se han pintado: los hace
     /// la siguiente escena (0.1.9.6, ver AccelerateFill). Cada uno es una
     /// franja de filas y los cuatro bytes del pixel tal como van en
@@ -761,6 +766,13 @@ struct RasterizerGXM::ScreenCopy {
     bool valid = false;
     /// ...y la memoria del invitado todavia no.
     bool pending = false;
+    /// De mosaico a mosaico (0.2.2.4): una textura, con las filas como las
+    /// deja el cache de texturas (la 0 es la ultima del invitado) para
+    /// muestrearla tal cual. Ver TextureFromCopy.
+    bool tiled = false;
+    /// La valla de la escena del ultimo blit (0.2.2.4): MaterializeCopy espera
+    /// solo a esa, tambien con la escena de un lote abierta.
+    u32 fence = 0;
     /// Para elegir cual se rehace si hacen falta mas de kMaxScreenCopies.
     u32 last_use = 0;
     /// La textura sobre la superficie de origen del ultimo blit.
@@ -810,7 +822,9 @@ struct RasterizerGXM::BlitProgram {
 
 namespace {
 /// Pantallas a la vez: las dos de arriba y las dos de abajo del doble buffer.
-constexpr std::size_t kMaxScreenCopies = 4;
+/// Ocho desde 0.2.2.4: aqui van tambien las texturas de TextureFromCopy, y
+/// rehacer una copia cuesta un sceGxmFinish.
+constexpr std::size_t kMaxScreenCopies = 8;
 /// Vertice del quad del blit: posicion float4 y coordenada float2, como el
 /// presentador.
 constexpr u32 kBlitVertexStride = 6 * sizeof(float);
@@ -2679,8 +2693,10 @@ void RasterizerGXM::Reload(Surface& surface) {
     surface.clear_pending = false;
     surface.clear_count = 0;
     // Lo que lee del invitado tiene que estar escrito: una copia de pantalla
-    // en la GPU que pise el tramo, primero a la memoria.
+    // en la GPU que pise el tramo, primero a la memoria. Y una textura que se
+    // quedo en la GPU deja de valer: esa memoria pasa a ser de la superficie.
     MaterializeCopies(surface.guest_address, surface.guest_stride * surface.height);
+    DropTiledCopies(surface.guest_address, surface.guest_stride * surface.height);
     // Lee y escribe color_buffer: misma razon que WriteBack.
     WaitGpu(GpuWait::Reload);
     surface.needs_reload = false;
@@ -2753,7 +2769,7 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
      * blit, y la GPU las hace en orden.
      */
     for (const auto& copy : self.screen_copies) {
-        if (!copy->valid || copy->dst != guest_address) {
+        if (!copy->valid || copy->tiled || copy->dst != guest_address) {
             continue;
         }
         SceGxmTextureFormat tex_format{};
@@ -2850,6 +2866,142 @@ void RasterizerGXM::DropCopies(PAddr addr, u32 size) {
     }
 }
 
+void RasterizerGXM::DropTiledCopies(PAddr addr, u32 size) {
+    for (auto& copy : screen_copies) {
+        if (copy->valid && copy->tiled && addr < copy->dst + copy->dst_size &&
+            copy->dst < addr + size) {
+            MaterializeCopy(*copy);
+            copy->valid = false;
+        }
+    }
+}
+
+namespace {
+/// El formato de la transferencia es el de la textura (no son el mismo enum).
+bool SameTextureFormat(Pica::PixelFormat pixel, Pica::TexturingRegs::TextureFormat texture) {
+    using TextureFormat = Pica::TexturingRegs::TextureFormat;
+    switch (pixel) {
+    case Pica::PixelFormat::RGBA8:
+        return texture == TextureFormat::RGBA8;
+    case Pica::PixelFormat::RGB565:
+        return texture == TextureFormat::RGB565;
+    case Pica::PixelFormat::RGB5A1:
+        return texture == TextureFormat::RGB5A1;
+    case Pica::PixelFormat::RGBA4:
+        return texture == TextureFormat::RGBA4;
+    default:
+        return false;
+    }
+}
+
+/// La unidad de textura tal como la ve el cache: configuracion, formato y si
+/// esta encendida.
+bool TextureUnit(const Pica::TexturingRegs& texturing, u32 unit,
+                 const Pica::TexturingRegs::TextureConfig*& config,
+                 Pica::TexturingRegs::TextureFormat& format) {
+    switch (unit) {
+    case 0:
+        config = &texturing.texture0;
+        format = texturing.texture0_format;
+        return texturing.main_config.texture0_enable != 0;
+    case 1:
+        config = &texturing.texture1;
+        format = texturing.texture1_format;
+        return texturing.main_config.texture1_enable != 0;
+    case 2:
+        config = &texturing.texture2;
+        format = texturing.texture2_format;
+        return texturing.main_config.texture2_enable != 0;
+    default:
+        return false;
+    }
+}
+} // Anonymous namespace
+
+const SceGxmTexture* RasterizerGXM::TextureFromCopy(u32 unit) {
+    const auto& texturing = pica.regs.internal.texturing;
+    const Pica::TexturingRegs::TextureConfig* config = nullptr;
+    Pica::TexturingRegs::TextureFormat format{};
+    if (!TextureUnit(texturing, unit, config, format)) {
+        return nullptr;
+    }
+    const PAddr address = config->GetPhysicalAddress();
+    const u32 span = Pica::TexturingRegs::NibblesPerPixel(format) * config->width *
+                     config->height / 2;
+    /**
+     * El origen de una copia de mosaico a mosaico no se vuelca al presentar
+     * (copied), y la transferencia por software lo volcaba en cada fotograma:
+     * si el juego tambien lo usa de textura, se vuelca aqui, para que el cache
+     * no lea memoria atrasada. La superficie abierta no: es el destino de este
+     * mismo lote.
+     */
+    for (auto& surface : surfaces) {
+        if (!surface->tiled_source || !surface->dirty || surface.get() == open_surface ||
+            !surface->Overlaps(address, span)) {
+            continue;
+        }
+        WriteBack(*surface);
+        texture_source_writebacks.fetch_add(1, std::memory_order_relaxed);
+        if (textures != nullptr) {
+            textures->InvalidateRange(surface->guest_address,
+                                      surface->guest_stride * surface->height);
+        }
+    }
+    for (auto& copy : screen_copies) {
+        if (!copy->valid || !copy->tiled || address >= copy->dst + copy->dst_size ||
+            copy->dst >= address + span) {
+            continue;
+        }
+        // Como la decodifica el cache: la unidad 0 solo en 2D.
+        const bool flat = unit != 0 ||
+                          config->type == Pica::TexturingRegs::TextureConfig::Texture2D ||
+                          config->type == Pica::TexturingRegs::TextureConfig::Projection2D;
+        /**
+         * Lineal y no LINEAR_STRIDED: en esas, los bits del filtro de mipmap y
+         * de la cuenta de niveles son los del stride (psp2/gxm.h), y aqui se
+         * ponen los de la unidad. El stride de una lineal es el ancho
+         * redondeado a 8, que es el del buffer de la copia (GetScreenCopy).
+         */
+        SceGxmTextureFormat tex_format{};
+        SceGxmTexture& texture = copy_textures[unit];
+        const bool usable =
+            flat && copy->dst == address && copy->width == config->width &&
+            copy->height == config->height && SameTextureFormat(copy->output_format, format) &&
+            PresentTextureFormat(copy->gxm_color_format, tex_format) &&
+            sceGxmTextureInitLinear(&texture, copy->color_buffer.Data(), tex_format,
+                                    Phys(copy->width, copy->scale),
+                                    Phys(copy->height, copy->scale), 1) >= 0 &&
+            TextureCache::ApplyUnitSampler(unit, pica.regs.internal, texture);
+        if (!usable) {
+            // La lee de otra forma: al invitado, y la decodifica el cache.
+            MaterializeCopy(*copy);
+            continue;
+        }
+        copy->last_use = ++copy_clock;
+        return &texture;
+    }
+    return nullptr;
+}
+
+void RasterizerGXM::MaterializeTextureCopies() {
+    const bool any = std::any_of(screen_copies.begin(), screen_copies.end(), [](const auto& copy) {
+        return copy->valid && copy->tiled && copy->pending;
+    });
+    if (!any) {
+        return;
+    }
+    const auto& texturing = pica.regs.internal.texturing;
+    for (u32 unit = 0; unit < 3; unit++) {
+        const Pica::TexturingRegs::TextureConfig* config = nullptr;
+        Pica::TexturingRegs::TextureFormat format{};
+        if (TextureUnit(texturing, unit, config, format)) {
+            MaterializeCopies(config->GetPhysicalAddress(),
+                              Pica::TexturingRegs::NibblesPerPixel(format) * config->width *
+                                  config->height / 2);
+        }
+    }
+}
+
 /**
  * La copia de verdad a la memoria del invitado, desde el buffer de la copia.
  * La pantalla es lineal, asi que es fila a fila: los mismos bytes que el
@@ -2865,7 +3017,11 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
         return;
     }
     // El blit tiene que haber terminado.
-    WaitGpu(GpuWait::Copy);
+    if (copy.fence != 0) {
+        WaitFence(copy.fence, GpuWait::Copy);
+    } else {
+        WaitGpu(GpuWait::Copy);
+    }
     u8* const dst = memory.GetPhysicalPointer(copy.dst);
     const u8* const src = static_cast<const u8*>(copy.color_buffer.Data());
     const u32 src_stride = copy.stride * copy.bpp;
@@ -2874,34 +3030,61 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
                              copy.output_format == Pica::PixelFormat::RGB8;
     alignas(16) u8 row[2048 * 4];
     alignas(16) u8 scaled[2048 * 4];
-    for (u32 y = 0; y < copy.height; y++) {
-        // CDRAM se lee sin cache: la fila de una vez y despues de memoria normal.
-        if (copy.scale == 2) {
-            std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride,
-                        copy.width * copy.bpp);
-        } else {
-            const u32 phys_width = Phys(copy.width, copy.scale);
-            std::memcpy(scaled, src + static_cast<std::size_t>(Phys(y, copy.scale)) * src_stride,
+    if (copy.tiled) {
+        // Una textura (0.2.2.4): las filas al reves que en el invitado, y alli
+        // en mosaicos, como al volcar una superficie.
+        const u32 row_bytes = copy.width * copy.bpp;
+        const u32 phys_width = Phys(copy.width, copy.scale);
+        scale_scratch.resize(static_cast<std::size_t>(row_bytes) * copy.height);
+        for (u32 y = 0; y < copy.height; y++) {
+            const u32 source_row = copy.height - 1 - y;
+            u8* out = scale_scratch.data() + static_cast<std::size_t>(y) * row_bytes;
+            if (copy.scale == 2) {
+                std::memcpy(out, src + static_cast<std::size_t>(source_row) * src_stride,
+                            row_bytes);
+                continue;
+            }
+            std::memcpy(scaled,
+                        src + static_cast<std::size_t>(Phys(source_row, copy.scale)) * src_stride,
                         phys_width * copy.bpp);
             for (u32 x = 0; x < copy.width; x++) {
-                std::memcpy(row + x * copy.bpp, scaled + Phys(x, copy.scale) * copy.bpp,
+                std::memcpy(out + x * copy.bpp, scaled + Phys(x, copy.scale) * copy.bpp,
                             copy.bpp);
             }
         }
-        u8* out = dst + static_cast<std::size_t>(y) * copy.width * out_bpp;
-        if (rgba_to_rgb) {
-            for (u32 x = 0; x < copy.width; x++) {
-                out[x * 3 + 0] = row[x * 4 + 1];
-                out[x * 3 + 1] = row[x * 4 + 2];
-                out[x * 3 + 2] = row[x * 4 + 3];
+        CopyTiledGuest(dst, scale_scratch.data(), copy.width, copy.height, row_bytes, copy.bpp,
+                       true);
+    } else {
+        for (u32 y = 0; y < copy.height; y++) {
+            // CDRAM se lee sin cache: la fila de una vez y despues de memoria normal.
+            if (copy.scale == 2) {
+                std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride,
+                            copy.width * copy.bpp);
+            } else {
+                const u32 phys_width = Phys(copy.width, copy.scale);
+                std::memcpy(scaled,
+                            src + static_cast<std::size_t>(Phys(y, copy.scale)) * src_stride,
+                            phys_width * copy.bpp);
+                for (u32 x = 0; x < copy.width; x++) {
+                    std::memcpy(row + x * copy.bpp, scaled + Phys(x, copy.scale) * copy.bpp,
+                                copy.bpp);
+                }
             }
-        } else if (out_bpp == copy.bpp) {
-            std::memcpy(out, row, copy.width * out_bpp);
-        } else {
-            // RGB8: la superficie lleva 4 bytes por pixel y los 3 primeros son
-            // los del invitado (ver CurrentSurface).
-            for (u32 x = 0; x < copy.width; x++) {
-                std::memcpy(out + x * 3, row + x * 4, 3);
+            u8* out = dst + static_cast<std::size_t>(y) * copy.width * out_bpp;
+            if (rgba_to_rgb) {
+                for (u32 x = 0; x < copy.width; x++) {
+                    out[x * 3 + 0] = row[x * 4 + 1];
+                    out[x * 3 + 1] = row[x * 4 + 2];
+                    out[x * 3 + 2] = row[x * 4 + 3];
+                }
+            } else if (out_bpp == copy.bpp) {
+                std::memcpy(out, row, copy.width * out_bpp);
+            } else {
+                // RGB8: la superficie lleva 4 bytes por pixel y los 3 primeros son
+                // los del invitado (ver CurrentSurface).
+                for (u32 x = 0; x < copy.width; x++) {
+                    std::memcpy(out + x * 3, row + x * 4, 3);
+                }
             }
         }
     }
@@ -3038,7 +3221,7 @@ bool RasterizerGXM::EnsureBlitProgram() {
 
 RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u32 height,
                                                        u32 gxm_color_format, u32 bpp,
-                                                       u32 scale) {
+                                                       u32 scale, bool tiled) {
     std::unique_ptr<ScreenCopy>* slot = nullptr;
     for (auto& copy : screen_copies) {
         if (copy->dst == dst) {
@@ -3047,7 +3230,8 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
         }
     }
     if (slot != nullptr && (*slot)->width == width && (*slot)->height == height &&
-        (*slot)->gxm_color_format == gxm_color_format && (*slot)->scale == scale) {
+        (*slot)->gxm_color_format == gxm_color_format && (*slot)->scale == scale &&
+        (*slot)->tiled == tiled) {
         return slot->get();
     }
 
@@ -3060,6 +3244,7 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
     copy->height = height;
     copy->gxm_color_format = gxm_color_format;
     copy->scale = scale;
+    copy->tiled = tiled;
     const u32 phys_width = Phys(width, scale);
     const u32 phys_height = Phys(height, scale);
     copy->stride = (phys_width + 7) & ~7u;
@@ -3200,7 +3385,12 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     sceGxmSetFragmentTexture(context, blit->texture_unit, &texture);
     sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
                quad + 8 * kBlitVertexStride, 4);
-    sceGxmEndScene(context, nullptr, nullptr);
+    fence_sent++;
+    SceGxmNotification done{};
+    done.address = fence_address;
+    done.value = fence_sent;
+    sceGxmEndScene(context, nullptr, &done);
+    copy.fence = fence_sent;
     gpu_pending = true;
     return true;
 }
@@ -3271,17 +3461,33 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     if (!available) {
         return reject("sin gxm");
     }
-    if (config.input_linear || config.dont_swizzle ||
-        config.scaling > Pica::DisplayTransferConfig::ScaleXY) {
+    if (config.input_linear || config.scaling > Pica::DisplayTransferConfig::ScaleXY) {
         return reject("modo");
     }
+    /**
+     * DE MOSAICO A MOSAICO, UNA TEXTURA EN LA GPU (0.2.2.4). Pokemon Sol reduce
+     * en cada fotograma una superficie de 128x256 a 64x128 (dont_swizzle, 2x2)
+     * y la usa de textura para el brillo. Por software era volcar la superficie
+     * esperando a la GPU -- y a todo lo que tuviera delante, hasta dos
+     * fotogramas desde 0.2.2.0 --, reducirla con la CPU y decodificarla: 6,5 a
+     * 8,5 ms por fotograma solo de espera ("volcado" en crash.txt de 0.2.2.1).
+     * Ahora la reduce el blit y se queda en la GPU (TextureFromCopy). Sin
+     * conversion de formato y sin RGB8: el alfa de una superficie RGB8 es el
+     * del shader, y el de una textura RGB8 es 1.
+     */
+    const bool tiled = config.dont_swizzle != 0;
     // El mismo formato, o RGBA8 a RGB8. Los de 16 bits desde 0.1.9.8
     // (New Super Mario Bros. 2 dibuja en RGB565).
     if (in_format != out_format &&
-        !(in_format == Pica::PixelFormat::RGBA8 && out_format == Pica::PixelFormat::RGB8)) {
+        (tiled ||
+         !(in_format == Pica::PixelFormat::RGBA8 && out_format == Pica::PixelFormat::RGB8))) {
         return reject("formato");
     }
-    if (!IsDisplayFramebuffer(dst)) {
+    if (tiled && (out_format == Pica::PixelFormat::RGB8 || width % 8 != 0 || height % 8 != 0 ||
+                  (config.flip_vertically && config.crop_input_lines))) {
+        return reject("textura");
+    }
+    if (!tiled && !IsDisplayFramebuffer(dst)) {
         return reject("no es pantalla");
     }
 
@@ -3336,8 +3542,8 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     if (!EnsureBlitProgram()) {
         return reject("sin blit");
     }
-    ScreenCopy* copy =
-        GetScreenCopy(dst, width, height, source->gxm_color_format, source->rt_bpp, source->scale);
+    ScreenCopy* copy = GetScreenCopy(dst, width, height, source->gxm_color_format, source->rt_bpp,
+                                     source->scale, tiled);
     if (copy == nullptr) {
         return reject("sin copia");
     }
@@ -3345,7 +3551,8 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     // Lo que hubiera en esa pantalla deja de valer, como en la copia por
     // software (la copia anterior a ella incluida).
     InvalidateRegion(dst, dst_size);
-    if (!BlitToCopy(*copy, *source, first_row, config.flip_vertically != 0, in_width,
+    // La textura, volteada respecto al invitado (ver ScreenCopy::tiled).
+    if (!BlitToCopy(*copy, *source, first_row, (config.flip_vertically != 0) != tiled, in_width,
                     in_height)) {
         return reject("escena");
     }
@@ -3356,6 +3563,14 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     copy->pending = true;
     copy->last_use = ++copy_clock;
     source->copied = true;
+    if (tiled) {
+        source->tiled_source = true;
+        gpu_texture_transfers.fetch_add(1, std::memory_order_relaxed);
+        static bool noted_texture = false;
+        NoteOnce(noted_texture, "gxm copia", "textura {:#010x} {}x{} desde {:#010x}, en la GPU",
+                 dst, width, height, src);
+        return true;
+    }
     gpu_transfers.fetch_add(1, std::memory_order_relaxed);
     static bool noted = false;
     NoteOnce(noted, "gxm copia", "pantalla {:#010x} {}x{} desde {:#010x}, copiada en la GPU", dst,
@@ -3386,14 +3601,17 @@ void FillPattern(u8* dst, u32 bytes, u32 texel, u32 bpp) {
 
 std::string RasterizerGXM::TakeSurfaceSummary() {
     return fmt::format("recargas: lote soft {} relleno/transf {} volcar+invalidar {} | "
-                       "rellenos por software {} ({} KB) | copias de textura {} ({} KB)",
+                       "rellenos por software {} ({} KB) | copias de textura {} ({} KB) | "
+                       "texturas en la gpu {}, volcados por textura {}",
                        reload_causes[0].exchange(0, std::memory_order_relaxed),
                        reload_causes[1].exchange(0, std::memory_order_relaxed),
                        reload_causes[2].exchange(0, std::memory_order_relaxed),
                        soft_fills.exchange(0, std::memory_order_relaxed),
                        soft_fill_kb.exchange(0, std::memory_order_relaxed),
                        texture_copies.exchange(0, std::memory_order_relaxed),
-                       texture_copy_kb.exchange(0, std::memory_order_relaxed));
+                       texture_copy_kb.exchange(0, std::memory_order_relaxed),
+                       gpu_texture_transfers.exchange(0, std::memory_order_relaxed),
+                       texture_source_writebacks.exchange(0, std::memory_order_relaxed));
 }
 
 bool RasterizerGXM::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
@@ -4425,6 +4643,8 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
  * queda para recargarse antes del siguiente lote de GPU o de copiarla.
  */
 void RasterizerGXM::PrepareSoftwareBatch() {
+    // El software lee sus texturas de la memoria del invitado.
+    MaterializeTextureCopies();
     const PAddr address =
         pica.regs.internal.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
     for (auto& surface : surfaces) {
@@ -4900,7 +5120,10 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         if (pipeline->samplers[i] == nullptr) {
             continue;
         }
-        const SceGxmTexture* texture = textures->Get(i, pica.regs.internal, memory);
+        const SceGxmTexture* texture = TextureFromCopy(i);
+        if (texture == nullptr) {
+            texture = textures->Get(i, pica.regs.internal, memory);
+        }
         if (texture == nullptr) {
             NoteSkip(4, "textura");
             return false;

@@ -188,6 +188,10 @@ public:
     /// Copias hechas asi y copias que hubo que hacer de verdad despues (overlay).
     static std::atomic<u32> gpu_transfers;
     static std::atomic<u32> transfer_materialized;
+    /// Copias de mosaico a mosaico que se quedan en la GPU de textura (0.2.2.4),
+    /// y volcados de su origen porque el juego tambien lo usaba de textura.
+    static std::atomic<u32> gpu_texture_transfers;
+    static std::atomic<u32> texture_source_writebacks;
 
     /**
      * Lo que hace SwapBuffers antes de presentar: como FlushPending, pero las
@@ -436,7 +440,7 @@ private:
     /// La copia de esa pantalla, con su render target, creada o rehecha si
     /// hace falta. nullptr si no hay memoria.
     ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format, u32 bpp,
-                              u32 scale);
+                              u32 scale, bool tiled);
     /// El quad de la superficie a la copia, en una escena suya.
     bool AccelerateFillOnGpu(const Pica::MemoryFillConfig& config);
     bool FillGuestMemory(const Pica::MemoryFillConfig& config);
@@ -465,6 +469,20 @@ private:
     void MaterializeAllCopies();
     /// El invitado ha escrito en esa pantalla por otro camino: copia olvidada.
     void DropCopies(PAddr addr, u32 size);
+    /**
+     * TEXTURAS QUE SE QUEDAN EN LA GPU (0.2.2.4). Una copia de mosaico a
+     * mosaico (dont_swizzle) desde una superficie nuestra se hace con el blit y
+     * no se escribe en el invitado: si el juego la usa de textura con la misma
+     * direccion, medidas y formato, se muestrea su buffer tal cual. Lo que la
+     * lea de otra forma (otra textura que la pise, un lote por software, la
+     * CPU, una superficie encima) la escribe antes en el invitado.
+     */
+    const SceGxmTexture* TextureFromCopy(u32 unit);
+    /// Las que pisen las texturas de las unidades encendidas, al invitado.
+    void MaterializeTextureCopies();
+    /// Las que pisen el tramo, al invitado, y ya no valen de textura.
+    void DropTiledCopies(PAddr addr, u32 size);
+    std::array<SceGxmTexture, 3> copy_textures{};
 
     /// Pesquisa un pipeline (y compila el shader si es la primera vez).
     /// Devuelve nullptr si la configuracion no esta soportada.
