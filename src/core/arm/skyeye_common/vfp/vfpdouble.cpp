@@ -460,6 +460,25 @@ static u32 vfp_compare(ARMul_State* state, int dd, int signal_on_qnan, s64 m, u3
     }
 
     d = vfp_get_double(state, dd);
+    /**
+     * FLUSH-TO-ZERO TAMBIEN AL COMPARAR (0.2.1.8). Con FPSCR.FZ, el hardware
+     * trata un operando subnormal como cero (y marca IDC), igual que en la
+     * aritmetica, que aqui ya lo hacia al desempaquetar. La comparacion
+     * miraba los bits tal cual: un 1e-40 frente a 0 salia "mayor" aqui e
+     * "igual" en la Vita, y el JIT, que usa VCMP del hardware, daba otra rama
+     * (14 DIFERENCIA en Inazuma Eleven GO 0.2.1.7, todas vcmp + vmrs + salto).
+     */
+    u32 denormal = 0;
+    if ((fpscr & FPSCR_FLUSH_TO_ZERO) != 0) {
+        if (vfp_double_packed_exponent(m) == 0 && vfp_double_packed_mantissa(m) != 0) {
+            m = 0;
+            denormal = FPSCR_IDC;
+        }
+        if (vfp_double_packed_exponent(d) == 0 && vfp_double_packed_mantissa(d) != 0) {
+            d = 0;
+            denormal = FPSCR_IDC;
+        }
+    }
     if (vfp_double_packed_exponent(d) == 2047 && vfp_double_packed_mantissa(d)) {
         ret |= FPSCR_CFLAG | FPSCR_VFLAG;
         if (signal_on_qnan ||
@@ -506,7 +525,7 @@ static u32 vfp_compare(ARMul_State* state, int dd, int signal_on_qnan, s64 m, u3
     }
     LOG_TRACE(Core_ARM11, "In {}, state=0x{}, ret=0x{:x}", __FUNCTION__, fmt::ptr(state), ret);
 
-    return ret;
+    return ret | denormal;
 }
 
 static u32 vfp_double_fcmp(ARMul_State* state, int dd, int unused, int dm, u32 fpscr) {

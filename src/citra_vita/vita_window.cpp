@@ -1284,9 +1284,9 @@ void EmuWindow_Vita::DrawStatsOverlay() {
              * necesitaba una captura de pantalla, y crash.txt es lo unico que
              * llega siempre. Treinta veces (5 minutos) desde 0.2.0.0: con
              * seis solo salia el primer minuto, que suele ser la intro.
+             * Por ventana desde 0.2.1.8: como static valian para toda la
+             * sesion, y el segundo juego sin reiniciar no anotaba nada.
              */
-            static u32 frame_ticks = 0;
-            static u32 frame_notes = 0;
             if (++frame_ticks % 10 == 0 && frame_notes < 30) {
                 frame_notes++;
                 Common::VitaNote(

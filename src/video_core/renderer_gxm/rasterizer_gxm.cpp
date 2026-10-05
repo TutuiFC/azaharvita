@@ -14,6 +14,7 @@
 #include <utility>
 #include <fmt/format.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/shacccg.h>
 #include <vita2d.h>
 #include "common/logging/log.h"
@@ -2546,9 +2547,36 @@ void RasterizerGXM::WaitFence(u32 fence) {
     if (FenceDone(fence)) {
         return;
     }
-    // Las escenas acaban en orden: esperar a todo cubre esta.
-    gpu_pending = true;
-    WaitGpu();
+    if (static_cast<s32>(fence_sent - fence) < 0) {
+        // Una valla que aun no se ha enviado (no deberia pasar): a todo.
+        gpu_pending = true;
+        WaitGpu();
+        return;
+    }
+    /**
+     * SOLO ESA VALLA (0.2.1.8). Hasta ahora esto era sceGxmFinish: esperar a
+     * TODO lo enviado, incluido lo que se acababa de mandar. FlushForPresent
+     * lo hace en cada fotograma para no pisar los vertices de la presentacion
+     * anterior, y con eso el hilo de la GPU se quedaba parado hasta que la
+     * Vita terminaba de dibujar el fotograma entero, sin poder preparar el
+     * siguiente: crash.txt de Pokemon Sol en 0.2.1.7, "espera a la gpu" 10,6
+     * ms de cada fotograma de 39, y el juego esperando al hilo de la GPU 11
+     * ms. La valla la escribe la GPU al acabar cada escena, y acaban en orden:
+     * basta con mirarla. sceGxmNotificationWait no sirve: espera a que el
+     * valor sea IGUAL, y si la GPU ya ha pasado de esa escena no volveria.
+     * Con un tope de 2 s, por si la GPU no la escribiera nunca.
+     */
+    const unsigned long long begin = Common::VitaMicros();
+    const Common::ScopedVitaStage stage{"gxm espera a una valla"};
+    while (!FenceDone(fence)) {
+        if (Common::VitaMicros() - begin > 2000000ull) {
+            gpu_pending = true;
+            WaitGpu();
+            return;
+        }
+        sceKernelDelayThread(50);
+    }
+    Common::FrameStats::Add(Common::FrameStats::finish_us, begin);
 }
 
 void RasterizerGXM::WaitGpu() {
