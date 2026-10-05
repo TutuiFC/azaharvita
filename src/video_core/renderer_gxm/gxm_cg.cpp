@@ -1154,6 +1154,10 @@ std::mutex g_jobs_mutex;
 std::condition_variable g_jobs_ready;
 std::deque<std::shared_ptr<CgJob>> g_jobs;
 bool g_worker_started = false;
+std::atomic<SceUID> g_worker_uid{-1};
+std::atomic<bool> g_worker_boosted{false};
+/// Justo por encima de los ayudantes y del hilo de la GPU (159).
+constexpr int kCgBoostedPriority = Common::kVitaPriorityHelper - 1;
 
 void* CgWorkerMain(void*) {
     /**
@@ -1175,6 +1179,7 @@ void* CgWorkerMain(void*) {
     // el nucleo, y comparte nucleo con ayudantes a los que espera el hilo de
     // la GPU en cada lote. Ver kVitaPriorityBackground.
     Common::VitaSetThreadPriority(Common::kVitaPriorityBackground, "compilador de shaders");
+    g_worker_uid.store(sceKernelGetThreadId(), std::memory_order_release);
     while (true) {
         std::shared_ptr<CgJob> job;
         {
@@ -1198,11 +1203,40 @@ void* CgWorkerMain(void*) {
             }
         }
         job->done.store(true, std::memory_order_release);
+        if (g_worker_boosted.exchange(false, std::memory_order_acq_rel)) {
+            sceKernelChangeThreadPriority(sceKernelGetThreadId(),
+                                          Common::kVitaPriorityBackground);
+        }
     }
     return nullptr;
 }
 
 } // Anonymous namespace
+
+/**
+ * EL COMPILADOR SE QUEDABA SIN CPU (0.2.1.3). crash.txt de Pokemon Sol en
+ * 0.2.1.2: los shaders de vertices del 3D tardaban 30-60 s cada uno (uno que
+ * pillo la CPU libre, 2,6 s), porque mientras no estan, sus lotes van por la
+ * CPU y los ayudantes que los sombrean (159) ocupan los nucleos al 97 %, por
+ * encima del compilador (191). Cuanto mas tardaba, mas tiempo a 1 FPS. Solo
+ * cuando un lote lleva esperando de mas se le sube: la consola se para un
+ * momento en vez de ir a 1 FPS minutos, y el resultado queda en la cache.
+ */
+void CgMarkStarved() {
+    if (g_worker_boosted.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const SceUID thread = g_worker_uid.load(std::memory_order_acquire);
+    if (thread < 0 || g_worker_boosted.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    sceKernelChangeThreadPriority(thread, kCgBoostedPriority);
+    static bool noted = false;
+    if (!noted) {
+        noted = true;
+        Common::VitaNote("gxm compila", "lotes esperando: compilador por encima de los ayudantes");
+    }
+}
 
 void CgSubmit(std::shared_ptr<CgJob> job, bool urgent) {
     std::lock_guard lock{g_jobs_mutex};

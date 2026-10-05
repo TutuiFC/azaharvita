@@ -25,6 +25,7 @@
 #include "video_core/renderer_gxm/renderer_gxm.h"
 #include "video_core/renderer_software/renderer_software.h"
 #include "video_core/renderer_software/sw_rasterizer.h"
+#include "video_core/shader/shader_neon_jit.h"
 
 namespace VitaFrontend {
 
@@ -1332,6 +1333,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                         .c_str());
                 Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
                 Common::VitaNote("jit otro", Core::ArmJit::TakeRejectWords().c_str());
+                Common::VitaNote("vs flujo", Pica::Shader::Fast::TakeFlowSummary().c_str());
                 u32 code_bytes = 0;
                 u32 code_blocks = 0;
                 Core::ArmJit::CodeUsage(code_bytes, code_blocks);

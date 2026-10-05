@@ -385,6 +385,32 @@ private:
  */
 namespace Fast {
 
+/// Por tipo, muestreado 1 de cada 16 (ver TakeFlowSummary): if, loop, call,
+/// salto, break, nop/end y comprobaciones tras un tramo.
+std::array<std::atomic<u32>, 7> g_flow_counts{};
+
+std::string TakeFlowSummary() {
+    static constexpr const char* kNames[7] = {"if", "loop", "call", "salto", "break",
+                                              "nop/end", "tras tramo"};
+    u32 counts[7];
+    u64 total = 0;
+    for (u32 i = 0; i < 7; i++) {
+        counts[i] = g_flow_counts[i].exchange(0, std::memory_order_relaxed);
+        total += counts[i];
+    }
+    if (total == 0) {
+        return "-";
+    }
+    std::string text;
+    for (u32 i = 0; i < 7; i++) {
+        if (counts[i] != 0) {
+            text += fmt::format("{}{} {:.0f}%", text.empty() ? "" : " ", kNames[i],
+                                counts[i] * 100.0 / static_cast<double>(total));
+        }
+    }
+    return text;
+}
+
 struct FlowContext {
     ShaderUnit* state = nullptr;
     const ShaderSetup* setup = nullptr;
@@ -433,7 +459,9 @@ u32 CheckStacks(FlowContext& f, u32 old_program_counter, u32 program_counter, bo
 } // Anonymous namespace
 
 u32 FlowPostCheck(FlowContext* flow, u32 old_pc) {
-    flow->state->slow_instrs++;
+    if ((flow->state->slow_instrs++ & 15) == 0) {
+        g_flow_counts[6].fetch_add(1, std::memory_order_relaxed);
+    }
     return CheckStacks(*flow, old_pc, old_pc + 1, false);
 }
 
@@ -507,6 +535,35 @@ u32 FlowStep(FlowContext* flow, u32 pc) {
         });
         state.address_registers[2] = loop_param.y;
     };
+
+    if ((state.slow_instrs & 15) == 0) {
+        u32 kind = 5;
+        switch (instr.opcode.Value()) {
+        case OpCode::Id::IFU:
+        case OpCode::Id::IFC:
+            kind = 0;
+            break;
+        case OpCode::Id::LOOP:
+            kind = 1;
+            break;
+        case OpCode::Id::CALL:
+        case OpCode::Id::CALLU:
+        case OpCode::Id::CALLC:
+            kind = 2;
+            break;
+        case OpCode::Id::JMPU:
+        case OpCode::Id::JMPC:
+            kind = 3;
+            break;
+        case OpCode::Id::BREAK:
+        case OpCode::Id::BREAKC:
+            kind = 4;
+            break;
+        default:
+            break;
+        }
+        g_flow_counts[kind].fetch_add(1, std::memory_order_relaxed);
+    }
 
     switch (instr.opcode.Value()) {
     case OpCode::Id::END:

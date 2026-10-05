@@ -45,7 +45,7 @@ namespace {
 /// mismo que hace la cache de traduccion del interprete). 16 MB desde 0.2.1.2:
 /// con 8, Pokemon Sol la llenaba en su 3D y la vaciaba en bucle ("codigo"
 /// bajando de 7 MB a 175 KB y "compilar" en 750 ms por fotograma). Si no hay
-/// memoria para 16, se queda en 8. Los saltos entre bloques y a C van por
+/// memoria para 16, 12 u 8. Los saltos entre bloques y a C van por
 /// registro, asi que el tamano no esta limitado por el alcance de B/BL.
 constexpr u32 kCodeBytesWanted = 16u * 1024u * 1024u;
 constexpr u32 kCodeBytesFallback = 8u * 1024u * 1024u;
@@ -996,11 +996,22 @@ bool Init(ARMul_State* cpu) {
                                         .c_str());
         return false;
     }
-    g_code_bytes = kCodeBytesWanted;
-    g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", g_code_bytes);
-    if (g_code_block < 0) {
-        g_code_bytes = kCodeBytesFallback;
+    // 0.2.1.3: 16 MB no lo dio la consola del usuario; se prueba 12 antes de 8.
+    int first_rc = 0;
+    for (const u32 size : {kCodeBytesWanted, 12u * 1024u * 1024u, kCodeBytesFallback}) {
+        g_code_bytes = size;
         g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", g_code_bytes);
+        if (g_code_block >= 0) {
+            break;
+        }
+        if (first_rc == 0) {
+            first_rc = g_code_block;
+        }
+    }
+    if (first_rc != 0 && g_code_block >= 0) {
+        Common::VitaNote("jit arm", fmt::format("16 MB de codigo rechazados ({:#x})",
+                                                static_cast<u32>(first_rc))
+                                        .c_str());
     }
     if (g_code_block < 0) {
         Common::VitaNote("jit arm", fmt::format("sin memoria ejecutable ({:#x}): JIT apagado",

@@ -32,6 +32,7 @@
 #ifdef __PSVITA__
 
 #include <atomic>
+#include <string>
 #include "common/common_types.h"
 #include "video_core/pica/shader_setup.h"
 
@@ -51,6 +52,10 @@ void CompileRuns(Program& program);
 /// flujo por FlowStep/FlowPostCheck. Si el programa tiene algo que la ruta
 /// rapida no decodifica, se deja sin compilar entero (sigue por tramos).
 void CompileWhole(Program& program, const ProgramCode& code);
+
+/// Que instrucciones de flujo siguen yendo a FlowStep (0.2.1.3), en % del
+/// total, para crash.txt; "-" si ninguna. Pone los contadores a cero.
+std::string TakeFlowSummary();
 
 } // namespace Pica::Shader::Fast
 

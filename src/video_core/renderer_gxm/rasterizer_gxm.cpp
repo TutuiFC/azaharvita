@@ -1368,6 +1368,7 @@ struct RasterizerGXM::PipelineCache {
                 // Como con los de vertices (0.2.1.2): si el compilador lleva
                 // demasiado con el, por software, que se vea.
                 if (Common::VitaMicros() - pending.job->submitted_us > kAsyncFsWindowUs) {
+                    CgMarkStarved();
                     return fail("fs compilando largo");
                 }
                 return fail("fs compilando");
@@ -1777,6 +1778,9 @@ struct RasterizerGXM::HwShaderCache {
                     const bool young = Common::VitaMicros() - found.job->submitted_us <
                                        kAsyncVsWindowUs;
                     *out_reason = young ? "vs compilando" : "vs compilando largo";
+                    if (!young) {
+                        CgMarkStarved();
+                    }
                     return nullptr;
                 }
                 const SceShaccCgCompileOutput* output = found.job->output;

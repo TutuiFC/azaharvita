@@ -518,6 +518,90 @@ void CompileRuns(Program& program) {
     sceKernelCloseVMDomain();
 }
 
+/// fast_ops += count (estadistica del overlay: ins / rap).
+void EmitCountFast(Emitter& e, u32 count) {
+    e.Ldr(R0, kState, static_cast<u32>(offsetof(ShaderUnit, fast_ops)));
+    e.Mov32(R12, count);
+    e.AddReg(R0, R0, R12);
+    e.Str(R0, kState, static_cast<u32>(offsetof(ShaderUnit, fast_ops)));
+}
+
+/**
+ * NOP, END, JMPU y JMPC EN NATIVO (0.2.1.3). Eran una llamada a FlowStep cada
+ * uno (unos 150 ciclos con la vuelta por la tabla). Solo si la direccion de
+ * detras NO es el final de ningun IF, CALL o LOOP: entonces las comprobaciones
+ * de pila de despues de la instruccion no pueden hacer nada (CheckStacks solo
+ * mira old_pc + 1) y el resultado es el mismo. Los saltos, solo a direcciones
+ * con etiqueta (principio de tramo o instruccion de flujo). Si no, false y se
+ * llama a FlowStep como antes.
+ */
+bool EmitNativeFlow(Emitter& e, u32 word, bool next_is_stack_address, bool target_ok,
+                    std::vector<std::pair<u32, u32>>& to_label, std::vector<u32>& to_epilogue) {
+    if (next_is_stack_address) {
+        return false;
+    }
+    Instruction instr{};
+    instr.hex = word;
+    const u32 dest = instr.flow_control.dest_offset;
+    switch (instr.opcode.Value()) {
+    case OpCode::Id::NOP:
+        EmitCountFast(e, 1);
+        return true;
+    case OpCode::Id::END:
+        EmitCountFast(e, 1);
+        to_epilogue.push_back(e.BranchPlaceholder(kAl));
+        return true;
+    case OpCode::Id::JMPU: {
+        if (!target_ok) {
+            return false;
+        }
+        EmitCountFast(e, 1);
+        // Salta si b[id] == !(num & 1).
+        const u32 expected = (instr.flow_control.num_instructions & 1) != 0 ? 0u : 1u;
+        e.Emit(0xE5D00000u | (kUniforms << 16) | (R0 << 12) |
+               static_cast<u32>(Uniforms::GetBoolUniformOffset(
+                   instr.flow_control.bool_uniform_id))); // LDRB r0, [kUniforms, #b]
+        e.Emit(0xE3500000u | (R0 << 16) | expected);    // CMP r0, #expected
+        to_label.emplace_back(e.BranchPlaceholder(kEq), dest);
+        return true;
+    }
+    case OpCode::Id::JMPC: {
+        if (!target_ok) {
+            return false;
+        }
+        using FlowOp = Instruction::FlowControlType::Op;
+        const u32 refx = instr.flow_control.refx.Value() ? 1u : 0u;
+        const u32 refy = instr.flow_control.refy.Value() ? 1u : 0u;
+        const u32 cc = static_cast<u32>(offsetof(ShaderUnit, conditional_code));
+        EmitCountFast(e, 1);
+        e.Emit(0xE5D00000u | (kState << 16) | (R0 << 12) | cc);        // LDRB r0, cc0
+        e.Emit(0xE5D00000u | (kState << 16) | (R1 << 12) | (cc + 1)); // LDRB r1, cc1
+        switch (instr.flow_control.op) {
+        case FlowOp::JustX:
+            e.Emit(0xE3500000u | (R0 << 16) | refx); // CMP r0, #refx
+            break;
+        case FlowOp::JustY:
+            e.Emit(0xE3500000u | (R1 << 16) | refy); // CMP r1, #refy
+            break;
+        case FlowOp::And:
+            e.Emit(0xE3500000u | (R0 << 16) | refx);                  // CMP r0, #refx
+            e.Emit((kEq << 28) | 0x03500000u | (R1 << 16) | refy);    // CMPEQ r1, #refy
+            break;
+        case FlowOp::Or:
+            e.Emit(0xE3500000u | (R0 << 16) | refx);                  // CMP r0, #refx
+            e.Emit((kNe << 28) | 0x03500000u | (R1 << 16) | refy);    // CMPNE r1, #refy
+            break;
+        default:
+            return false;
+        }
+        to_label.emplace_back(e.BranchPlaceholder(kEq), dest);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 void CompileWhole(Program& program, const ProgramCode& code) {
     program.whole = nullptr;
     if (!g_neon_jit.load(std::memory_order_relaxed) || !EnsureMemory()) {
@@ -587,6 +671,7 @@ void CompileWhole(Program& program, const ProgramCode& code) {
     std::vector<u32> label(kMax, 0xFFFFFFFFu);
     std::vector<u32> to_epilogue;
     std::vector<u32> to_trap;
+    std::vector<std::pair<u32, u32>> to_label;
 
     e.Emit(0xE92D47F0u); // PUSH {r4-r10, lr}
     e.MovReg(kFlow, R2);
@@ -625,11 +710,7 @@ void CompileWhole(Program& program, const ProgramCode& code) {
             for (u32 i = 0; i < run.count; i++) {
                 EmitOp(e, program.ops[run.first_op + i]);
             }
-            // Estadistica del overlay (ins / rap): fast_ops += count.
-            e.Ldr(R0, kState, static_cast<u32>(offsetof(ShaderUnit, fast_ops)));
-            e.Mov32(R12, run.count);
-            e.AddReg(R0, R0, R12);
-            e.Str(R0, kState, static_cast<u32>(offsetof(ShaderUnit, fast_ops)));
+            EmitCountFast(e, run.count);
             if (stack_address[run.end]) {
                 e.MovReg(R0, kFlow);
                 e.Mov32(R1, run.end - 1);
@@ -644,6 +725,18 @@ void CompileWhole(Program& program, const ProgramCode& code) {
             continue;
         }
         label[a] = e.Position();
+        if (a != kLast) {
+            Instruction flow{};
+            flow.hex = code[a];
+            const u32 dest = flow.flow_control.dest_offset;
+            const bool target_ok =
+                dest <= last && (program.run_at[dest] != kNoRun || !covered[dest]);
+            if (EmitNativeFlow(e, code[a], stack_address[a + 1], target_ok, to_label,
+                               to_epilogue)) {
+                a++;
+                continue;
+            }
+        }
         e.MovReg(R0, kFlow);
         e.Mov32(R1, a);
         e.Call(reinterpret_cast<const void*>(&FlowStep));
@@ -667,6 +760,9 @@ void CompileWhole(Program& program, const ProgramCode& code) {
     }
     for (const u32 index : to_trap) {
         e.Patch(index, trap);
+    }
+    for (const auto& [index, dest] : to_label) {
+        e.Patch(index, label[dest] != 0xFFFFFFFFu ? label[dest] : trap);
     }
     program.jump_table.assign(kMax, e.Address(trap));
     for (u32 i = 0; i < kMax; i++) {

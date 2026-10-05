@@ -116,4 +116,9 @@ struct CgJob {
 /// el lote no se dibuja).
 void CgSubmit(std::shared_ptr<CgJob> job, bool urgent = false);
 
+/// Hay lotes por la CPU esperando a un trabajo de la cola: el hilo de
+/// compilacion sube por encima de los ayudantes hasta acabar el que tiene entre
+/// manos (0.2.1.3). Barato si ya esta subido.
+void CgMarkStarved();
+
 } // namespace Gxm

@@ -320,4 +320,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
 include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/src/vita_compat/include")
 
 add_subdirectory(externals)
+# 0.2.1.3: el hash de revalidar texturas (XXH3, con NEON) corria a ~80 MB/s con
+# el -Os de base (crash.txt de Pokemon Sol: 528 KB y 6,7 ms por fotograma). Es
+# un camino caliente como los de video_core.
+target_compile_options(xxhash PRIVATE -O3)
 add_subdirectory(src)
