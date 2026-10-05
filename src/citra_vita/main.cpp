@@ -385,6 +385,12 @@ struct UserSettings {
     /// 0.2.1.7: bloques Thumb en el JIT (Core::ArmJit::thumb). Sin fila en el
     /// menu: solo ajustes.txt, para apagarlo si diera problemas.
     bool jit_thumb = true;
+    /// 0.2.2.9: enlaces directos del JIT parcheados (Core::ArmJit::
+    /// direct_link_patch). Solo ajustes.txt, como jit_thumb.
+    bool jit_link_patch = true;
+    /// 0.2.3.1: superbloques en el JIT (Core::ArmJit::superblocks). Solo
+    /// ajustes.txt.
+    bool jit_superblocks = true;
 };
 UserSettings g_user;
 
@@ -433,6 +439,15 @@ void ApplyUserSettings() {
     }
     const u32 want_thumb = g_user.jit_thumb ? 1u : 0u;
     if (Core::ArmJit::thumb.exchange(want_thumb, std::memory_order_relaxed) != want_thumb) {
+        Core::ArmJit::Reset();
+    }
+    const u32 want_patch = g_user.jit_link_patch ? 1u : 0u;
+    if (Core::ArmJit::direct_link_patch.exchange(want_patch, std::memory_order_relaxed) !=
+        want_patch) {
+        Core::ArmJit::Reset();
+    }
+    const u32 want_super = g_user.jit_superblocks ? 1u : 0u;
+    if (Core::ArmJit::superblocks.exchange(want_super, std::memory_order_relaxed) != want_super) {
         Core::ArmJit::Reset();
     }
     // 0.1.6.0: solo cambia que shaders se traducen a partir de ahora.
@@ -524,6 +539,8 @@ void LoadUserSettings() {
     }
     read_bool("shaders_asinc=", g_user.async_shaders);
     read_bool("jit_thumb=", g_user.jit_thumb);
+    read_bool("jit_parche=", g_user.jit_link_patch);
+    read_bool("jit_superbloques=", g_user.jit_superblocks);
 }
 
 /// El contenido de ajustes.txt, una clave por linea.
@@ -534,7 +551,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
         "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
-        "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\n",
+        "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\njit_parche=%d\n"
+        "jit_superbloques=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -542,7 +560,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0,
         g_user.gpu_screen_copy ? 1 : 0, g_user.gpu_thread ? 1 : 0,
         g_user.unlimited_speed ? 1 : 0, g_user.gpu_scale, g_user.async_shaders ? 1 : 0,
-        g_user.jit_thumb ? 1 : 0);
+        g_user.jit_thumb ? 1 : 0, g_user.jit_link_patch ? 1 : 0,
+        g_user.jit_superblocks ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin

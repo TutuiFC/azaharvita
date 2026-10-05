@@ -20,6 +20,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include <psp2/kernel/sysmem.h>
+#include "common/hash.h"
 #include "common/vita_diag.h"
 #include "common/vita_vm.h"
 #include "core/arm/dyncom/arm_dyncom_dec.h"
@@ -35,6 +36,7 @@ std::atomic<u32> reg_cache{1};
 std::atomic<u32> vfp_data{1};
 std::atomic<u32> direct_link{1};
 std::atomic<u32> direct_link_patch{1};
+std::atomic<u32> superblocks{1};
 std::atomic<u32> vfp_native{1};
 std::atomic<u32> thumb{1};
 
@@ -65,6 +67,8 @@ constexpr u32 kCompileAfterVisits = 2;
 /// Bloques mas largos no se compilan (el interprete no tiene limite, y la
 /// extension tiene que coincidir con la suya).
 constexpr u32 kMaxBlockInstructions = 256;
+/// Saltos condicionales hacia delante que un superbloque deja dentro (0.2.3.1).
+constexpr u32 kMaxSideExits = 4;
 /// Comprobaciones: las primeras kFullChecks ejecuciones de cada bloque, y
 /// despues una de cada kSampleEvery (potencia de dos). 0.1.9.5: de 4 a 1. Cada
 /// pantalla nueva compila cientos de bloques y comprobarlos cuatro veces eran
@@ -319,6 +323,14 @@ u32 ExtOffset(u32 vfp_reg) {
 /// Presupuesto retirado por StopLinksIfRescheduled: no son instrucciones
 /// ejecutadas, y RunCompiled lo descuenta. Solo lo toca C++.
 u32 g_link_withdrawn = 0;
+/**
+ * Instrucciones cobradas al presupuesto que no se llegaron a ejecutar
+ * (0.2.3.1): las del resto de un superbloque cuando sale por un lado, o las
+ * que se salta un salto interno. El presupuesto se queda como esta -- asi no
+ * se reactiva despues de StopLinksIfRescheduled -- y RunCompiled las resta de
+ * la cuenta.
+ */
+u32 g_link_refund = 0;
 /// Diagnostico (0.1.6.3): llamadas a las funciones lentas de memoria y a la
 /// aritmetica VFP. Variables normales (un solo hilo emula); se publican con
 /// el resto en FlushLocalStats.
@@ -889,6 +901,9 @@ struct Block {
         bool patched = false;
     };
     std::vector<LinkSite> incoming;
+    /// Saltos condicionales que siguen dentro del bloque (0.2.3.1, ver
+    /// DecodeArmBlock): la comprobacion deja correr al interprete por ellos.
+    u32 side_exits = 0;
 };
 
 SceUID g_code_block = -1;
@@ -1695,6 +1710,59 @@ public:
     /// El bloque que se compila (0.2.1.9): su clave y cuantas instrucciones
     /// cuenta, para que un salto a si mismo no salga del bloque (ver
     /// EmitSelfLink).
+public:
+    void SetSideExit(bool side_exit, u32 refund, bool internal, u32 skip) {
+        side_exit_ = side_exit;
+        side_refund_ = refund;
+        internal_ = internal;
+        internal_skip_ = skip;
+    }
+    /// Los saltos internos que caen en 'pc' apuntan aqui.
+    void LandInternal(u32 pc) {
+        for (std::size_t i = 0; i < internal_branches_.size();) {
+            if (internal_branches_[i].second == pc) {
+                e.PatchBranch(internal_branches_[i].first, e.Position());
+                internal_branches_.erase(internal_branches_.begin() + static_cast<long>(i));
+            } else {
+                i++;
+            }
+        }
+    }
+    [[nodiscard]] bool IsInternalTarget(u32 pc) const {
+        for (const auto& branch : internal_branches_) {
+            if (branch.second == pc) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// Los que no hayan encontrado su destino (no deberia pasar), como salidas.
+    void ExitPendingInternal() {
+        while (!internal_branches_.empty()) {
+            const auto branch = internal_branches_.back();
+            internal_branches_.pop_back();
+            e.PatchBranch(branch.first, e.Position());
+            ExitDirect(branch.second);
+        }
+    }
+    /// Instrucciones cobradas que no se ejecutan (ver g_link_refund). No toca
+    /// los flags ni la cache de registros.
+    void EmitRefund(u32 count) {
+        if (count == 0) {
+            return;
+        }
+        e.Mov32(kT0, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_link_refund)));
+        e.LdrImm(kT1, kT0, 0);
+        u32 encoded = 0;
+        if (Emitter::EncodeImmediate(count, &encoded)) {
+            e.Emit(0xE2800000u | (kT1 << 16) | (kT1 << 12) | encoded); // ADD kT1, kT1, #count
+        } else {
+            e.Mov32(kRd, count);
+            e.Emit(0xE0800000u | (kT1 << 16) | (kT1 << 12) | kRd); // ADD kT1, kT1, kRd
+        }
+        e.StrImm(kT1, kT0, 0);
+    }
+
     void SetBlock(u32 key, u32 count) {
         block_key_ = key;
         block_count_ = count;
@@ -1712,6 +1780,15 @@ private:
     u32 branch_target_ = 0;
     u32 block_key_ = 0xFFFFFFFFu;
     u32 block_count_ = 0;
+    /// El terminador que se compila ahora es un salto lateral (0.2.3.1, ver
+    /// DecodeArmBlock): lo que se devuelve si se toma, y si salta dentro, a que
+    /// PC y cuantas instrucciones se salta.
+    bool side_exit_ = false;
+    u32 side_refund_ = 0;
+    bool internal_ = false;
+    u32 internal_skip_ = 0;
+    /// Saltos internos por parchear: posicion del B y PC de destino.
+    std::vector<std::pair<u32, u32>> internal_branches_;
     u32 body_start_ = 0xFFFFFFFFu;
 
     /**
@@ -3202,6 +3279,22 @@ public:
         // kT0/kT1 en vez de R0-R2: R0-R3 y lr son los huecos de la cache de
         // registros. Un Mov32 ahi pisaria un valor cacheado y el Epilogue
         // (que si vuelca) escribiria basura sobre los registros del juego.
+        if (side_exit_) {
+            // Salto lateral de un superbloque (0.2.3.1): si no se toma, se
+            // sigue con la instruccion siguiente, que se compila a continuacion.
+            const u32 not_taken = e.BranchPlaceholder(cond ^ 1u);
+            const s32 offset = static_cast<s32>((inst & 0x00FFFFFFu) << 8) >> 6;
+            const u32 target = thumb_ ? branch_target_ : pc + 8 + static_cast<u32>(offset);
+            if (internal_) {
+                EmitRefund(internal_skip_);
+                internal_branches_.emplace_back(e.BranchPlaceholder(kAlways), target);
+            } else {
+                EmitRefund(side_refund_);
+                ExitDirect(target);
+            }
+            e.PatchBranch(not_taken, e.Position());
+            return;
+        }
         u32 skip = 0;
         if (cond != kAlways) {
             skip = e.BranchPlaceholder(cond ^ 1u);
@@ -3304,11 +3397,41 @@ struct PendingCheck {
     u32 n = 0, z = 0, c = 0, v = 0, t = 0;
     u32 journal_size = 0;
     std::array<JournalEntry, kJournalEntries> journal{};
+    /// Tramos del superbloque que el interprete aun puede recorrer antes de
+    /// llegar a donde salio el JIT (0.2.3.1).
+    u32 side_exits_left = 0;
 };
 PendingCheck g_pending;
 
 /// Tramos [inicio, fin) invalidados desde la ultima vez (ver InvalidateRange).
 std::vector<std::pair<u32, u32>> g_invalid_ranges;
+
+/**
+ * BLOQUES YA COMPROBADOS (0.2.3.0). Clave del bloque -> hash de sus
+ * instrucciones, de los que pasaron su comprobacion contra el interprete. Al
+ * llenarse la memoria de codigo se tira todo (ResetAll) y, hasta ahora, cada
+ * bloque se volvia a generar dos veces (la variante de comprobacion tambien) y
+ * a comparar con el interprete aunque fuera exactamente el mismo codigo:
+ * Pokemon Sol llena sus 11 MB cada 20-60 s, y despues de cada vaciado eran
+ * miles de bloques con "compilar" y "comprobar" de 7-17 ms por fotograma. Con
+ * las mismas instrucciones la traduccion es la misma, asi que se compila solo
+ * la normal (la mitad de memoria: los vaciados se espacian) y se publica en
+ * su primera ejecucion; el muestreo de comprobaciones sigue igual. Sobrevive a
+ * los vaciados; se olvida al cambiar un ajuste del JIT (Reset), que cambia la
+ * traduccion.
+ */
+std::unordered_map<u32, u64> g_verified;
+constexpr std::size_t kMaxVerified = 65536;
+
+u64 BlockHash(const Block& block) {
+    u64 hash = Common::ComputeHash64(block.words.data(), block.words.size() * sizeof(u32));
+    if (block.thumb) {
+        hash = Common::HashCombine(
+            hash, Common::ComputeHash64(block.targets.data(), block.targets.size() * sizeof(u32)),
+            Common::ComputeHash64(block.sizes.data(), block.sizes.size()));
+    }
+    return hash;
+}
 
 void ResetAll() {
     g_invalid_ranges.clear();
@@ -3322,14 +3445,45 @@ void ResetAll() {
 }
 
 /// Las instrucciones ARM del bloque (hasta 0.2.1.6, todo Analyze).
+/**
+ * SUPERBLOQUES (0.2.3.1). Un salto condicional HACIA DELANTE sin enlace ("beq
+ * mas_abajo", el if sin else) ya no acaba el bloque: si se toma, sale por un
+ * lado (o salta dentro, si el destino esta en el mismo bloque); si no, sigue.
+ * Pokemon Sol hacia ~115.000 enlaces por fotograma con bloques de 6
+ * instrucciones, y en cada enlace se vuelca la cache de registros, se cobra el
+ * presupuesto y el destino la vuelve a cargar. Los saltos hacia atras (bucles)
+ * siguen acabando el bloque: ya van con EmitSelfLink. El salto que se toma no
+ * cambia nada de lo que ve el juego: las instrucciones cobradas de mas se
+ * devuelven (g_link_refund) y la comprobacion contra el interprete le deja
+ * recorrer los mismos tramos antes de comparar (CompletePendingCheck).
+ */
+bool SideExit(u32 inst, u32 pc, u32 target) {
+    // Condiciones 0-13: la 14 es "siempre" y la 15 es BLX con inmediato.
+    return (inst >> 28) < kAlways && (inst & 0x0F000000u) == 0x0A000000u && target > pc;
+}
+
 bool DecodeArmBlock(ARMul_State* cpu, Block& block) {
     u32 pc = block.pc;
     bool ended = false;
+    const bool extend = superblocks.load(std::memory_order_relaxed) != 0;
+    std::size_t last_exit_words = 0;
+    block.side_exits = 0;
+    // Si el superbloque no puede seguir, acaba en su ultimo salto lateral, que
+    // vuelve a ser el final del bloque como antes.
+    const auto end_at_last_exit = [&] {
+        block.words.resize(last_exit_words);
+        block.side_exits--;
+        ended = true;
+    };
     for (u32 i = 0; i < kMaxBlockInstructions; i++) {
         // La misma lectura que usa el interprete para traducir.
         const u32 inst = cpu->memory.Read32(pc & 0xFFFFFFFCu);
         const Decoded decoded = Classify(inst);
         if (decoded.kind == Kind::Unsupported) {
+            if (block.side_exits > 0) {
+                end_at_last_exit();
+                break;
+            }
             block.words.clear();
             block.reject = decoded.reject;
             block.reject_word = inst;
@@ -3337,8 +3491,15 @@ bool DecodeArmBlock(ARMul_State* cpu, Block& block) {
         }
         block.words.push_back(inst);
         if (decoded.terminator) {
-            ended = true;
-            break;
+            const s32 offset = static_cast<s32>((inst & 0x00FFFFFFu) << 8) >> 6;
+            const u32 target = pc + 8 + static_cast<u32>(offset);
+            if (extend && block.side_exits < kMaxSideExits && SideExit(inst, pc, target)) {
+                block.side_exits++;
+                last_exit_words = block.words.size();
+            } else {
+                ended = true;
+                break;
+            }
         }
         pc += 4;
         if ((pc & 0xFFF) == 0) {
@@ -3347,9 +3508,12 @@ bool DecodeArmBlock(ARMul_State* cpu, Block& block) {
         }
     }
     if (!ended) {
-        block.words.clear();
-        block.reject = kRejectLong;
-        return false;
+        if (block.side_exits == 0) {
+            block.words.clear();
+            block.reject = kRejectLong;
+            return false;
+        }
+        end_at_last_exit();
     }
     block.guest_bytes = static_cast<u32>(block.words.size()) * 4;
     block.guest_count = static_cast<u32>(block.words.size());
@@ -3387,6 +3551,22 @@ bool DecodeThumbBlock(ARMul_State* cpu, Block& block) {
     u32 pc = start;
     u32 count = 0;
     bool ended = false;
+    const bool extend = superblocks.load(std::memory_order_relaxed) != 0;
+    std::size_t last_exit_words = 0;
+    block.side_exits = 0;
+    const auto end_at_last_exit = [&] {
+        block.words.resize(last_exit_words);
+        block.sizes.resize(last_exit_words);
+        block.targets.resize(last_exit_words);
+        block.side_exits--;
+        pc = start;
+        count = 0;
+        for (const u8 size : block.sizes) {
+            pc += size;
+            count += size == 4 ? 2u : 1u;
+        }
+        ended = true;
+    };
     for (u32 i = 0; i < kMaxBlockInstructions; i++) {
         // La misma lectura que InterpreterTranslateInstruction.
         const u32 raw = cpu->memory.Read32(pc & 0xFFFFFFFCu);
@@ -3455,20 +3635,34 @@ bool DecodeThumbBlock(ARMul_State* cpu, Block& block) {
         }
         const Decoded decoded = Classify(arm);
         if (decoded.kind == Kind::Unsupported) {
+            if (block.side_exits > 0) {
+                end_at_last_exit();
+                break;
+            }
             return reject(decoded.reject, tinstr);
         }
         block.words.push_back(arm);
         block.sizes.push_back(static_cast<u8>(size));
         block.targets.push_back(target);
         count++;
+        const u32 branch_pc = pc;
         pc += size;
+        if (decoded.terminator && extend && block.side_exits < kMaxSideExits &&
+            SideExit(arm, branch_pc, target) && (pc & 0xFFFu) != 0) {
+            block.side_exits++;
+            last_exit_words = block.words.size();
+            continue;
+        }
         if (decoded.terminator || (pc & 0xFFFu) == 0) {
             ended = true; // salto, o fin de pagina como END_OF_PAGE
             break;
         }
     }
     if (!ended) {
-        return reject(kRejectLong, 0);
+        if (block.side_exits == 0) {
+            return reject(kRejectLong, 0);
+        }
+        end_at_last_exit();
     }
     block.guest_bytes = pc - start;
     block.guest_count = count;
@@ -3701,14 +3895,39 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity,
     bool terminated = false;
     // Vida de los flags del juego (0.1.5.7): ver ComputeFlagsLiveAfter.
     const std::vector<bool> flags_live = ComputeFlagsLiveAfter(block.words);
+    /**
+     * Superbloques (0.2.3.1): por instruccion, su PC y cuantas cuenta el
+     * interprete hasta ella incluida, para lo que devuelve un salto lateral y
+     * para saber si un destino cae dentro del bloque.
+     */
+    const std::size_t word_count = block.words.size();
+    std::vector<u32> word_pc(word_count);
+    std::vector<u32> counted(word_count);
+    {
+        u32 at = pc;
+        u32 total = 0;
+        for (std::size_t k = 0; k < word_count; k++) {
+            const u32 size = block.thumb ? block.sizes[k] : 4u;
+            word_pc[k] = at;
+            total += size == 4 && block.thumb ? 2u : 1u;
+            counted[k] = total;
+            at += size;
+        }
+    }
+    const auto index_of = [&](u32 target) -> std::ptrdiff_t {
+        const auto it = std::lower_bound(word_pc.begin(), word_pc.end(), target);
+        return it != word_pc.end() && *it == target ? it - word_pc.begin() : -1;
+    };
     for (std::size_t i = 0; i < block.words.size(); i++) {
         const u32 inst = block.words[i];
         const Decoded decoded = Classify(inst);
+        compiler.LandInternal(pc);
         // La aritmetica VFP seguida, con un solo cambio de FPSCR (0.2.1.0).
         if (decoded.kind == Kind::VfpCdp && Compiler::VfpNative(inst)) {
             std::size_t end = i + 1;
             while (end < block.words.size() && Classify(block.words[end]).kind == Kind::VfpCdp &&
-                   Compiler::VfpNative(block.words[end])) {
+                   Compiler::VfpNative(block.words[end]) &&
+                   !compiler.IsInternalTarget(word_pc[end])) {
                 end++;
             }
             // Los flags se guardan si se leen despues o si alguna lleva condicion.
@@ -3727,15 +3946,27 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity,
         if (block.thumb) {
             compiler.SetThumbInstruction(pc + size, block.targets[i]);
         }
+        const bool side_exit = decoded.terminator && i + 1 < word_count;
+        if (side_exit) {
+            const s32 offset = static_cast<s32>((inst & 0x00FFFFFFu) << 8) >> 6;
+            const u32 target = block.thumb ? block.targets[i] : pc + 8 + static_cast<u32>(offset);
+            const std::ptrdiff_t landing = index_of(target);
+            const bool internal = landing > static_cast<std::ptrdiff_t>(i);
+            const u32 skip =
+                internal ? counted[static_cast<std::size_t>(landing) - 1] - counted[i] : 0u;
+            compiler.SetSideExit(true, block.guest_count - counted[i], internal, skip);
+        }
         compiler.SetFlagsLiveAfter(flags_live[i]);
         compiler.Instruction(inst, pc, decoded);
-        terminated = decoded.terminator;
+        compiler.SetSideExit(false, 0, false, 0);
+        terminated = decoded.terminator && !side_exit;
         pc += size;
     }
     compiler.SetFlagsLiveAfter(true);
     if (!terminated) {
         compiler.FallThrough(pc);
     }
+    compiler.ExitPendingInternal();
     compiler.Epilogue();
     compiler.EmitColdStubs();
     if (e.Overflowed()) {
@@ -3989,6 +4220,7 @@ void StartCheck(ARMul_State* cpu, Block& block, u8* const* pages) {
         g_pending.t = cpu->TFlag;
         g_pending.journal_size = g_check.journal_size;
         g_pending.journal = g_check.journal;
+        g_pending.side_exits_left = block.side_exits;
         Common::FrameStats::jit_checks.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -4057,6 +4289,12 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
     block->link.count = block->guest_count;
     block->code = nullptr;
     block->check_code = nullptr;
+    // Ya comprobado con estas mismas instrucciones (ver g_verified).
+    if (const auto it = g_verified.find(block->pc);
+        it != g_verified.end() && it->second == BlockHash(*block)) {
+        block->link.runs = kFullChecks;
+        Common::FrameStats::jit_reverified.fetch_add(1, std::memory_order_relaxed);
+    }
     // Las dos variantes de una vez si le toca comprobacion (la primera vez, siempre).
     if (!EmitBlockCode(*block, true, DueForCheck(*block))) {
         // Sin sitio: se vacia en la siguiente llamada y se vuelve a intentar.
@@ -4108,20 +4346,26 @@ u64 RunCompiled(ARMul_State* cpu, Block& block, u8* const* pages, u64 chain_budg
     cpu->jit_link_budget = budget;
     cpu->jit_link_hops = 0;
     g_link_withdrawn = 0;
+    g_link_refund = 0;
     block.code(cpu, pages);
     const u32 hops = cpu->jit_link_hops;
     const u64 linked = budget - cpu->jit_link_budget - g_link_withdrawn;
+    const u64 executed = block.link.count + linked - g_link_refund;
     g_local.dispatches += hops;
     g_local.links += hops;
     g_local.jit_dispatches += 1 + hops;
-    g_local.jit_instructions += block.link.count + linked;
-    return block.link.count + linked;
+    g_local.jit_instructions += executed;
+    return executed;
 }
 
 } // Anonymous namespace
 
 u32 TryRun(ARMul_State* cpu, u64 budget_left) {
     if (mode.load(std::memory_order_relaxed) == 0) {
+        return 0;
+    }
+    // Una comprobacion de superbloque a medias: sigue el interprete.
+    if (g_pending.active) {
         return 0;
     }
     if (!g_ready) {
@@ -4246,6 +4490,17 @@ void CompletePendingCheck(ARMul_State* cpu) {
         return;
     }
     const ScopedMicros timer{g_check_us};
+    /**
+     * Un superbloque (0.2.3.1): el interprete acaba su bloque en cada salto
+     * condicional, y el JIT pudo seguir. Mientras el interprete no este donde
+     * salio el JIT, se le deja otro tramo (TryRun no entra con una
+     * comprobacion pendiente); como mucho, uno por salto lateral.
+     */
+    if (g_pending.cpu == cpu && g_pending.side_exits_left > 0 &&
+        (cpu->Reg[15] & ~1u) != (g_pending.regs[15] & ~1u)) {
+        g_pending.side_exits_left--;
+        return;
+    }
     g_pending.active = false;
     if (g_pending.cpu != cpu || g_pending.block == nullptr) {
         return;
@@ -4325,10 +4580,20 @@ void CompletePendingCheck(ARMul_State* cpu) {
         WithdrawEntry(block);
         Common::FrameStats::jit_mismatches.fetch_add(1, std::memory_order_relaxed);
         NoteMismatch(block, what);
+        g_verified.erase(block.pc);
+        return;
     }
+    if (g_verified.size() >= kMaxVerified) {
+        g_verified.clear();
+    }
+    g_verified[block.pc] = BlockHash(block);
 }
 
 void AbandonPendingCheck(u32 slice_instructions) {
+    // Sin comparar (la rodaja se acabo en medio): se comprueba otra vez.
+    if (g_pending.active && g_pending.block != nullptr) {
+        g_pending.block->link.runs = 0;
+    }
     g_pending.active = false;
     g_local.instructions += slice_instructions;
     // 0.1.6.3: publicar cada 32 rodajas, no en cada una: son unas veinte
@@ -4449,6 +4714,7 @@ void Reset() {
     if (!g_ready) {
         return;
     }
+    g_verified.clear();
     ResetAll();
 }
 

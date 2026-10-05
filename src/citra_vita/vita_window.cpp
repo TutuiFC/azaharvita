@@ -1397,11 +1397,14 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 Common::VitaNote(
                     "jit",
                     fmt::format("{} {:.0f}% Mi {:.2f} arm {:.1f} | bloques {} rechazados {} "
-                                "comprobados {} diferencias {} | rech {} {:.0f}% | codigo {} KB "
-                                "{} B/bloque",
+                                "comprobados {} ya comprobados {} diferencias {} | rech {} "
+                                "{:.0f}% | codigo {} KB {} B/bloque",
                                 stats_jit_on ? "ON" : "off", stats_jit_percent, stats_guest_mips,
                                 stats_arm_ms, stats_jit_blocks, stats_jit_rejected,
-                                stats_jit_checks, stats_jit_mismatches,
+                                stats_jit_checks,
+                                Common::FrameStats::jit_reverified.exchange(
+                                    0, std::memory_order_relaxed),
+                                stats_jit_mismatches,
                                 Core::ArmJit::RejectName(stats_jit_top_reject),
                                 stats_jit_top_reject_percent, code_bytes / 1024,
                                 code_blocks != 0 ? code_bytes / code_blocks : 0)

@@ -173,6 +173,9 @@ inline std::atomic<unsigned int> jit_blocks{0};
 inline std::atomic<unsigned int> jit_rejected{0};
 inline std::atomic<unsigned int> jit_checks{0};
 inline std::atomic<unsigned int> jit_mismatches{0};
+/// Bloques recompilados (tras un vaciado) que ya habian pasado su comprobacion
+/// con las mismas instrucciones: sin variante de comprobacion (0.2.3.0).
+inline std::atomic<unsigned int> jit_reverified{0};
 inline std::atomic<unsigned long long> shade_fast_ops{0};
 inline std::atomic<unsigned long long> shade_slow_instrs{0};
 /**

@@ -62,6 +62,12 @@ std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
 std::atomic<u32> RasterizerGXM::gpu_texture_transfers{0};
+namespace {
+/// De state_texture_us, lo de TextureFromCopy (0.2.3.1): las texturas por lote
+/// pasaron de ~11 us en 0.2.2.1 a ~46 en 0.2.2.8, y hay que saber si es eso o
+/// el cache.
+unsigned long long g_state_copy_us = 0;
+} // Anonymous namespace
 std::atomic<u32> RasterizerGXM::texture_source_writebacks{0};
 std::atomic<u32> RasterizerGXM::gpu_fills{0};
 std::array<std::atomic<u32>, 3> RasterizerGXM::reload_causes{};
@@ -5315,7 +5321,11 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         if (pipeline->samplers[i] == nullptr) {
             continue;
         }
+        const unsigned long long copy_mark = timed ? Common::VitaMicros() : 0;
         const SceGxmTexture* texture = TextureFromCopy(i);
+        if (timed) {
+            g_state_copy_us += Common::VitaMicros() - copy_mark;
+        }
         if (texture == nullptr) {
             texture = textures->Get(i, pica.regs.internal, memory);
         }
@@ -6516,14 +6526,16 @@ std::string RasterizerGXM::TakeBatchProfile() {
     };
     std::string text = fmt::format(
         "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
-        "(escena {:.1f} texturas {:.1f}) uniforms {:.1f} ({} muestras)",
+        "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
+        "muestras)",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
-        avg(state_texture_us), avg(batch_phase_us[5]), samples);
+        avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples);
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
     state_scene_us = 0;
     state_texture_us = 0;
+    g_state_copy_us = 0;
     return text;
 }
 

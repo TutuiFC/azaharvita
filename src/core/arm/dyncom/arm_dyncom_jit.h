@@ -122,6 +122,11 @@ extern std::atomic<u32> direct_link;
 /// publicar cada bloque.
 extern std::atomic<u32> direct_link_patch;
 
+/// Superbloques (0.2.3.1): los saltos condicionales hacia delante no acaban
+/// el bloque (ver DecodeArmBlock). 0 = un bloque por salto, como antes. Se lee
+/// al decodificar cada bloque; al cambiarlo se vacia la cache de bloques.
+extern std::atomic<u32> superblocks;
+
 /**
  * Aritmetica VFP en el hardware de la Vita (0.1.7.0), con el FPSCR del juego
  * cargado durante cada instruccion. 0 = por las funciones del interprete
