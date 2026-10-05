@@ -19,6 +19,7 @@
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include "common/common_types.h"
@@ -597,6 +598,45 @@ void ReadRecords(const char* path, std::unordered_set<BadSource, BadSourceHash>&
 
 void StoreBadSource(const BadSource& bad);
 
+/// Un SceDateTime en un numero que se puede comparar (al segundo).
+u64 DateKey(const SceDateTime& t) {
+    return (((((static_cast<u64>(t.year) * 13 + t.month) * 32 + t.day) * 24 + t.hour) * 60 +
+             t.minute) *
+                60 +
+            t.second);
+}
+
+/**
+ * MURIO DE VERDAD COMPILANDO? (0.2.1.6). La marca de kCompilingPath se queda
+ * igual si la sesion acaba por cualquier otra cosa a mitad de una compilacion:
+ * el usuario cierra el juego (hay shaders de 25-30 s), o se cuelga la GPU. Ni
+ * una sola de las nueve muertes apuntadas entre 0.2.0.8 y 0.2.1.5 tiene volcado
+ * de la consola detras, y sin embargo sus shaders fueron a la lista negra (a la
+ * CPU para siempre); uno se reintento en O0 y ese binario colgo la GPU. Cuando
+ * el compilador se cae de verdad, el sistema escribe un psp2core-* en ux0:data
+ * (los de 0.2.0.x estan ahi). Solo cuenta si es posterior a la marca y no es de
+ * la GPU. Si no se puede leer la carpeta, se culpa como antes.
+ */
+bool CompilerCrashDumpSince(const SceIoStat& marker) {
+    const SceUID dir = sceIoDopen("ux0:data");
+    if (dir < 0) {
+        return true;
+    }
+    const u64 since = DateKey(marker.st_mtime);
+    bool found = false;
+    SceIoDirent entry{};
+    while (sceIoDread(dir, &entry) > 0) {
+        if (std::strncmp(entry.d_name, "psp2core-", 9) == 0 &&
+            std::strstr(entry.d_name, "GPUCRASH") == nullptr &&
+            DateKey(entry.d_stat.st_mtime) >= since) {
+            found = true;
+            break;
+        }
+    }
+    sceIoDclose(dir);
+    return found;
+}
+
 void LoadBadSources() {
     if (g_bad_loaded) {
         return;
@@ -604,8 +644,22 @@ void LoadBadSources() {
     g_bad_loaded = true;
     ReadRecords(kBadListPath, g_bad_sources);
     ReadRecords(kNoOptListPath, g_no_opt_sources);
+    SceIoStat marker_stat{};
+    const bool marker_dated = sceIoGetstat(kCompilingPath, &marker_stat) >= 0;
     const SceUID crashed_fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
-    if (crashed_fd >= 0) {
+    if (crashed_fd >= 0 && marker_dated && !CompilerCrashDumpSince(marker_stat)) {
+        CompilingMarker interrupted{{}, SCE_SHACCCG_PROFILE_VP, 1, 0, 0};
+        sceIoRead(crashed_fd, &interrupted, sizeof(interrupted));
+        sceIoClose(crashed_fd);
+        sceIoRemove(kCompilingPath);
+        sceIoRemove(kCompilingSourcePath);
+        Common::VitaNote("gxm shader",
+                         fmt::format("la sesion anterior acabo compilando un shader de {} bytes, "
+                                     "sin volcado de la consola (cerrado o colgado por otra "
+                                     "cosa): no se le culpa, se compilara otra vez",
+                                     interrupted.source_size)
+                             .c_str());
+    } else if (crashed_fd >= 0) {
         // El de 0.2.0.6 y 0.2.0.7 solo traia el hash: se toma como uno de
         // vertices optimizado, que es lo que se caia.
         CompilingMarker crashed{{}, SCE_SHACCCG_PROFILE_VP, 1, 0, 0};
@@ -975,7 +1029,10 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     if (profile == SCE_SHACCCG_PROFILE_VP) {
         options.optimizationLevel = 1;
     }
-    if (g_no_opt_sources.count(BadSource{key.hash_city, key.hash_fnv}) != 0) {
+    // Los de vertices nunca en O0 (0.2.1.6), aunque esten en la lista de antes:
+    // uno de ellos colgo la GPU en 0.2.1.3.
+    if (profile != SCE_SHACCCG_PROFILE_VP &&
+        g_no_opt_sources.count(BadSource{key.hash_city, key.hash_fnv}) != 0) {
         options.optimizationLevel = 0;
     }
 
@@ -1186,6 +1243,8 @@ std::condition_variable g_jobs_ready;
 std::deque<std::shared_ptr<CgJob>> g_jobs;
 bool g_worker_started = false;
 std::atomic<SceUID> g_worker_uid{-1};
+std::atomic<unsigned long long> g_worker_busy_since{0};
+std::atomic<u32> g_jobs_queued{0};
 std::atomic<bool> g_worker_boosted{false};
 /// Justo por encima de los ayudantes y del hilo de la GPU (159).
 constexpr int kCgBoostedPriority = Common::kVitaPriorityHelper - 1;
@@ -1218,7 +1277,9 @@ void* CgWorkerMain(void*) {
             g_jobs_ready.wait(lock, [] { return !g_jobs.empty(); });
             job = std::move(g_jobs.front());
             g_jobs.pop_front();
+            g_jobs_queued.store(static_cast<u32>(g_jobs.size()), std::memory_order_relaxed);
         }
+        g_worker_busy_since.store(Common::VitaMicros(), std::memory_order_relaxed);
         for (std::size_t i = 0; i < job->sources.size(); i++) {
             // Los de vertices dejan de pedirse con el compilador roto; los de
             // fragmentos no (ver RecoverFromInternalError).
@@ -1233,6 +1294,7 @@ void* CgWorkerMain(void*) {
                 break;
             }
         }
+        g_worker_busy_since.store(0, std::memory_order_relaxed);
         job->done.store(true, std::memory_order_release);
         if (g_worker_boosted.exchange(false, std::memory_order_acq_rel)) {
             sceKernelChangeThreadPriority(sceKernelGetThreadId(),
@@ -1312,7 +1374,13 @@ void CgSubmit(std::shared_ptr<CgJob> job, bool urgent) {
     } else {
         g_jobs.push_back(std::move(job));
     }
+    g_jobs_queued.store(static_cast<u32>(g_jobs.size()), std::memory_order_relaxed);
     g_jobs_ready.notify_one();
+}
+
+CgActivity GetCgActivity() {
+    return CgActivity{g_worker_busy_since.load(std::memory_order_relaxed),
+                      g_jobs_queued.load(std::memory_order_relaxed)};
 }
 
 } // namespace Gxm

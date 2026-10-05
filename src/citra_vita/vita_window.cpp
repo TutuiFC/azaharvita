@@ -19,6 +19,7 @@
 #include "common/vita_diag.h"
 #include "core/core.h"
 #include "video_core/gpu.h"
+#include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_pica_format.h"
 #include "video_core/renderer_gxm/gxm_presenter.h"
 #include "video_core/renderer_gxm/rasterizer_gxm.h"
@@ -580,6 +581,24 @@ void EmuWindow_Vita::PresentScreens() {
             vita2d_draw_texture(overlay_texture, 0.0f, 0.0f);
         } else if (stats_overlay_visible) {
             DrawStatsOverlay();
+        }
+        /**
+         * AVISO DE COMPILACION (0.2.1.6). Hay shaders de vertices de Pokemon
+         * Sol que tardan 25-30 s en compilarse, y mientras tanto el juego va a
+         * 1 FPS: parece colgado y se cierra, y la compilacion se pierde (antes
+         * ademas iba a la lista negra). Solo si lleva mas de un segundo.
+         */
+        const Gxm::CgActivity cg = Gxm::GetCgActivity();
+        const unsigned long long now_us = Common::VitaMicros();
+        if (stats_font != nullptr && cg.busy_since_us != 0 && now_us > cg.busy_since_us &&
+            now_us - cg.busy_since_us > 1000000ull) {
+            const std::string notice = fmt::format(
+                "Compilando shaders ({} en cola, {} s): no cierres el juego", cg.queued,
+                (now_us - cg.busy_since_us) / 1000000ull);
+            vita2d_draw_rectangle(0.0f, static_cast<float>(kVitaScreenHeight) - 24.0f, 470.0f,
+                                  24.0f, RGBA8(0, 0, 0, 170));
+            vita2d_pgf_draw_text(stats_font, 8, static_cast<int>(kVitaScreenHeight) - 7,
+                                 RGBA8(255, 210, 90, 255), 0.85f, notice.c_str());
         }
         Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
     }

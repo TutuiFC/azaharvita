@@ -55,6 +55,7 @@
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/rasterizer_gxm.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
+#include "video_core/shader/shader_neon_jit.h"
 #include "video_core/renderer_software/sw_rasterizer.h"
 
 #ifndef AZAHAR_HEAP_MB
@@ -2035,6 +2036,8 @@ int main(int argc, char** argv) {
     // vita_jit_probe.cpp para por que hace falta saberlo antes de escribir un
     // recompilador y no despues.
     VitaFrontend::ProbeJitSupport();
+    // Antes que el JIT ARM, que se queda con lo que quede (ver ReserveCodeMemory).
+    Pica::Shader::Fast::ReserveCodeMemory();
 
     vita2d_init();
     WriteCrashLog("main", "vita2d_init hecho");

@@ -53,6 +53,11 @@ void CompileRuns(Program& program);
 /// rapida no decodifica, se deja sin compilar entero (sigue por tramos).
 void CompileWhole(Program& program, const ProgramCode& code);
 
+/// Reserva ya la memoria ejecutable de este JIT (0.2.1.6). Se llama al
+/// arrancar, ANTES que el JIT ARM: la consola no devuelve la que se suelta, y
+/// el JIT ARM se queda con lo que pueda de lo que quede.
+void ReserveCodeMemory();
+
 /// Que instrucciones de flujo siguen yendo a FlowStep (0.2.1.3), en % del
 /// total, para crash.txt; "-" si ninguna. Pone los contadores a cero.
 std::string TakeFlowSummary();

@@ -121,4 +121,13 @@ void CgSubmit(std::shared_ptr<CgJob> job, bool urgent = false);
 /// manos (0.2.1.3). Barato si ya esta subido.
 void CgMarkStarved();
 
+/// Lo que esta haciendo el hilo de compilacion, para el aviso en pantalla
+/// (0.2.1.6): desde cuando compila el trabajo actual (VitaMicros, 0 si nada) y
+/// cuantos esperan detras.
+struct CgActivity {
+    unsigned long long busy_since_us = 0;
+    u32 queued = 0;
+};
+CgActivity GetCgActivity();
+
 } // namespace Gxm

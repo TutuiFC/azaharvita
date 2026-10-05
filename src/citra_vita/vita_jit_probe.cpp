@@ -77,22 +77,29 @@ constexpr u32 kTestCode[] = {
 } // Anonymous namespace
 
 void ProbeJitSupport() {
-    // 1 MB: suficiente para la prueba y muy por debajo del maximo de 16 MB que
-    // admite un bloque VM.
-    constexpr SceSize kProbeSize = 1024 * 1024;
-
-    const SceUID block = sceKernelAllocMemBlockForVM("azahar_jit_probe", kProbeSize);
+    /**
+     * El bloque mas pequeno que acepte la consola (0.2.1.6). La memoria
+     * ejecutable de toda la sesion son unos 16 MB y lo que se pide no vuelve
+     * aunque se suelte: el mega de antes se lo quitaba a los dos JIT. Un
+     * intento fallido no gasta nada.
+     */
+    SceUID block = -1;
+    SceSize probe_size = 0;
+    for (const SceSize size : {SceSize{0x1000}, SceSize{0x10000}, SceSize{0x100000}}) {
+        block = sceKernelAllocMemBlockForVM("azahar_jit_probe", size);
+        if (block >= 0) {
+            probe_size = size;
+            break;
+        }
+    }
     if (block < 0) {
         NoteStep("FALLO al reservar memoria ejecutable (hace falta unsafe)", block);
         Common::VitaNote("jit", "resultado: NO se puede hacer JIT en esta consola");
         return;
     }
     NoteStep("memoria ejecutable reservada", block);
-    /**
-     * Se suelta al salir (0.2.1.5). Se quedaba reservado toda la sesion, y la
-     * memoria ejecutable de la consola son 16 MB en total: con este mega
-     * ocupado no cabian los 12 del JIT ARM y los 4 del de vertices a la vez.
-     */
+    NoteStep("tamano de la prueba en bytes", static_cast<int>(probe_size));
+    // Se suelta al salir, aunque la consola no devuelva ese espacio.
     struct FreeOnExit {
         SceUID uid;
         ~FreeOnExit() {

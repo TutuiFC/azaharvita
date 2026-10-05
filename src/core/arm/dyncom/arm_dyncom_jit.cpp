@@ -45,17 +45,17 @@ namespace {
  * Memoria de codigo. Cuando se llena se tira todo y se empieza de cero (lo
  * mismo que hace la cache de traduccion del interprete). Con 8 MB el centro
  * Pokemon de Pokemon Sol la vaciaba en bucle ("compilar" 450-600 ms por
- * fotograma en 0.2.1.4); con 12 llego a 11,7 MB sin vaciarse (0.2.1.3). La
- * memoria ejecutable de la consola son 16 MB en total, y el JIT de vertices
- * NEON necesita 4: se prueba que queden antes de quedarse con 12 (en 0.2.1.3
- * no quedaban, por el mega de la prueba de arranque, y los vertices por CPU
- * pasaron de 22 a 33 us). Si no, 8.
+ * fotograma en 0.2.1.4); con 12 llego a 11,7 MB sin vaciarse (0.2.1.3).
+ *
+ * LA MEMORIA EJECUTABLE NO SE RECUPERA AL SOLTARLA (crash.txt de 0.2.1.3 a
+ * 0.2.1.5): la consola da unos 16 MB en toda la sesion, y un bloque soltado
+ * sigue contando. 0.2.1.5 pedia 12, probaba si quedaban 4 y, como no, soltaba
+ * los 12 y pedia 8: ya no habia, y el juego entero fue por el interprete. Ahora
+ * no se suelta nada: el JIT de vertices reserva sus 4 al arrancar (main.cpp) y
+ * aqui se prueba de mayor a menor; un intento fallido no gasta.
  */
-constexpr u32 kCodeBytesWanted = 12u * 1024u * 1024u;
-constexpr u32 kCodeBytesFallback = 8u * 1024u * 1024u;
-/// Lo que se deja libre para el JIT de vertices (su kCodeBytes).
-constexpr u32 kVertexJitBytes = 4u * 1024u * 1024u;
-u32 g_code_bytes = kCodeBytesFallback;
+constexpr u32 kCodeSizesMb[] = {12, 11, 10, 9, 8, 6, 4};
+u32 g_code_bytes = 0;
 /// Un bloque se compila la SEGUNDA vez que se despacha: el codigo que solo
 /// corre una vez (arranque, cargas) no merece lo que cuesta compilarlo.
 constexpr u32 kCompileAfterVisits = 2;
@@ -1002,20 +1002,12 @@ bool Init(ARMul_State* cpu) {
                                         .c_str());
         return false;
     }
-    g_code_bytes = kCodeBytesWanted;
-    g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", g_code_bytes);
-    if (g_code_block >= 0) {
-        const SceUID room = sceKernelAllocMemBlockForVM("azahar_pica_room", kVertexJitBytes);
-        if (room >= 0) {
-            sceKernelFreeMemBlock(room);
-        } else {
-            sceKernelFreeMemBlock(g_code_block);
-            g_code_block = -1;
-        }
-    }
-    if (g_code_block < 0) {
-        g_code_bytes = kCodeBytesFallback;
+    for (const u32 megabytes : kCodeSizesMb) {
+        g_code_bytes = megabytes * 1024u * 1024u;
         g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", g_code_bytes);
+        if (g_code_block >= 0) {
+            break;
+        }
     }
     if (g_code_block < 0) {
         Common::VitaNote("jit arm", fmt::format("sin memoria ejecutable ({:#x}): JIT apagado",

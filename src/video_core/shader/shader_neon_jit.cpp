@@ -493,6 +493,12 @@ bool EnsureMemory() {
 
 } // Anonymous namespace
 
+void ReserveCodeMemory() {
+    if (!g_init_tried && Init()) {
+        Common::VitaNote("vs neon", "4 MB de memoria ejecutable reservados");
+    }
+}
+
 void CompileRuns(Program& program) {
     for (Run& run : program.runs) {
         run.code = nullptr;
