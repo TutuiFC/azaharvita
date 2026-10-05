@@ -3397,9 +3397,17 @@ struct PendingCheck {
     u32 n = 0, z = 0, c = 0, v = 0, t = 0;
     u32 journal_size = 0;
     std::array<JournalEntry, kJournalEntries> journal{};
-    /// Tramos del superbloque que el interprete aun puede recorrer antes de
-    /// llegar a donde salio el JIT (0.2.3.1).
-    u32 side_exits_left = 0;
+    /**
+     * Superbloque (0.2.3.2): la comparacion la hace TryRun cuando el
+     * interprete ha ejecutado tantas instrucciones como el JIT -- su rodaja
+     * restante era budget_start al empezar --, no al llegar al mismo PC: con
+     * un bucle que vuelve justo detras de un salto lateral, el interprete
+     * pasaba por ese PC al acabar su primer tramo, y se comparaba antes de
+     * tiempo (cientos de DIFERENCIA falsas en 0.2.3.1).
+     */
+    bool multi = false;
+    u64 budget_start = 0;
+    u32 jit_executed = 0;
 };
 PendingCheck g_pending;
 
@@ -4185,7 +4193,7 @@ void NoteMismatch(const Block& block, const std::string& what) {
  * el bloque se deja al interprete; la comparacion se hace en el siguiente
  * despacho, en CompletePendingCheck.
  */
-void StartCheck(ARMul_State* cpu, Block& block, u8* const* pages) {
+void StartCheck(ARMul_State* cpu, Block& block, u8* const* pages, u64 budget_left) {
     if (block.check_code == nullptr) {
         block.check_code = EmitBlock(block, true);
         if (block.check_code == nullptr) {
@@ -4204,6 +4212,7 @@ void StartCheck(ARMul_State* cpu, Block& block, u8* const* pages) {
     g_check.pages = pages;
     g_check.aborted = false;
     g_check.journal_size = 0;
+    g_link_refund = 0;
     block.check_code(cpu, pages);
 
     if (!g_check.aborted) {
@@ -4220,7 +4229,9 @@ void StartCheck(ARMul_State* cpu, Block& block, u8* const* pages) {
         g_pending.t = cpu->TFlag;
         g_pending.journal_size = g_check.journal_size;
         g_pending.journal = g_check.journal;
-        g_pending.side_exits_left = block.side_exits;
+        g_pending.multi = block.side_exits > 0;
+        g_pending.budget_start = budget_left;
+        g_pending.jit_executed = block.guest_count - g_link_refund;
         Common::FrameStats::jit_checks.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -4360,13 +4371,20 @@ u64 RunCompiled(ARMul_State* cpu, Block& block, u8* const* pages, u64 chain_budg
 
 } // Anonymous namespace
 
+void FinishPendingCheck(ARMul_State* cpu);
+
 u32 TryRun(ARMul_State* cpu, u64 budget_left) {
     if (mode.load(std::memory_order_relaxed) == 0) {
         return 0;
     }
-    // Una comprobacion de superbloque a medias: sigue el interprete.
+    // Una comprobacion de superbloque: sigue el interprete hasta que haya
+    // hecho lo mismo que el JIT, y entonces se compara (ver PendingCheck).
     if (g_pending.active) {
-        return 0;
+        if (g_pending.cpu == cpu &&
+            g_pending.budget_start - budget_left < g_pending.jit_executed) {
+            return 0;
+        }
+        FinishPendingCheck(cpu);
     }
     if (!g_ready) {
         if (g_init_tried || !Init(cpu)) {
@@ -4402,7 +4420,7 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
     if (DueForCheck(*block)) {
         const ScopedMicros timer{g_check_us};
         block->link.runs++;
-        StartCheck(cpu, *block, pages);
+        StartCheck(cpu, *block, pages, budget_left);
         return 0; // el interprete ejecuta el bloque de verdad
     }
     /**
@@ -4486,21 +4504,15 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
 }
 
 void CompletePendingCheck(ARMul_State* cpu) {
-    if (!g_pending.active) {
+    // Las de superbloque las cierra TryRun (ver PendingCheck).
+    if (!g_pending.active || g_pending.multi) {
         return;
     }
+    FinishPendingCheck(cpu);
+}
+
+void FinishPendingCheck(ARMul_State* cpu) {
     const ScopedMicros timer{g_check_us};
-    /**
-     * Un superbloque (0.2.3.1): el interprete acaba su bloque en cada salto
-     * condicional, y el JIT pudo seguir. Mientras el interprete no este donde
-     * salio el JIT, se le deja otro tramo (TryRun no entra con una
-     * comprobacion pendiente); como mucho, uno por salto lateral.
-     */
-    if (g_pending.cpu == cpu && g_pending.side_exits_left > 0 &&
-        (cpu->Reg[15] & ~1u) != (g_pending.regs[15] & ~1u)) {
-        g_pending.side_exits_left--;
-        return;
-    }
     g_pending.active = false;
     if (g_pending.cpu != cpu || g_pending.block == nullptr) {
         return;
