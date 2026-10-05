@@ -42,14 +42,11 @@ namespace {
 // ---------------------------------------------------------------------------
 
 /// Memoria de codigo. Cuando se llena se tira todo y se empieza de cero (lo
-/// mismo que hace la cache de traduccion del interprete). 16 MB desde 0.2.1.2:
-/// con 8, Pokemon Sol la llenaba en su 3D y la vaciaba en bucle ("codigo"
-/// bajando de 7 MB a 175 KB y "compilar" en 750 ms por fotograma). Si no hay
-/// memoria para 16, 12 u 8. Los saltos entre bloques y a C van por
-/// registro, asi que el tamano no esta limitado por el alcance de B/BL.
-constexpr u32 kCodeBytesWanted = 16u * 1024u * 1024u;
-constexpr u32 kCodeBytesFallback = 8u * 1024u * 1024u;
-u32 g_code_bytes = kCodeBytesFallback;
+/// mismo que hace la cache de traduccion del interprete). 8 MB: la memoria
+/// ejecutable de la consola no da para mas. Con 12 (0.2.1.3) el JIT de
+/// vertices NEON se quedo sin sus 4 MB y el sombreado por CPU paso de 22 a 33
+/// us por vertice; 16 los rechaza (0x80024b0b).
+constexpr u32 kCodeBytes = 8u * 1024u * 1024u;
 /// Un bloque se compila la SEGUNDA vez que se despacha: el codigo que solo
 /// corre una vez (arranque, cargas) no merece lo que cuesta compilarlo.
 constexpr u32 kCompileAfterVisits = 2;
@@ -996,23 +993,7 @@ bool Init(ARMul_State* cpu) {
                                         .c_str());
         return false;
     }
-    // 0.2.1.3: 16 MB no lo dio la consola del usuario; se prueba 12 antes de 8.
-    int first_rc = 0;
-    for (const u32 size : {kCodeBytesWanted, 12u * 1024u * 1024u, kCodeBytesFallback}) {
-        g_code_bytes = size;
-        g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", g_code_bytes);
-        if (g_code_block >= 0) {
-            break;
-        }
-        if (first_rc == 0) {
-            first_rc = g_code_block;
-        }
-    }
-    if (first_rc != 0 && g_code_block >= 0) {
-        Common::VitaNote("jit arm", fmt::format("16 MB de codigo rechazados ({:#x})",
-                                                static_cast<u32>(first_rc))
-                                        .c_str());
-    }
+    g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", kCodeBytes);
     if (g_code_block < 0) {
         Common::VitaNote("jit arm", fmt::format("sin memoria ejecutable ({:#x}): JIT apagado",
                                                 static_cast<u32>(g_code_block))
@@ -1028,7 +1009,7 @@ bool Init(ARMul_State* cpu) {
     g_code_used_words = 0;
     g_ready = true;
     Common::VitaNote("jit arm",
-                     fmt::format("listo ({} MB de codigo)", g_code_bytes >> 20).c_str());
+                     fmt::format("listo ({} MB de codigo)", kCodeBytes >> 20).c_str());
     return true;
 }
 
@@ -3458,7 +3439,7 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
         return false;
     }
     u32* const start = g_code + g_code_used_words;
-    const u32 capacity = g_code_bytes / 4 - g_code_used_words;
+    const u32 capacity = kCodeBytes / 4 - g_code_used_words;
     u32 used = 0;
     BlockFn code = nullptr;
     BlockFn check_code = nullptr;

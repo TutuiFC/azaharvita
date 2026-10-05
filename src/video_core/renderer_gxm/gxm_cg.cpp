@@ -615,7 +615,11 @@ void LoadBadSources() {
         sceIoClose(crashed_fd);
         sceIoRemove(kCompilingPath);
         if (read_ok) {
+            // Los de vertices, nunca sin optimizar (0.2.1.4): en 0.2.1.3 uno de
+            // Pokemon Sol tardo 106 s en O0 y su programa colgo la GPU de la
+            // Vita ("GPU crash" del sistema). Van a la CPU.
             const bool retry = crashed.optimization != 0 &&
+                               crashed.profile != SCE_SHACCCG_PROFILE_VP &&
                                g_no_opt_sources.insert(crashed.source).second;
             if (retry) {
                 AppendRecord(kNoOptListPath, crashed.source);
@@ -775,7 +779,34 @@ bool CgHeapLow() {
     return HeapInUse() + reserve > total;
 }
 
+/**
+ * Los de vertices compilados en O0 por 0.2.0.8-0.2.1.3 (los de la lista de sin
+ * optimizar) se quedaron en la cache de la tarjeta, y uno de ellos cuelga la
+ * GPU: se borran y van a la lista negra antes de precargar nada (0.2.1.4).
+ * Despues de la primera vez no queda fichero que borrar y no hace nada.
+ */
+void PurgeUnoptimizedVertexPrograms() {
+    std::unordered_set<BadSource, BadSourceHash> no_opt;
+    ReadRecords(kNoOptListPath, no_opt);
+    u32 purged = 0;
+    const std::lock_guard lock{g_cg_mutex};
+    for (const BadSource& source : no_opt) {
+        if (sceIoRemove(CachePath(source.hash_city, SCE_SHACCCG_PROFILE_VP).c_str()) >= 0) {
+            StoreBadSource(source);
+            purged++;
+        }
+    }
+    if (purged != 0) {
+        Common::VitaNote("gxm cache",
+                         fmt::format("{} shaders de vertices sin optimizar borrados de la cache "
+                                     "(colgaban la GPU): a la CPU",
+                                     purged)
+                             .c_str());
+    }
+}
+
 u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress) {
+    PurgeUnoptimizedVertexPrograms();
     // Nada de lo anterior sirve para otro juego.
     std::vector<std::string> paths;
     {
