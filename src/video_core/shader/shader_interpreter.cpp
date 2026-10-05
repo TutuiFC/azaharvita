@@ -365,6 +365,17 @@ public:
         count--;
     }
 
+    /// Para el codigo generado (Fast::GetFlowLayout).
+    static std::size_t ItemsOffset() {
+        return offsetof(FixedRingStack, items);
+    }
+    static std::size_t HeadOffset() {
+        return offsetof(FixedRingStack, head);
+    }
+    static std::size_t CountOffset() {
+        return offsetof(FixedRingStack, count);
+    }
+
 private:
     std::array<T, N> items;
     u32 head = 0;
@@ -419,6 +430,23 @@ struct FlowContext {
     FixedRingStack<LoopStackElement, 4> loop_stack;
     bool trapped = false;
 };
+
+FlowLayout GetFlowLayout() {
+    using IfRing = FixedRingStack<IfStackElement, 8>;
+    using CallRing = FixedRingStack<CallStackElement, 4>;
+    static_assert(sizeof(IfStackElement) == 8 && sizeof(CallStackElement) == 8,
+                  "el codigo generado indexa las pilas de 8 en 8 bytes");
+    const u32 if_base = static_cast<u32>(offsetof(FlowContext, if_stack));
+    const u32 call_base = static_cast<u32>(offsetof(FlowContext, call_stack));
+    return FlowLayout{
+        if_base + static_cast<u32>(IfRing::ItemsOffset()),
+        if_base + static_cast<u32>(IfRing::HeadOffset()),
+        if_base + static_cast<u32>(IfRing::CountOffset()),
+        call_base + static_cast<u32>(CallRing::ItemsOffset()),
+        call_base + static_cast<u32>(CallRing::HeadOffset()),
+        call_base + static_cast<u32>(CallRing::CountOffset()),
+    };
+}
 
 namespace {
 

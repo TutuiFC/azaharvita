@@ -192,6 +192,13 @@ constexpr u32 kFlowEnd = 0xFFFFFFFFu;
 u32 FlowStep(FlowContext* flow, u32 pc);
 u32 FlowPostCheck(FlowContext* flow, u32 old_pc);
 u32 FlowTrap(FlowContext* flow, u32 pc);
+/// Donde estan, dentro de FlowContext, las pilas de IF y de CALL (0.2.1.5):
+/// el codigo generado las maneja en nativo, sobre la misma memoria.
+struct FlowLayout {
+    u32 if_items, if_head, if_count;
+    u32 call_items, call_head, call_count;
+};
+FlowLayout GetFlowLayout();
 using ProgramFn = void (*)(ShaderUnit* state, const Uniforms* uniforms, FlowContext* flow);
 
 struct Program {

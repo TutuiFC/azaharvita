@@ -86,6 +86,12 @@ public:
     u32 Position() const {
         return position;
     }
+    /// Descarta lo emitido desde 'index' (sin saltos pendientes dentro).
+    void Rewind(u32 index) {
+        if (index <= position) {
+            position = index;
+        }
+    }
     u32 Address(u32 index) const {
         return static_cast<u32>(reinterpret_cast<uintptr_t>(base + index));
     }
@@ -602,6 +608,218 @@ bool EmitNativeFlow(Emitter& e, u32 word, bool next_is_stack_address, bool targe
     }
 }
 
+
+// Registros libres en el flujo nativo: r0-r3, r10 y r12 (r10 lo guarda el PUSH
+// del prologo y ningun otro codigo generado lo usa).
+constexpr u32 R3 = 3, R10 = 10;
+
+void EmitSubImm(Emitter& e, u32 rd, u32 rn, u32 imm8) {
+    e.Emit(0xE2400000u | (rn << 16) | (rd << 12) | imm8);
+}
+void EmitAndImm(Emitter& e, u32 rd, u32 rn, u32 imm8) {
+    e.Emit(0xE2000000u | (rn << 16) | (rd << 12) | imm8);
+}
+/// rd = kFlow + rm * 8
+void EmitFlowSlot(Emitter& e, u32 rd, u32 rm) {
+    e.Emit(0xE0800000u | (kFlow << 16) | (rd << 12) | (3u << 7) | rm);
+}
+
+/// Flags a EQ si se cumple la condicion de JMPC/IFC/CALLC (evaluate_condition
+/// del interprete: refx == cc0, refy == cc1; O, Y, solo X o solo Y).
+bool EmitCondition(Emitter& e, const Instruction& instr) {
+    using FlowOp = Instruction::FlowControlType::Op;
+    const u32 refx = instr.flow_control.refx.Value() ? 1u : 0u;
+    const u32 refy = instr.flow_control.refy.Value() ? 1u : 0u;
+    const u32 cc = static_cast<u32>(offsetof(ShaderUnit, conditional_code));
+    e.Emit(0xE5D00000u | (kState << 16) | (R1 << 12) | cc);        // LDRB r1, cc0
+    e.Emit(0xE5D00000u | (kState << 16) | (R2 << 12) | (cc + 1)); // LDRB r2, cc1
+    switch (instr.flow_control.op) {
+    case FlowOp::JustX:
+        e.Emit(0xE3500000u | (R1 << 16) | refx);
+        return true;
+    case FlowOp::JustY:
+        e.Emit(0xE3500000u | (R2 << 16) | refy);
+        return true;
+    case FlowOp::And:
+        e.Emit(0xE3500000u | (R1 << 16) | refx);
+        e.Emit((kEq << 28) | 0x03500000u | (R2 << 16) | refy);
+        return true;
+    case FlowOp::Or:
+        e.Emit(0xE3500000u | (R1 << 16) | refx);
+        e.Emit((kNe << 28) | 0x03500000u | (R2 << 16) | refy);
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Flags a EQ si b[id] vale 'expected' (0 o 1).
+void EmitBoolTest(Emitter& e, u32 id, u32 expected) {
+    e.Emit(0xE5D00000u | (kUniforms << 16) | (R1 << 12) |
+           static_cast<u32>(Uniforms::GetBoolUniformOffset(id))); // LDRB r1, [kUniforms, #b]
+    e.Emit(0xE3500000u | (R1 << 16) | expected);                  // CMP r1, #expected
+}
+
+/// push_back de FixedRingStack<T, n> con {first, second}: si esta llena, el
+/// nuevo ocupa el hueco del mas antiguo y la cabeza avanza.
+void EmitRingPush(Emitter& e, u32 items, u32 head, u32 count, u32 n, u32 first, u32 second) {
+    e.Ldr(R2, kFlow, count);
+    e.Ldr(R3, kFlow, head);
+    e.Emit(0xE3500000u | (R2 << 16) | n);                                    // CMP r2, #n
+    e.Emit((kNe << 28) | 0x00800000u | (R3 << 16) | (R12 << 12) | R2);      // ADDNE r12, r3, r2
+    e.Emit((kNe << 28) | 0x02000000u | (R12 << 16) | (R12 << 12) | (n - 1)); // ANDNE r12, #n-1
+    e.Emit((kNe << 28) | 0x02800000u | (R2 << 16) | (R2 << 12) | 1u);      // ADDNE r2, #1
+    e.Emit((kNe << 28) | 0x05800000u | (kFlow << 16) | (R2 << 12) | count); // STRNE r2, count
+    e.Emit((kEq << 28) | 0x01A00000u | (R12 << 12) | R3);                   // MOVEQ r12, r3
+    e.Emit((kEq << 28) | 0x02800000u | (R3 << 16) | (R3 << 12) | 1u);      // ADDEQ r3, #1
+    e.Emit((kEq << 28) | 0x02000000u | (R3 << 16) | (R3 << 12) | (n - 1)); // ANDEQ r3, #n-1
+    e.Emit((kEq << 28) | 0x05800000u | (kFlow << 16) | (R3 << 12) | head); // STREQ r3, head
+    EmitFlowSlot(e, R12, R12);
+    e.Mov32(R10, first);
+    e.Str(R10, R12, items);
+    e.Mov32(R10, second);
+    e.Str(R10, R12, items + 4);
+}
+
+/// r3 = kFlow + 8 * ((head + count - 1) & (n - 1)), con count (> 0) en r2.
+void EmitRingBack(Emitter& e, u32 head, u32 n) {
+    e.Ldr(R3, kFlow, head);
+    e.AddReg(R3, R3, R2);
+    EmitSubImm(e, R3, R3, 1);
+    EmitAndImm(e, R3, R3, n - 1);
+    EmitFlowSlot(e, R3, R3);
+}
+
+/**
+ * CheckStacks del interprete tras la instruccion en 'old_pc', con el pc ya
+ * calculado en r0 y SIN pila de LOOP (solo en programas sin LOOP ni BREAK):
+ * hasta cuatro CALL que acaban en old_pc + 1 (los tres primeros vuelven, el
+ * cuarto no), y despues el IF de arriba si su else es old_pc + 1.
+ */
+void EmitCheckStacks(Emitter& e, const FlowLayout& layout, u32 old_pc) {
+    std::vector<u32> calls_done;
+    e.Mov32(R1, old_pc + 1); // next_program_counter
+    for (u32 i = 0; i < 4; i++) {
+        e.Ldr(R2, kFlow, layout.call_count);
+        e.Emit(0xE3500000u | (R2 << 16)); // CMP r2, #0
+        calls_done.push_back(e.BranchPlaceholder(kEq));
+        EmitRingBack(e, layout.call_head, 4);
+        e.Ldr(R12, R3, layout.call_items);      // end_address
+        e.Emit(0xE1500000u | (R12 << 16) | R1); // CMP r12, r1
+        calls_done.push_back(e.BranchPlaceholder(kNe));
+        if (i < 3) {
+            e.Ldr(R0, R3, layout.call_items + 4); // return_address
+            e.MovReg(R1, R0);
+        }
+        EmitSubImm(e, R2, R2, 1);
+        e.Str(R2, kFlow, layout.call_count);
+    }
+    for (const u32 index : calls_done) {
+        e.Patch(index, e.Position());
+    }
+    e.Ldr(R2, kFlow, layout.if_count);
+    e.Emit(0xE3500000u | (R2 << 16)); // CMP r2, #0
+    const u32 if_done = e.BranchPlaceholder(kEq);
+    EmitRingBack(e, layout.if_head, 8);
+    e.Ldr(R12, R3, layout.if_items); // else_address
+    e.Mov32(R10, old_pc + 1);
+    e.Emit(0xE1500000u | (R12 << 16) | R10); // CMP r12, r10
+    const u32 if_miss = e.BranchPlaceholder(kNe);
+    e.Ldr(R0, R3, layout.if_items + 4); // end_address
+    EmitSubImm(e, R2, R2, 1);
+    e.Str(R2, kFlow, layout.if_count);
+    e.Patch(if_done, e.Position());
+    e.Patch(if_miss, e.Position());
+}
+
+/**
+ * IF, CALL, saltos, NOP y END en nativo, con sus pilas (0.2.1.5). En Pokemon
+ * Sol el control de flujo era ~30 % del sombreado de un vertice: unas 40
+ * llamadas a FlowStep/FlowPostCheck por vertice ("vs flujo" de 0.2.1.4: if
+ * 20 %, call 25 %, comprobaciones tras tramo 38 %). Copia de FlowStep: deja el
+ * pc siguiente en r0 y hace las comprobaciones de pila de detras si old_pc + 1
+ * puede ser el final de algo. False si no sabe (y se llama a FlowStep).
+ */
+bool EmitFlowWithStacks(Emitter& e, const FlowLayout& layout, u32 a, u32 word,
+                        bool next_is_stack_address, std::vector<u32>& to_epilogue) {
+    Instruction instr{};
+    instr.hex = word;
+    const u32 dest = instr.flow_control.dest_offset;
+    const u32 num = instr.flow_control.num_instructions;
+    std::vector<u32> to_join;
+    switch (instr.opcode.Value()) {
+    case OpCode::Id::END:
+        EmitCountFast(e, 1);
+        to_epilogue.push_back(e.BranchPlaceholder(kAl));
+        return true;
+    case OpCode::Id::NOP:
+        EmitCountFast(e, 1);
+        e.Mov32(R0, a + 1);
+        break;
+    case OpCode::Id::JMPU:
+    case OpCode::Id::JMPC:
+        EmitCountFast(e, 1);
+        if (instr.opcode.Value() == OpCode::Id::JMPU) {
+            EmitBoolTest(e, instr.flow_control.bool_uniform_id, (num & 1) != 0 ? 0u : 1u);
+        } else if (!EmitCondition(e, instr)) {
+            return false;
+        }
+        // MOVW/MOVT no tocan los flags.
+        e.Mov32(R0, a + 1);
+        e.Mov32(R0, dest, kEq);
+        break;
+    case OpCode::Id::IFU:
+    case OpCode::Id::IFC: {
+        EmitCountFast(e, 1);
+        if (instr.opcode.Value() == OpCode::Id::IFU) {
+            EmitBoolTest(e, instr.flow_control.bool_uniform_id, 1);
+        } else if (!EmitCondition(e, instr)) {
+            return false;
+        }
+        const u32 to_false = e.BranchPlaceholder(kNe);
+        EmitRingPush(e, layout.if_items, layout.if_head, layout.if_count, 8, dest, dest + num);
+        e.Mov32(R0, a + 1);
+        to_join.push_back(e.BranchPlaceholder(kAl));
+        e.Patch(to_false, e.Position());
+        e.Mov32(R0, dest);
+        break;
+    }
+    case OpCode::Id::CALL:
+    case OpCode::Id::CALLU:
+    case OpCode::Id::CALLC: {
+        EmitCountFast(e, 1);
+        u32 to_skip = 0xFFFFFFFFu;
+        if (instr.opcode.Value() == OpCode::Id::CALLU) {
+            EmitBoolTest(e, instr.flow_control.bool_uniform_id, 1);
+            to_skip = e.BranchPlaceholder(kNe);
+        } else if (instr.opcode.Value() == OpCode::Id::CALLC) {
+            if (!EmitCondition(e, instr)) {
+                return false;
+            }
+            to_skip = e.BranchPlaceholder(kNe);
+        }
+        EmitRingPush(e, layout.call_items, layout.call_head, layout.call_count, 4, dest + num,
+                     a + 1);
+        e.Mov32(R0, dest);
+        if (to_skip != 0xFFFFFFFFu) {
+            to_join.push_back(e.BranchPlaceholder(kAl));
+            e.Patch(to_skip, e.Position());
+            e.Mov32(R0, a + 1);
+        }
+        break;
+    }
+    default:
+        return false;
+    }
+    for (const u32 index : to_join) {
+        e.Patch(index, e.Position());
+    }
+    if (next_is_stack_address) {
+        EmitCheckStacks(e, layout, a);
+    }
+    return true;
+}
+
 void CompileWhole(Program& program, const ProgramCode& code) {
     program.whole = nullptr;
     if (!g_neon_jit.load(std::memory_order_relaxed) || !EnsureMemory()) {
@@ -630,6 +848,8 @@ void CompileWhole(Program& program, const ProgramCode& code) {
         }
     }
     std::vector<bool> stack_address(kMax + 2, false);
+    // Sin LOOP ni BREAK, el flujo entero va en nativo (EmitFlowWithStacks).
+    bool native_stacks = true;
     for (u32 a = 0; a <= last; a++) {
         if (covered[a]) {
             continue;
@@ -656,11 +876,17 @@ void CompileWhole(Program& program, const ProgramCode& code) {
             break;
         case OpCode::Id::LOOP:
             stack_address[std::min(dest + 1, kMax + 1)] = true;
+            native_stacks = false;
+            break;
+        case OpCode::Id::BREAK:
+        case OpCode::Id::BREAKC:
+            native_stacks = false;
             break;
         default:
             break;
         }
     }
+    const FlowLayout layout = GetFlowLayout();
 
     const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
     if (sceKernelOpenVMDomain() < 0) {
@@ -700,6 +926,18 @@ void CompileWhole(Program& program, const ProgramCode& code) {
         e.Emit(0xE790F100u | (kTable << 16) | R0); // LDR pc, [kTable, r0, LSL #2]
         e.Patch(skip, e.Position());
     };
+    // Lo mismo tras el flujo nativo, que deja el pc en r0, no toca NEON y no
+    // termina el programa (END salta al epilogo por su cuenta).
+    const auto native_dispatch = [&](u32 expected) {
+        e.Mov32(R12, expected);
+        e.Emit(0xE1500000u | (R0 << 16) | R12); // CMP r0, r12
+        const u32 skip = e.BranchPlaceholder(kEq);
+        e.Mov32(R12, kMax);
+        e.Emit(0xE1500000u | (R0 << 16) | R12); // CMP r0, r12
+        to_trap.push_back(e.BranchPlaceholder(kHs));
+        e.Emit(0xE790F100u | (kTable << 16) | R0); // LDR pc, [kTable, r0, LSL #2]
+        e.Patch(skip, e.Position());
+    };
 
     u32 a = 0;
     while (a <= last) {
@@ -711,7 +949,11 @@ void CompileWhole(Program& program, const ProgramCode& code) {
                 EmitOp(e, program.ops[run.first_op + i]);
             }
             EmitCountFast(e, run.count);
-            if (stack_address[run.end]) {
+            if (stack_address[run.end] && native_stacks) {
+                e.Mov32(R0, run.end);
+                EmitCheckStacks(e, layout, run.end - 1);
+                native_dispatch(run.end);
+            } else if (stack_address[run.end]) {
                 e.MovReg(R0, kFlow);
                 e.Mov32(R1, run.end - 1);
                 e.Call(reinterpret_cast<const void*>(&FlowPostCheck));
@@ -725,6 +967,18 @@ void CompileWhole(Program& program, const ProgramCode& code) {
             continue;
         }
         label[a] = e.Position();
+        if (a != kLast && native_stacks) {
+            const u32 before = e.Position();
+            const std::size_t epilogue_jumps = to_epilogue.size();
+            if (EmitFlowWithStacks(e, layout, a, code[a], stack_address[a + 1], to_epilogue)) {
+                native_dispatch(a + 1);
+                a++;
+                continue;
+            }
+            // Condicion desconocida (no deberia pasar): se descarta y FlowStep.
+            e.Rewind(before);
+            to_epilogue.resize(epilogue_jumps);
+        }
         if (a != kLast) {
             Instruction flow{};
             flow.hex = code[a];

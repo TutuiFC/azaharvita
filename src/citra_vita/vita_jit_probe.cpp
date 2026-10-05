@@ -88,6 +88,17 @@ void ProbeJitSupport() {
         return;
     }
     NoteStep("memoria ejecutable reservada", block);
+    /**
+     * Se suelta al salir (0.2.1.5). Se quedaba reservado toda la sesion, y la
+     * memoria ejecutable de la consola son 16 MB en total: con este mega
+     * ocupado no cabian los 12 del JIT ARM y los 4 del de vertices a la vez.
+     */
+    struct FreeOnExit {
+        SceUID uid;
+        ~FreeOnExit() {
+            sceKernelFreeMemBlock(uid);
+        }
+    } free_on_exit{block};
 
     void* base = nullptr;
     const int base_rc = sceKernelGetMemBlockBase(block, &base);
