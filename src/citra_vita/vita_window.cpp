@@ -504,7 +504,11 @@ void EmuWindow_Vita::PresentScreens() {
 
     if (!use_gxm) {
         // Camino de siempre: copiar los bytes crudos a la textura de vita2d.
-        // Con GXM la copia la hace el presentador y se cronometra alli.
+        // Con GXM la copia la hace el presentador y se cronometra alli. La
+        // presentacion anterior puede seguir leyendo estas texturas (0.2.2.0).
+        if (gxm_api) {
+            Gxm::RasterizerGXM::WaitPreviousPresentation();
+        }
         const unsigned long long upload_begin = Common::VitaMicros();
         UploadScreenNative(top_texture, *top);
         UploadScreenNative(bottom_texture, *bottom);
@@ -524,6 +528,26 @@ void EmuWindow_Vita::PresentScreens() {
      * la escena de la pantalla, y cada fotograma la pone encima con un quad.
      * Sin textura (sin memoria de video), como antes: directo cada fotograma.
      */
+    /**
+     * EL POOL DE VITA2D, SIN VACIARLO CADA FOTOGRAMA (0.2.2.0). vita2d_start_
+     * drawing() lo pone a cero en cada llamada (desensamblado de libvita2d:
+     * escribe 0 en su desplazamiento), y con eso los vertices de esta
+     * presentacion pisaban los de la anterior aunque la GPU no la hubiera
+     * dibujado aun: por eso FlushForPresent esperaba a la GPU en cada
+     * fotograma. Ahora se empieza con vita2d_start_drawing_advanced(NULL, 0),
+     * que es lo mismo sin vaciarlo, y se vacia aqui solo cuando pasa de la
+     * mitad, despues de esperar a que la GPU acabe todo (una vez cada muchos
+     * fotogramas: cada uno gasta unos pocos KB).
+     */
+    if (vita2d_pool_capacity == 0) {
+        vita2d_wait_rendering_done();
+        vita2d_pool_reset();
+        vita2d_pool_capacity = vita2d_pool_free_space();
+    } else if (vita2d_pool_free_space() < vita2d_pool_capacity / 2) {
+        vita2d_wait_rendering_done();
+        vita2d_pool_reset();
+    }
+
     bool overlay_from_texture = false;
     {
         const unsigned long long overlay_begin = Common::VitaMicros();
@@ -549,7 +573,7 @@ void EmuWindow_Vita::PresentScreens() {
         }
         Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
     }
-    vita2d_start_drawing();
+    vita2d_start_drawing_advanced(nullptr, 0);
     vita2d_clear_screen();
     if (use_gxm) {
         gxm_presenter->Draw(*top, *bottom, {rects.top_x, rects.top_y, rects.top_w, rects.top_h},

@@ -386,6 +386,11 @@ public:
      */
     [[nodiscard]] static DirectPresent QueryDirectPresent(u32 guest_address);
 
+    /// Espera a que la GPU haya terminado la presentacion ANTERIOR (0.2.2.0):
+    /// para quien vaya a reescribir con la CPU algo que esa presentacion lee
+    /// (las texturas de pantalla que se suben). Ver FlushForPresent.
+    static void WaitPreviousPresentation();
+
     static void ResetCounters() {
         gpu_triangles.store(0, std::memory_order_relaxed);
         software_triangles.store(0, std::memory_order_relaxed);
@@ -417,7 +422,8 @@ private:
     ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format, u32 bpp,
                               u32 scale);
     /// El quad de la superficie a la copia, en una escena suya.
-    bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip);
+    bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip,
+                    u32 in_width, u32 in_height);
     /// Rellenos pendientes (ver AccelerateFill): el quad del color dentro de la
     /// escena abierta, una escena solo para el, o a mano con la CPU.
     void DrawClearQuad(Surface& surface);
@@ -564,6 +570,13 @@ private:
     u32 fence_sent = 0;
     /// La primera valla del fotograma en curso (ver FlushForPresent).
     u32 frame_first_fence = 0;
+    /// Las primeras vallas de los dos fotogramas anteriores (0.2.2.0): [0] el
+    /// ultimo, [1] el de antes. 0 = no hubo escena en ese fotograma.
+    std::array<u32, 2> present_fences{};
+    u32 presents_seen = 0;
+    /// La del fotograma que se esta presentando: acabada, la presentacion
+    /// anterior tambien (WaitPreviousPresentation).
+    u32 present_fence_now = 0;
     [[nodiscard]] bool FenceDone(u32 fence) const;
     void WaitFence(u32 fence, GpuWait why);
 

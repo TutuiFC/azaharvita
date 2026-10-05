@@ -377,6 +377,8 @@ private:
     /// Reparto de unidades de textura por formato, ya formateado ("fmt a8 3 ...").
     char stats_format_line[56] = "fmt -";
     SceUInt64 stats_next_update_us = 0;
+    /// Lo que cabe en el pool temporal de vita2d, medido vacio (0.2.2.0).
+    unsigned int vita2d_pool_capacity = 0;
     /// Las notas "fotograma" de crash.txt de este juego (ver DrawStatsOverlay).
     u32 frame_ticks = 0;
     u32 frame_notes = 0;

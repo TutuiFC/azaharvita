@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <psp2/gxm.h>
 #include <psp2/shacccg.h>
 #include "common/common_types.h"
@@ -190,8 +191,15 @@ private:
     Allocation indices;
 
     Screen screens[2];
+    /**
+     * Tres juegos de vertices y de texel de relleno, uno por presentacion
+     * (0.2.2.0): la GPU puede seguir leyendo los de las dos anteriores
+     * mientras se escriben los de esta. Ver RasterizerGXM::FlushForPresent.
+     */
+    static constexpr u32 kPresentSlots = 3;
     Allocation fill_texel;
-    SceGxmTexture fill_texture{};
+    std::array<SceGxmTexture, kPresentSlots> fill_textures{};
+    u32 present_slot = 0;
 };
 
 } // namespace Gxm

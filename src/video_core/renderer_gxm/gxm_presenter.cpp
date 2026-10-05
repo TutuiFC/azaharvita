@@ -109,6 +109,8 @@ constexpr u32 kQuadCount = 2;
 constexpr u32 kVertexBytes = kVerticesPerQuad * kQuadCount * kVertexStride;
 constexpr u32 kIndicesPerQuad = 4;
 constexpr u32 kIndexBytes = kIndicesPerQuad * kQuadCount * sizeof(u16);
+/// Un texel de relleno por hueco, separados lo que pide la GPU a una textura.
+constexpr u32 kFillTexelStride = 16;
 
 } // Anonymous namespace
 
@@ -239,9 +241,9 @@ bool ScreenPresenter::Init() {
         sampler_param != nullptr ? sceGxmProgramParameterGetResourceIndex(sampler_param) : 0;
 
     // 4. La memoria que lee la GPU.
-    vertices = Allocate(Pool::Host, kVertexBytes);
+    vertices = Allocate(Pool::Host, kVertexBytes * kPresentSlots);
     indices = Allocate(Pool::Host, kIndexBytes);
-    fill_texel = Allocate(Pool::Host, 4);
+    fill_texel = Allocate(Pool::Host, kFillTexelStride * kPresentSlots);
     if (!vertices.Valid() || !indices.Valid() || !fill_texel.Valid()) {
         status = "vita2d (sin memoria gxm)";
         return fail("no hay memoria para vertices/indices/textura de relleno", 0);
@@ -252,19 +254,23 @@ bool ScreenPresenter::Init() {
     static constexpr u16 kIndexData[kIndicesPerQuad * kQuadCount] = {0, 1, 2, 3, 4, 5, 6, 7};
     std::memcpy(indices.Data(), kIndexData, sizeof(kIndexData));
 
-    // El texel de 1x1 que sirve para el relleno de color. Se le pone el color
-    // del juego en cada fotograma que lo pida.
-    std::memset(fill_texel.Data(), 0, 4);
-    rc = sceGxmTextureInitLinear(&fill_texture, fill_texel.Data(),
-                                 SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_RGBA, 1, 1, 1);
-    if (rc < 0) {
-        status = "vita2d (error de textura)";
-        return fail("no se pudo crear la textura de relleno", rc);
+    // El texel de 1x1 que sirve para el relleno de color, uno por hueco. Se le
+    // pone el color del juego en cada fotograma que lo pida.
+    std::memset(fill_texel.Data(), 0, kFillTexelStride * kPresentSlots);
+    for (u32 slot = 0; slot < kPresentSlots; slot++) {
+        SceGxmTexture& fill_texture = fill_textures[slot];
+        rc = sceGxmTextureInitLinear(&fill_texture,
+                                     static_cast<u8*>(fill_texel.Data()) + slot * kFillTexelStride,
+                                     SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_RGBA, 1, 1, 1);
+        if (rc < 0) {
+            status = "vita2d (error de textura)";
+            return fail("no se pudo crear la textura de relleno", rc);
+        }
+        sceGxmTextureSetMinFilter(&fill_texture, SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMagFilter(&fill_texture, SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetUAddrMode(&fill_texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+        sceGxmTextureSetVAddrMode(&fill_texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
     }
-    sceGxmTextureSetMinFilter(&fill_texture, SCE_GXM_TEXTURE_FILTER_POINT);
-    sceGxmTextureSetMagFilter(&fill_texture, SCE_GXM_TEXTURE_FILTER_POINT);
-    sceGxmTextureSetUAddrMode(&fill_texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
-    sceGxmTextureSetVAddrMode(&fill_texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
 
     ready = true;
     status = "gxm";
@@ -319,7 +325,7 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
     // Relleno de color: no hay framebuffer que copiar; el juego pide un color
     // liso (los fundidos lo usan mucho) y se dibuja con el texel de 1x1.
     if (info.fill_enabled) {
-        u8* texel = static_cast<u8*>(fill_texel.Data());
+        u8* texel = static_cast<u8*>(fill_texel.Data()) + present_slot * kFillTexelStride;
         texel[0] = info.fill_r;
         texel[1] = info.fill_g;
         texel[2] = info.fill_b;
@@ -467,6 +473,9 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
     const u32 tight_stride = (row_bytes + 15u) & ~15u;
     const u32 needed = tight_stride * info.height;
 
+    // La presentacion anterior puede seguir leyendo este buffer: hasta 0.2.1.9
+    // lo cubria la espera de cada fotograma en FlushForPresent (0.2.2.0).
+    RasterizerGXM::WaitPreviousPresentation();
     const unsigned long long upload_begin = Common::VitaMicros();
 
     bool reallocated = false;
@@ -635,7 +644,10 @@ void ScreenPresenter::Draw(const SwRenderer::ScreenInfo& top, const SwRenderer::
         return;
     }
 
-    auto* vertex_data = static_cast<float*>(vertices.Data());
+    // El hueco de esta presentacion (ver kPresentSlots).
+    present_slot = (present_slot + 1) % kPresentSlots;
+    auto* vertex_data = reinterpret_cast<float*>(static_cast<u8*>(vertices.Data()) +
+                                                 present_slot * kVertexBytes);
     const Source top_source = PrepareScreen(screens[0], top);
     if (!ready) {
         // PrepareScreen se apaga solo si no ha podido subir la pantalla (sin
@@ -689,10 +701,11 @@ void ScreenPresenter::Draw(const SwRenderer::ScreenInfo& top, const SwRenderer::
     sceGxmSetBackDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
     sceGxmSetVertexProgram(context, vertex_program);
     sceGxmSetFragmentProgram(context, fragment_program);
-    sceGxmSetVertexStream(context, 0, vertices.Data());
+    sceGxmSetVertexStream(context, 0, vertex_data);
 
     const auto draw_quad = [&](const Screen& screen, Source source, u32 first_index) {
-        const SceGxmTexture* texture = source == Source::Fill ? &fill_texture : &screen.texture;
+        const SceGxmTexture* texture =
+            source == Source::Fill ? &fill_textures[present_slot] : &screen.texture;
         sceGxmSetFragmentTexture(context, texture_unit, texture);
         const auto* index_data = static_cast<const u16*>(indices.Data()) + first_index;
         sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, index_data,

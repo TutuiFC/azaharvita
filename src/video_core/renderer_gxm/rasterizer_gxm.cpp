@@ -2697,6 +2697,19 @@ bool PresentTextureFormat(u32 color_format, SceGxmTextureFormat& out) {
 }
 } // Anonymous namespace
 
+void RasterizerGXM::WaitPreviousPresentation() {
+    if (s_instance == nullptr) {
+        return;
+    }
+    RasterizerGXM& self = *s_instance;
+    if (self.present_fence_now != 0) {
+        self.WaitFence(self.present_fence_now, GpuWait::Present);
+    } else if (self.context != nullptr) {
+        self.gpu_pending = true;
+        self.WaitGpu(GpuWait::Present);
+    }
+}
+
 RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address) {
     DirectPresent out;
     if (s_instance == nullptr || guest_address == 0) {
@@ -3092,8 +3105,8 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
     return slot->get();
 }
 
-bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
-                               bool flip) {
+bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip,
+                               u32 in_width, u32 in_height) {
     if (source.clear_pending) {
         FlushClear(source);
     }
@@ -3105,12 +3118,21 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     const u32 source_stride = source.color_stride * source.rt_bpp;
     const u8* first = static_cast<const u8*>(source.color_buffer.Data()) +
                       static_cast<std::size_t>(Phys(first_row, source.scale)) * source_stride;
-    if (sceGxmTextureInitLinearStrided(&texture, first, tex_format, Phys(copy.width, copy.scale),
-                                       Phys(copy.height, copy.scale), source_stride) < 0) {
+    if (sceGxmTextureInitLinearStrided(&texture, first, tex_format, Phys(in_width, copy.scale),
+                                       Phys(in_height, copy.scale), source_stride) < 0) {
         return false;
     }
-    sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
-    sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+    /**
+     * Con reduccion (0.2.2.0) la textura es el doble que el destino en el eje
+     * reducido, y el centro de cada pixel de destino cae justo entre dos
+     * texeles (entre cuatro en 2x2): con filtro bilineal la GPU da su media,
+     * que es lo que hace la copia por software. Sin reduccion, 1:1 y POINT.
+     */
+    const SceGxmTextureFilter filter = (in_width != copy.width || in_height != copy.height)
+                                           ? SCE_GXM_TEXTURE_FILTER_LINEAR
+                                           : SCE_GXM_TEXTURE_FILTER_POINT;
+    sceGxmTextureSetMinFilter(&texture, filter);
+    sceGxmTextureSetMagFilter(&texture, filter);
     sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
     sceGxmTextureSetVAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
 
@@ -3155,8 +3177,21 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
 bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     const PAddr src = config.GetPhysicalInputAddress();
     const PAddr dst = config.GetPhysicalOutputAddress();
-    const u32 width = config.output_width;
-    const u32 height = config.output_height;
+    /**
+     * COPIA CON REDUCCION (0.2.2.0). Inazuma Eleven GO dibuja su 3D a 480x400
+     * y lo copia a la pantalla reducido a 240x400 ("escala 1"): se rechazaba
+     * por "modo", y cada fotograma iba por software, con un volcado de la
+     * superficie (espera entera a la GPU) y una subida de la imagen. Las
+     * medidas como en SwBlitter::DisplayTransfer: la salida es output_width
+     * >> 1 con reduccion, y output_height >> 1 con la de 2x2; la entrada, el
+     * doble en ese eje.
+     */
+    const u32 h_shift = config.scaling != Pica::DisplayTransferConfig::NoScale ? 1u : 0u;
+    const u32 v_shift = config.scaling == Pica::DisplayTransferConfig::ScaleXY ? 1u : 0u;
+    const u32 width = config.output_width >> h_shift;
+    const u32 height = config.output_height >> v_shift;
+    const u32 in_width = width << h_shift;
+    const u32 in_height = height << v_shift;
     const Pica::PixelFormat in_format = config.input_format;
     const Pica::PixelFormat out_format = config.output_format;
     Surface* source = nullptr;
@@ -3206,7 +3241,7 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         return reject("sin gxm");
     }
     if (config.input_linear || config.dont_swizzle ||
-        config.scaling != Pica::DisplayTransferConfig::NoScale) {
+        config.scaling > Pica::DisplayTransferConfig::ScaleXY) {
         return reject("modo");
     }
     // El mismo formato, o RGBA8 a RGB8. Los de 16 bits desde 0.1.9.8
@@ -3250,8 +3285,8 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         return reject("superficie por recargar");
     }
     if (source->width != config.input_width || source->bpp != Pica::BytesPerPixel(in_format) ||
-        width == 0 || height == 0 || width > source->width ||
-        first_row + height > source->height || width > 1024) {
+        width == 0 || height == 0 || in_width > source->width ||
+        first_row + in_height > source->height || width > 1024) {
         return reject("medidas");
     }
     // Con el mismo tamano de pixel, el formato de verdad de la superficie
@@ -3279,7 +3314,8 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     // Lo que hubiera en esa pantalla deja de valer, como en la copia por
     // software (la copia anterior a ella incluida).
     InvalidateRegion(dst, dst_size);
-    if (!BlitToCopy(*copy, *source, first_row, config.flip_vertically != 0)) {
+    if (!BlitToCopy(*copy, *source, first_row, config.flip_vertically != 0, in_width,
+                    in_height)) {
         return reject("escena");
     }
     copy->dst_size = dst_size;
@@ -3767,18 +3803,39 @@ void RasterizerGXM::FlushPending() {
 void RasterizerGXM::FlushForPresent() {
     EndScene();
     /**
-     * El presentador y vita2d reescriben sus vertices y la textura de la
-     * pantalla en cada fotograma, y antes nadie tenia que esperar por ellos:
-     * la espera entera al empezar cada escena ya lo cubria. Basta con que haya
-     * acabado la primera escena de ESTE fotograma, que la GPU hace despues de
-     * la presentacion del anterior (0.1.9.4).
+     * PRESENTAR SIN ESPERAR AL FOTOGRAMA (0.2.2.0).
+     *
+     * Desde 0.1.9.4 aqui se esperaba a que acabara la primera escena de ESTE
+     * fotograma, que la GPU hace despues de la presentacion del anterior: asi
+     * el presentador y vita2d podian reescribir sus vertices. Pero el
+     * rasterizador deja la escena abierta todo el fotograma (Pokemon Sol: una
+     * o dos por fotograma), asi que "la primera" era casi todo, y esto era
+     * esperar a que la Vita terminara de dibujar el fotograma entero: 12,6 ms
+     * de cada 46 ("esperas gpu: fotograma" de 0.2.1.9) en los que el hilo de
+     * la GPU no podia preparar el siguiente.
+     *
+     * Ahora lo que la presentacion reescribe cada fotograma esta triplicado
+     * (los vertices y el texel de relleno del presentador; el pool de vita2d
+     * se vacia solo de vez en cuando, ver PresentScreens), y antes de usar el
+     * hueco de hace tres presentaciones basta con que haya acabado la primera
+     * escena de hace DOS fotogramas, que casi siempre ya ha acabado. Las
+     * texturas de pantalla que se suben con la CPU siguen esperando a la
+     * presentacion anterior, pero solo cuando se suben (WaitPreviousPresentation).
+     * Sin escena en ese fotograma no hay valla que mirar: a todo, como antes.
      */
-    if (frame_first_fence != 0) {
-        WaitFence(frame_first_fence, GpuWait::Frame);
-    } else if (context != nullptr) {
-        gpu_pending = true;
-        WaitGpu(GpuWait::Frame);
+    const u32 older = present_fences[1];
+    if (presents_seen >= 2) {
+        if (older != 0) {
+            WaitFence(older, GpuWait::Frame);
+        } else if (context != nullptr) {
+            gpu_pending = true;
+            WaitGpu(GpuWait::Frame);
+        }
     }
+    present_fences[1] = present_fences[0];
+    present_fences[0] = frame_first_fence;
+    present_fence_now = frame_first_fence;
+    presents_seen++;
     frame_first_fence = 0;
     for (auto& surface : surfaces) {
         if (!surface->copied) {
