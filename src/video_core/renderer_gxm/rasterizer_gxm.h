@@ -457,7 +457,9 @@ private:
     std::vector<u8> scale_scratch;
     u32 clear_texel_next = 0;
     /// La direccion es una de las pantallas que el juego ha configurado.
-    bool IsDisplayFramebuffer(PAddr addr);
+    /// Con 'size' y 'row_bytes', tambien si una pantalla empieza dentro de
+    /// [addr, addr + size) en una fila entera (0.2.2.5).
+    bool IsDisplayFramebuffer(PAddr addr, u32 size = 0, u32 row_bytes = 0);
     /// Las ultimas direcciones vistas en la configuracion de las pantallas:
     /// un juego puede escribir siempre en la misma ranura y alternar la
     /// direccion, y la copia llega antes de que la pantalla nueva se configure.

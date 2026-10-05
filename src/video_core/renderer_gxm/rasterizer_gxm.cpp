@@ -2769,16 +2769,32 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
      * blit, y la GPU las hace en orden.
      */
     for (const auto& copy : self.screen_copies) {
-        if (!copy->valid || copy->tiled || copy->dst != guest_address) {
+        if (!copy->valid || copy->tiled || guest_address < copy->dst ||
+            guest_address >= copy->dst + copy->dst_size) {
             continue;
         }
+        /**
+         * LA PANTALLA PUEDE EMPEZAR DENTRO DE LA COPIA (0.2.2.5). New Super
+         * Mario Bros. 2 copia su 3D de 256x416 a 0x18300000 y presenta desde
+         * 0x18302000, 16 filas mas abajo: con la direccion exacta no se
+         * encontraba, y la pantalla salia de una memoria del invitado que la
+         * copia no habia escrito. Las filas de antes no se ven.
+         */
+        const u32 row_bytes = copy->width * Pica::BytesPerPixel(copy->output_format);
+        const u32 offset = guest_address - copy->dst;
+        if (row_bytes == 0 || offset % row_bytes != 0) {
+            continue;
+        }
+        const u32 first_row = offset / row_bytes;
         SceGxmTextureFormat tex_format{};
         if (!PresentTextureFormat(copy->gxm_color_format, tex_format)) {
             break;
         }
-        out.data = static_cast<const u8*>(copy->color_buffer.Data());
+        out.data = static_cast<const u8*>(copy->color_buffer.Data()) +
+                   static_cast<std::size_t>(Phys(first_row, copy->scale)) * copy->stride *
+                       copy->bpp;
         out.width = Phys(copy->width, copy->scale);
-        out.height = Phys(copy->height, copy->scale);
+        out.height = Phys(copy->height - first_row, copy->scale);
         out.scale = copy->scale;
         out.stride_bytes = copy->stride * copy->bpp;
         out.gxm_texture_format = static_cast<u32>(tex_format);
@@ -2840,7 +2856,7 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
     return out;
 }
 
-bool RasterizerGXM::IsDisplayFramebuffer(PAddr addr) {
+bool RasterizerGXM::IsDisplayFramebuffer(PAddr addr, u32 size, u32 row_bytes) {
     for (u32 i = 0; i < 2; i++) {
         const auto& framebuffer = pica.regs.framebuffer_config[i];
         for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2}) {
@@ -2852,9 +2868,28 @@ bool RasterizerGXM::IsDisplayFramebuffer(PAddr addr) {
             display_address_next = (display_address_next + 1) % display_addresses.size();
         }
     }
-    return addr != 0 &&
-           std::find(display_addresses.begin(), display_addresses.end(), addr) !=
-               display_addresses.end();
+    if (addr == 0) {
+        return false;
+    }
+    if (std::find(display_addresses.begin(), display_addresses.end(), addr) !=
+        display_addresses.end()) {
+        return true;
+    }
+    if (size == 0 || row_bytes == 0) {
+        return false;
+    }
+    // Una pantalla que empieza mas abajo (ver QueryDirectPresent): solo las
+    // configuradas ahora, no las vistas alguna vez, que pueden ser de otro uso
+    // de esa memoria (el arranque deja las suyas en la VRAM).
+    for (u32 i = 0; i < 2; i++) {
+        const auto& framebuffer = pica.regs.framebuffer_config[i];
+        for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2}) {
+            if (shown > addr && shown < addr + size && (shown - addr) % row_bytes == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void RasterizerGXM::DropCopies(PAddr addr, u32 size) {
@@ -3487,7 +3522,14 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
                   (config.flip_vertically && config.crop_input_lines))) {
         return reject("textura");
     }
-    if (!tiled && !IsDisplayFramebuffer(dst)) {
+    /**
+     * 0.2.2.5: tambien si la pantalla empieza dentro de la copia (New Super
+     * Mario Bros. 2 copia a 0x18000000 y presenta desde 0x18002000): era la
+     * copia por software, con un volcado de la superficie esperando a la GPU,
+     * en uno de cada dos fotogramas.
+     */
+    if (!tiled && !IsDisplayFramebuffer(dst, width * height * Pica::BytesPerPixel(out_format),
+                                        width * Pica::BytesPerPixel(out_format))) {
         return reject("no es pantalla");
     }
 
@@ -3520,6 +3562,11 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     // Con la memoria del invitado por delante de la nuestra: por software.
     if (source->needs_reload || !source->color_buffer.Valid()) {
         return reject("superficie por recargar");
+    }
+    // Una textura encima de su propio origen: la invalidacion del destino se
+    // llevaria lo dibujado que aun no esta en el invitado (0.2.2.5).
+    if (tiled && source->Overlaps(dst, width * height * Pica::BytesPerPixel(out_format))) {
+        return reject("textura sobre su origen");
     }
     if (source->width != config.input_width || source->bpp != Pica::BytesPerPixel(in_format) ||
         width == 0 || height == 0 || in_width > source->width ||
