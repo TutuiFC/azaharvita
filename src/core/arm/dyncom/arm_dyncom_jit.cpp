@@ -3821,6 +3821,48 @@ bool Analyze(ARMul_State* cpu, Block& block) {
         }
     }
     block.uses_cache = placed > 0;
+    /**
+     * CUANTO DEJA FUERA LA CACHE (0.2.3.3). Accesos a registros del juego de
+     * los bloques compilados (sin ponderar por ejecuciones): los que caen en
+     * los cinco huecos, y los que caerian con siete o nueve. Es lo que decide
+     * si compensa ampliar la cache, que es tocar casi todo el compilador.
+     */
+    {
+        static u64 total = 0;
+        static u64 with_slots[3] = {};
+        static u64 words = 0;
+        static u64 side_exits = 0;
+        static u32 blocks = 0;
+        std::array<u32, 15> sorted{};
+        for (u32 g = 0; g < 15; g++) {
+            sorted[g] = uses[g];
+            total += uses[g];
+        }
+        std::sort(sorted.begin(), sorted.end(), std::greater<>());
+        constexpr u32 kSlots[3] = {5, 7, 9};
+        for (u32 k = 0; k < 3; k++) {
+            for (u32 g = 0; g < kSlots[k]; g++) {
+                with_slots[k] += sorted[g] >= 2 ? sorted[g] : 0u;
+            }
+        }
+        words += block.words.size();
+        side_exits += block.side_exits;
+        if (++blocks % 20000 == 0 && total != 0) {
+            const auto percent = [](u64 part, u64 whole) {
+                return static_cast<double>(part) * 100.0 / static_cast<double>(whole);
+            };
+            Common::VitaNote(
+                "jit regs",
+                fmt::format("{} bloques: {:.1f} instrucciones y {:.2f} saltos laterales de media; "
+                            "accesos a registros en la cache: {:.0f}% con 5 huecos, {:.0f}% con 7, "
+                            "{:.0f}% con 9",
+                            blocks, static_cast<double>(words) / blocks,
+                            static_cast<double>(side_exits) / blocks,
+                            percent(with_slots[0], total), percent(with_slots[1], total),
+                            percent(with_slots[2], total))
+                    .c_str());
+        }
+    }
     return true;
 }
 
