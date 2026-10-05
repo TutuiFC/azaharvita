@@ -1377,6 +1377,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                         .c_str());
                 Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
                 Common::VitaNote("esperas gpu", stats_gpu_waits.c_str());
+                Common::VitaNote("superficies",
+                                 Gxm::RasterizerGXM::TakeSurfaceSummary().c_str());
                 Common::VitaNote("jit otro", Core::ArmJit::TakeRejectWords().c_str());
                 Common::VitaNote("vs flujo", Pica::Shader::Fast::TakeFlowSummary().c_str());
                 u32 code_bytes = 0;

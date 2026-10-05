@@ -62,6 +62,11 @@ std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
 std::atomic<u32> RasterizerGXM::gpu_fills{0};
+std::array<std::atomic<u32>, 3> RasterizerGXM::reload_causes{};
+std::atomic<u32> RasterizerGXM::soft_fills{0};
+std::atomic<u32> RasterizerGXM::texture_copies{0};
+std::atomic<u32> RasterizerGXM::texture_copy_kb{0};
+
 std::atomic<u32> RasterizerGXM::software_syncs{0};
 std::atomic<u32> RasterizerGXM::skipped_batches{0};
 RasterizerGXM* RasterizerGXM::s_instance = nullptr;
@@ -3353,7 +3358,63 @@ void FillPattern(u8* dst, u32 bytes, u32 texel, u32 bpp) {
 }
 } // Anonymous namespace
 
+std::string RasterizerGXM::TakeSurfaceSummary() {
+    return fmt::format("recargas: lote soft {} relleno/transf {} volcar+invalidar {} | "
+                       "rellenos por software {} | copias de textura {} ({} KB)",
+                       reload_causes[0].exchange(0, std::memory_order_relaxed),
+                       reload_causes[1].exchange(0, std::memory_order_relaxed),
+                       reload_causes[2].exchange(0, std::memory_order_relaxed),
+                       soft_fills.exchange(0, std::memory_order_relaxed),
+                       texture_copies.exchange(0, std::memory_order_relaxed),
+                       texture_copy_kb.exchange(0, std::memory_order_relaxed));
+}
+
+bool RasterizerGXM::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
+    const PAddr src = config.GetPhysicalInputAddress();
+    const PAddr dst = config.GetPhysicalOutputAddress();
+    const u32 size = config.texture_copy.size;
+    texture_copies.fetch_add(1, std::memory_order_relaxed);
+    texture_copy_kb.fetch_add(size / 1024, std::memory_order_relaxed);
+    // Las primeras distintas, con lo que tocan: si el origen o el destino es
+    // una superficie nuestra, ahi esta el volcado o la recarga.
+    static std::array<std::pair<PAddr, PAddr>, 8> seen{};
+    static u32 seen_count = 0;
+    for (u32 i = 0; i < seen_count; i++) {
+        if (seen[i].first == src && seen[i].second == dst) {
+            return false;
+        }
+    }
+    if (seen_count < seen.size()) {
+        seen[seen_count++] = {src, dst};
+        const auto surface_at = [this](PAddr address) -> u32 {
+            for (const auto& surface : surfaces) {
+                if (surface->Overlaps(address, 1)) {
+                    return surface->guest_address;
+                }
+            }
+            return 0;
+        };
+        NoteFmt("gxm copia textura",
+                "{:#010x} -> {:#010x} {} bytes, ancho {}/{} hueco {}/{} (16 B) | sup origen "
+                "{:#010x} destino {:#010x}",
+                src, dst, size, static_cast<u32>(config.texture_copy.input_width.Value()),
+                static_cast<u32>(config.texture_copy.output_width.Value()),
+                static_cast<u32>(config.texture_copy.input_gap.Value()),
+                static_cast<u32>(config.texture_copy.output_gap.Value()), surface_at(src),
+                surface_at(dst));
+    }
+    return false;
+}
+
 bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
+    const bool done = AccelerateFillOnGpu(config);
+    if (!done) {
+        soft_fills.fetch_add(1, std::memory_order_relaxed);
+    }
+    return done;
+}
+
+bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
     // Mismo interruptor que la copia de pantalla: los dos son pintar en la
     // GPU lo que antes hacia la CPU en la memoria del invitado.
     if (!available || transfer_on_gpu.load(std::memory_order_relaxed) == 0) {
@@ -4317,6 +4378,7 @@ void RasterizerGXM::PrepareSoftwareBatch() {
         surface->needs_reload = true;
         surface->dirty = false;
         surface->copied = false;
+        reload_causes[0].fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -5055,6 +5117,13 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
             surface->needs_reload = true;
             surface->clear_pending = false;
             surface->clear_count = 0;
+            reload_causes[1].fetch_add(1, std::memory_order_relaxed);
+            static u32 noted = 0;
+            if (noted < 6) {
+                noted++;
+                NoteFmt("gxm recarga", "{:#010x} +{} pisa la superficie {:#010x} {}x{}", addr,
+                        size, surface->guest_address, surface->width, surface->height);
+            }
         }
         if (hits_depth) {
             surface->depth_needs_clear = true;
@@ -5089,6 +5158,7 @@ void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
             // comparte con el invitado, asi que ahi no hay nada que devolver.
             WriteBack(*surface);
             surface->needs_reload = true;
+            reload_causes[2].fetch_add(1, std::memory_order_relaxed);
         }
         if (hits_depth) {
             surface->depth_needs_clear = true;

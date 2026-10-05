@@ -141,8 +141,23 @@ public:
      * siguiente escena empieza pintando un quad de ese color.
      */
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
+    /// Solo apunta (0.2.2.1): las copias de textura siguen por software.
+    bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     /// Rellenos hechos asi (overlay y crash.txt).
     static std::atomic<u32> gpu_fills;
+    /**
+     * POR QUE UNA SUPERFICIE DEJA DE VALER (0.2.2.1). En Inazuma Eleven GO la
+     * copia de la imagen 3D a la pantalla se rechazaba por "superficie por
+     * recargar" en cada fotograma, y eso es volcarla esperando a toda la GPU.
+     * Cuantas veces se marca para recargar y por que camino, los rellenos que
+     * no pudieron ir a la GPU y las copias de textura del juego, para
+     * crash.txt (TakeSurfaceSummary).
+     */
+    static std::array<std::atomic<u32>, 3> reload_causes;
+    static std::atomic<u32> soft_fills;
+    static std::atomic<u32> texture_copies;
+    static std::atomic<u32> texture_copy_kb;
+    [[nodiscard]] static std::string TakeSurfaceSummary();
 
     /// Coste de AccelerateDrawBatch por fases, muestreado (0.1.9.6). La linea
     /// para crash.txt, y se pone a cero.
@@ -422,6 +437,7 @@ private:
     ScreenCopy* GetScreenCopy(PAddr dst, u32 width, u32 height, u32 gxm_color_format, u32 bpp,
                               u32 scale);
     /// El quad de la superficie a la copia, en una escena suya.
+    bool AccelerateFillOnGpu(const Pica::MemoryFillConfig& config);
     bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip,
                     u32 in_width, u32 in_height);
     /// Rellenos pendientes (ver AccelerateFill): el quad del color dentro de la
