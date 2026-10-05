@@ -123,4 +123,23 @@ StereoBuffer16 DecodePCM16(const unsigned num_channels, const u8* const data,
 
     return ret;
 }
+
+void RefreshPCM16(const unsigned num_channels, const u8* const data, const std::size_t sample_count,
+                  StereoBuffer16& buffer) {
+    ASSERT(num_channels == 1 || num_channels == 2);
+    ASSERT(sample_count <= buffer.size());
+
+    auto out = buffer.begin();
+    if (num_channels == 1) {
+        for (std::size_t i = 0; i < sample_count; i++, ++out) {
+            s16 sample;
+            std::memcpy(&sample, data + i * sizeof(s16), sizeof(s16));
+            out->fill(sample);
+        }
+    } else {
+        for (std::size_t i = 0; i < sample_count; i++, ++out) {
+            std::memcpy(out->data(), data + i * sizeof(s16) * 2, 2 * sizeof(s16));
+        }
+    }
+}
 } // namespace AudioCore::Codec

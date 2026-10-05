@@ -155,6 +155,7 @@ public:
      */
     static std::array<std::atomic<u32>, 3> reload_causes;
     static std::atomic<u32> soft_fills;
+    static std::atomic<u32> soft_fill_kb;
     static std::atomic<u32> texture_copies;
     static std::atomic<u32> texture_copy_kb;
     [[nodiscard]] static std::string TakeSurfaceSummary();
@@ -438,6 +439,7 @@ private:
                               u32 scale);
     /// El quad de la superficie a la copia, en una escena suya.
     bool AccelerateFillOnGpu(const Pica::MemoryFillConfig& config);
+    bool FillGuestMemory(const Pica::MemoryFillConfig& config);
     bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip,
                     u32 in_width, u32 in_height);
     /// Rellenos pendientes (ver AccelerateFill): el quad del color dentro de la

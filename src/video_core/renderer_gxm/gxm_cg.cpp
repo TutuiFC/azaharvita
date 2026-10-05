@@ -4,6 +4,7 @@
 
 #include "video_core/renderer_gxm/gxm_cg.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -1275,8 +1276,22 @@ void* CgWorkerMain(void*) {
         {
             std::unique_lock lock{g_jobs_mutex};
             g_jobs_ready.wait(lock, [] { return !g_jobs.empty(); });
-            job = std::move(g_jobs.front());
-            g_jobs.pop_front();
+            /**
+             * LOS GRANDES, LOS ULTIMOS (0.2.2.3). Uno de 16-23 KB pasa minutos
+             * aqui y el hilo es uno solo: por orden de llegada, todo lo que
+             * viniera detras esperaba esos minutos, los de fragmentos tambien
+             * (sin ellos el lote no se dibuja). Primero cualquiera que no sea
+             * grande; los grandes, cuando no queda otra cosa.
+             */
+            auto pick = std::find_if(g_jobs.begin(), g_jobs.end(),
+                                     [](const std::shared_ptr<CgJob>& queued) {
+                                         return !queued->heavy;
+                                     });
+            if (pick == g_jobs.end()) {
+                pick = g_jobs.begin();
+            }
+            job = std::move(*pick);
+            g_jobs.erase(pick);
             g_jobs_queued.store(static_cast<u32>(g_jobs.size()), std::memory_order_relaxed);
         }
         g_worker_busy_since.store(Common::VitaMicros(), std::memory_order_relaxed);

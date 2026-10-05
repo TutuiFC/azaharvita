@@ -386,7 +386,25 @@ void Source::GenerateFrame() {
 
         if (memory) {
             const u32 remaining_samples = state.current_buffer_length - state.current_sample_number;
-            state.current_buffer = Codec::DecodePCM16(num_channels, memory, remaining_samples);
+            /**
+             * SOLO LO QUE ESTE FOTOGRAMA PUEDE CONSUMIR, Y EN SU SITIO (0.2.2.3).
+             * Esto decodificaba TODO lo que quedaba del buffer en una deque nueva
+             * en cada fotograma del DSP (uno cada 5 ms emulados): con un buffer
+             * en bucle de segundos, decenas de miles de muestras y otras tantas
+             * reservas cada vez, lo unico del DSP que crece con el buffer. New
+             * Super Mario Bros. 2 en crash.txt de 0.2.2.1: "dsp" de 11 a 27 ms
+             * por fotograma en sus niveles, 1-4 ms en sus menus y en otros
+             * juegos. Lo que no se consume ahora se refresca en el fotograma que
+             * lo consuma, que es cuando importa: la salida es la misma. Con un
+             * ritmo absurdo (NaN, enorme), todo, como antes.
+             */
+            const std::size_t limit = std::min(state.current_buffer.size(),
+                                               static_cast<std::size_t>(remaining_samples));
+            const float wanted =
+                state.rate_multiplier * static_cast<float>(current_frame.size()) + 16.0f;
+            const std::size_t count =
+                wanted < static_cast<float>(limit) ? static_cast<std::size_t>(wanted) : limit;
+            Codec::RefreshPCM16(num_channels, memory, count, state.current_buffer);
         }
     }
 

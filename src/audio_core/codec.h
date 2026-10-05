@@ -45,4 +45,14 @@ StereoBuffer16 DecodePCM8(const unsigned num_channels, const u8* const data,
  */
 StereoBuffer16 DecodePCM16(const unsigned num_channels, const u8* const data,
                            const std::size_t sample_count);
+
+/**
+ * Like DecodePCM16, but overwrites the first sample_count samples of an existing buffer in place.
+ * @param num_channels Number of channels
+ * @param data Pointer to buffer that contains PCM16 data to decode
+ * @param sample_count Number of samples to decode, at most buffer.size()
+ * @param buffer Buffer whose first sample_count samples are replaced
+ */
+void RefreshPCM16(const unsigned num_channels, const u8* const data, const std::size_t sample_count,
+                  StereoBuffer16& buffer);
 } // namespace AudioCore::Codec

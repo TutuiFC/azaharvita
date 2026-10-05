@@ -64,6 +64,7 @@ std::atomic<u32> RasterizerGXM::transfer_materialized{0};
 std::atomic<u32> RasterizerGXM::gpu_fills{0};
 std::array<std::atomic<u32>, 3> RasterizerGXM::reload_causes{};
 std::atomic<u32> RasterizerGXM::soft_fills{0};
+std::atomic<u32> RasterizerGXM::soft_fill_kb{0};
 std::atomic<u32> RasterizerGXM::texture_copies{0};
 std::atomic<u32> RasterizerGXM::texture_copy_kb{0};
 
@@ -1955,8 +1956,18 @@ private:
          * 26 KB de la anterior lo tumbo). El hilo es uno solo, y detras se
          * quedan TODOS los demas, los de fragmentos tambien: el 3D entero
          * saltado y la pantalla de arriba en negro.
+         *
+         * 0.2.2.3: 23 KB, y los de mas de 16 KB los ultimos de la cola
+         * (CgJob::heavy), asi ya no tapan a nadie. Tiempos en la consola a O1
+         * (crash.txt de varios juegos): 4,6 KB 0,75 s; 8-10 KB 7-17 s;
+         * 13-14,5 KB 6-36 s; 24 KB 176 s y 48 MB de pico (Zelda: Ocarina of
+         * Time 3D). Los de New Super Mario Bros. 2 son de 16,8 a 22,3 KB, y por
+         * la CPU le costaban 23-44 ms por fotograma en cada nivel: unos minutos
+         * de compilador una vez, y luego salen de la cache de la tarjeta. Los
+         * de 24 KB de Pokemon Sol siguen fuera.
          */
-        constexpr std::size_t kMaxCompileSource = 16u * 1024u;
+        constexpr std::size_t kMaxCompileSource = 23u * 1024u;
+        constexpr std::size_t kHeavySource = 16u * 1024u;
         // De la cache de la tarjeta: es leer un fichero, aqui mismo.
         if (const SceShaccCgCompileOutput* cached =
                 LoadCgCache(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", sources.front().c_str())) {
@@ -1975,6 +1986,7 @@ private:
         }
         // Al hilo de compilacion (0.1.9.6); GetProgram recoge el resultado.
         auto job = std::make_shared<CgJob>();
+        job->heavy = sources.front().size() > kHeavySource;
         job->sources = std::move(sources);
         job->variants = std::move(variants);
         program.job = job;
@@ -3374,11 +3386,12 @@ void FillPattern(u8* dst, u32 bytes, u32 texel, u32 bpp) {
 
 std::string RasterizerGXM::TakeSurfaceSummary() {
     return fmt::format("recargas: lote soft {} relleno/transf {} volcar+invalidar {} | "
-                       "rellenos por software {} | copias de textura {} ({} KB)",
+                       "rellenos por software {} ({} KB) | copias de textura {} ({} KB)",
                        reload_causes[0].exchange(0, std::memory_order_relaxed),
                        reload_causes[1].exchange(0, std::memory_order_relaxed),
                        reload_causes[2].exchange(0, std::memory_order_relaxed),
                        soft_fills.exchange(0, std::memory_order_relaxed),
+                       soft_fill_kb.exchange(0, std::memory_order_relaxed),
                        texture_copies.exchange(0, std::memory_order_relaxed),
                        texture_copy_kb.exchange(0, std::memory_order_relaxed));
 }
@@ -3421,11 +3434,49 @@ bool RasterizerGXM::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
 }
 
 bool RasterizerGXM::AccelerateFill(const Pica::MemoryFillConfig& config) {
-    const bool done = AccelerateFillOnGpu(config);
-    if (!done) {
-        soft_fills.fetch_add(1, std::memory_order_relaxed);
+    if (AccelerateFillOnGpu(config)) {
+        return true;
     }
-    return done;
+    soft_fills.fetch_add(1, std::memory_order_relaxed);
+    return FillGuestMemory(config);
+}
+
+/**
+ * EL RELLENO QUE NO VA A LA GPU, AQUI MISMO (0.2.2.3). Era SwBlitter::MemoryFill,
+ * que hace lo mismo (InvalidateRegion y escribir el patron en la memoria del
+ * invitado) pero de pixel en pixel: 24 bits byte a byte y 16 bits de dos en dos.
+ * Pokemon Sol y New Super Mario Bros. 2 hacen 20-30 por fotograma ("rellenos
+ * por software" en crash.txt de 0.2.2.1), sobre todo el borrado de la
+ * profundidad, que no es una superficie de color. Con FillPattern, por bloques,
+ * que es lo que paso a hacer el relleno en la GPU en 0.1.9.8 (de ~11 ms a ~1 ms
+ * por fotograma). El final es exacto como alli: SwBlitter, con 24 bits, se pasa
+ * hasta 2 bytes. Lo que no este entero en la memoria del invitado, a SwBlitter.
+ */
+bool RasterizerGXM::FillGuestMemory(const Pica::MemoryFillConfig& config) {
+    const PAddr start = config.GetStartAddress();
+    const PAddr end = config.GetEndAddress();
+    if (end <= start || !GuestSpanMapped(memory, start, end - start)) {
+        return false;
+    }
+    u32 texel = 0;
+    u32 bpp = 0;
+    if (config.fill_24bit) {
+        texel = static_cast<u32>(config.value_24bit_r.Value()) |
+                (static_cast<u32>(config.value_24bit_g.Value()) << 8) |
+                (static_cast<u32>(config.value_24bit_b.Value()) << 16);
+        bpp = 3;
+    } else if (config.fill_32bit) {
+        texel = config.value_32bit;
+        bpp = 4;
+    } else {
+        texel = config.value_16bit;
+        bpp = 2;
+    }
+    const u32 bytes = end - start;
+    InvalidateRegion(start, bytes);
+    FillPattern(memory.GetPhysicalPointer(start), bytes, texel, bpp);
+    soft_fill_kb.fetch_add(bytes / 1024, std::memory_order_relaxed);
+    return true;
 }
 
 bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
