@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <memory>
+#include <string>
 #include <psp2/kernel/processmgr.h>
 #include <vita2d.h>
 #include "core/frontend/emu_window.h"
@@ -303,6 +304,8 @@ private:
     double stats_texdecode_ms = 0.0;
     double stats_texrehash_ms = 0.0;
     double stats_texrehash_kb = 0.0;
+    /// Las esperas a la GPU por motivo, en ms por fotograma (0.2.1.9).
+    std::string stats_gpu_waits = "-";
     unsigned int stats_texdecodes = 0;
     /// Vaciados de la cache de traduccion del ARM en el ultimo intervalo, y los
     /// totales en la lectura anterior para poder restar. Ver el calculo.

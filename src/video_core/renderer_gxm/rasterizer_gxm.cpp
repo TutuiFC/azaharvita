@@ -50,6 +50,8 @@ std::atomic<u32> RasterizerGXM::hw_vs_batches{0};
 std::atomic<u32> RasterizerGXM::hw_vs_rejects{0};
 std::atomic<const char*> RasterizerGXM::hw_vs_last_reject{"-"};
 std::array<RasterizerGXM::RejectCount, 12> RasterizerGXM::reject_counts{};
+std::array<std::atomic<unsigned long long>, static_cast<u32>(RasterizerGXM::GpuWait::Count)>
+    RasterizerGXM::gpu_wait_us{};
 std::atomic<u32> RasterizerGXM::Ablation::mode{0};
 std::atomic<u32> RasterizerGXM::no_finish_wait{1};
 std::atomic<u32> RasterizerGXM::present_direct{1};
@@ -2512,7 +2514,7 @@ void RasterizerGXM::EndScene() {
         // Camino de 0.1.5.1: esperar aqui mismo, medido en finish_us.
         // gpu_pending tiene que estar en uno para que WaitGpu no se salte.
         gpu_pending = true;
-        WaitGpu();
+        WaitGpu(GpuWait::Scene);
     }
     /**
      * Volver a encender la carga forzada.
@@ -2543,14 +2545,14 @@ bool RasterizerGXM::FenceDone(u32 fence) const {
     return static_cast<s32>(*fence_address - fence) >= 0;
 }
 
-void RasterizerGXM::WaitFence(u32 fence) {
+void RasterizerGXM::WaitFence(u32 fence, GpuWait why) {
     if (FenceDone(fence)) {
         return;
     }
     if (static_cast<s32>(fence_sent - fence) < 0) {
         // Una valla que aun no se ha enviado (no deberia pasar): a todo.
         gpu_pending = true;
-        WaitGpu();
+        WaitGpu(why);
         return;
     }
     /**
@@ -2571,15 +2573,17 @@ void RasterizerGXM::WaitFence(u32 fence) {
     while (!FenceDone(fence)) {
         if (Common::VitaMicros() - begin > 2000000ull) {
             gpu_pending = true;
-            WaitGpu();
+            WaitGpu(why);
             return;
         }
         sceKernelDelayThread(50);
     }
-    Common::FrameStats::Add(Common::FrameStats::finish_us, begin);
+    const unsigned long long waited = Common::VitaMicros() - begin;
+    Common::FrameStats::finish_us.fetch_add(waited, std::memory_order_relaxed);
+    gpu_wait_us[static_cast<u32>(why)].fetch_add(waited, std::memory_order_relaxed);
 }
 
-void RasterizerGXM::WaitGpu() {
+void RasterizerGXM::WaitGpu(GpuWait why) {
     if (!gpu_pending) {
         return;
     }
@@ -2589,7 +2593,24 @@ void RasterizerGXM::WaitGpu() {
     const unsigned long long finish_begin = Common::VitaMicros();
     const Common::ScopedVitaStage stage{"gxm espera a la gpu"};
     sceGxmFinish(context);
-    Common::FrameStats::Add(Common::FrameStats::finish_us, finish_begin);
+    const unsigned long long waited = Common::VitaMicros() - finish_begin;
+    Common::FrameStats::finish_us.fetch_add(waited, std::memory_order_relaxed);
+    gpu_wait_us[static_cast<u32>(why)].fetch_add(waited, std::memory_order_relaxed);
+}
+
+std::string RasterizerGXM::TakeGpuWaitSummary(double frames) {
+    static constexpr const char* kNames[static_cast<u32>(GpuWait::Count)] = {
+        "cerrar escena", "volcado", "recarga", "presentar directo", "copia", "borrado cpu",
+        "tablas de luz", "fotograma", "vertices", "valla"};
+    std::string text;
+    for (u32 i = 0; i < static_cast<u32>(GpuWait::Count); i++) {
+        const unsigned long long us = gpu_wait_us[i].exchange(0, std::memory_order_relaxed);
+        const double ms = static_cast<double>(us) / 1000.0 / (frames > 0.0 ? frames : 1.0);
+        if (ms >= 0.05) {
+            text += fmt::format("{}{} {:.1f}", text.empty() ? "" : ", ", kNames[i], ms);
+        }
+    }
+    return text.empty() ? "-" : text;
 }
 
 void RasterizerGXM::WriteBack(Surface& surface) {
@@ -2600,7 +2621,7 @@ void RasterizerGXM::WriteBack(Surface& surface) {
         ApplyClearOnCpu(surface);
     }
     // Lee color_buffer: la GPU pudo no haber terminado si 4.5 difirio la espera.
-    WaitGpu();
+    WaitGpu(GpuWait::WriteBack);
     surface.dirty = false;
     u8* guest = memory.GetPhysicalPointer(surface.guest_address);
     if (guest == nullptr) {
@@ -2630,7 +2651,7 @@ void RasterizerGXM::Reload(Surface& surface) {
     // en la GPU que pise el tramo, primero a la memoria.
     MaterializeCopies(surface.guest_address, surface.guest_stride * surface.height);
     // Lee y escribe color_buffer: misma razon que WriteBack.
-    WaitGpu();
+    WaitGpu(GpuWait::Reload);
     surface.needs_reload = false;
     u8* guest = memory.GetPhysicalPointer(surface.guest_address);
     if (guest == nullptr) {
@@ -2706,9 +2727,16 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
     if (present_direct.load(std::memory_order_relaxed) == 0) {
         return out;
     }
-    // La textura va a muestrear color_buffer: si 4.5 dejo la espera pendiente,
-    // hay que pagarla aqui o el chip podria seguir escribiendo debajo.
-    self.WaitGpu();
+    /**
+     * SIN ESPERA (0.2.1.9). Aqui se pagaba un sceGxmFinish en CADA
+     * presentacion, "o el chip podria seguir escribiendo debajo". Pero el
+     * presentador dibuja con el MISMO contexto GXM que el rasterizador
+     * (vita2d_get_context, ver Initialize), y la GPU procesa los fragmentos de
+     * las escenas de un contexto en el orden en que se mandan: la escena que
+     * muestrea color_buffer va despues de las que lo dibujan. Con la espera,
+     * el hilo de la GPU se quedaba parado hasta que la Vita acababa el
+     * fotograma entero en cada presentacion.
+     */
     for (const auto& surface : self.surfaces) {
         if (surface->guest_address != guest_address) {
             continue;
@@ -2793,7 +2821,7 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
         return;
     }
     // El blit tiene que haber terminado.
-    WaitGpu();
+    WaitGpu(GpuWait::Copy);
     u8* const dst = memory.GetPhysicalPointer(copy.dst);
     const u8* const src = static_cast<const u8*>(copy.color_buffer.Data());
     const u32 src_stride = copy.stride * copy.bpp;
@@ -3482,7 +3510,7 @@ void RasterizerGXM::ApplyClearOnCpu(Surface& surface) {
     if (open_surface == &surface) {
         EndScene();
     }
-    WaitGpu();
+    WaitGpu(GpuWait::Clear);
     u8* const base = static_cast<u8*>(surface.color_buffer.Data());
     const u32 stride = surface.color_stride * surface.rt_bpp;
     alignas(16) u8 row[2048 * 4];
@@ -3629,7 +3657,7 @@ bool RasterizerGXM::UpdateLightingLut() {
             lighting_lut_retired_in_scene++;
             lighting_lut_version = (lighting_lut_version + 1) % kLutVersions;
             // Una escena ya enviada puede seguir leyendo esa version.
-            WaitFence(lut_fence[lighting_lut_version]);
+            WaitFence(lut_fence[lighting_lut_version], GpuWait::Lut);
             write_all(lighting_lut_version);
             pica.lighting.lut_dirty = 0;
             // La version nueva todavia no la ha atado nadie.
@@ -3653,7 +3681,7 @@ bool RasterizerGXM::UpdateLightingLut() {
             pica.lighting.lut_dirty = 0;
             return true;
         }
-        WaitFence(lut_fence[lighting_lut_version]);
+        WaitFence(lut_fence[lighting_lut_version], GpuWait::Lut);
     }
     // Nadie lee la version actual: basta con reescribir las tablas cambiadas.
     // Esta al dia en todo lo demas, porque cada version se escribe entera al
@@ -3746,10 +3774,10 @@ void RasterizerGXM::FlushForPresent() {
      * la presentacion del anterior (0.1.9.4).
      */
     if (frame_first_fence != 0) {
-        WaitFence(frame_first_fence);
+        WaitFence(frame_first_fence, GpuWait::Frame);
     } else if (context != nullptr) {
         gpu_pending = true;
-        WaitGpu();
+        WaitGpu(GpuWait::Frame);
     }
     frame_first_fence = 0;
     for (auto& surface : surfaces) {
@@ -5065,7 +5093,7 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
     if (!vertex_buffer.Valid() || bytes > vertex_buffer.Size()) {
         // Nuevo, o mas grande para un lote enorme: antes, que nadie lea el viejo.
         EndScene();
-        WaitGpu();
+        WaitGpu(GpuWait::VertexRing);
         const u32 size = std::max(kVertexBufferBytes, (bytes + 0xFFFFFu) & ~0xFFFFFu);
         Allocation buffer;
         if (size == kVertexBufferBytes) {
@@ -5102,10 +5130,10 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
         if (((vertex_segments_pending >> segment) & 1u) != 0) {
             scene_close_full.fetch_add(1, std::memory_order_relaxed);
             EndScene();
-            WaitGpu();
+            WaitGpu(GpuWait::VertexRing);
             break;
         }
-        WaitFence(vertex_segment_fence[segment]);
+        WaitFence(vertex_segment_fence[segment], GpuWait::VertexRing);
     }
     for (u32 segment = first; segment <= last; segment++) {
         vertex_segments_pending |= 1u << segment;

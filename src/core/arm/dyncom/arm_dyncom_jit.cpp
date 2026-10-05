@@ -885,8 +885,8 @@ bool g_init_tried = false;
 std::unordered_map<u32, Block> g_blocks;
 
 /// Atajo delante del mapa, como block_cache del interprete.
-constexpr u32 kFastSlots = 4096;
-constexpr u32 kFastSlotBits = 12;
+constexpr u32 kFastSlots = 8192;
+constexpr u32 kFastSlotBits = 13;
 static_assert((1u << kFastSlotBits) == kFastSlots, "el enlace indirecto indexa con kFastSlotBits");
 struct FastSlot {
     u32 pc = 0xFFFFFFFFu;
@@ -896,10 +896,13 @@ std::array<FastSlot, kFastSlots> g_fast{};
 static_assert(sizeof(FastSlot) == 8 && offsetof(FastSlot, pc) == 0 && offsetof(FastSlot, block) == 4,
               "el enlace indirecto lee g_fast como pares de palabras (pc, block)");
 
-/// Hueco de g_fast de una clave: las ARM como el enlace indirecto del codigo
-/// generado (pc >> 2); las Thumb (bit 0), por medias palabras.
+/**
+ * Hueco de g_fast de una clave, el MISMO calculo que el enlace indirecto del
+ * codigo generado (0.2.1.9): clave >> 1. Las ARM (alineadas a 4) caen en los
+ * huecos pares y las Thumb en todos; por eso la tabla paso de 4096 a 8192.
+ */
 inline u32 FastIndex(u32 key) {
-    return ((key & 1u) != 0 ? key >> 1 : key >> 2) & (kFastSlots - 1);
+    return (key >> 1) & (kFastSlots - 1);
 }
 /// Desplazamiento de Block::link dentro de Block (0 en la practica; se mide en
 /// Init porque Block no tiene disposicion estandar).
@@ -1672,6 +1675,17 @@ public:
         next_pc_ = next_pc;
         branch_target_ = target;
     }
+    /// El bloque que se compila (0.2.1.9): su clave y cuantas instrucciones
+    /// cuenta, para que un salto a si mismo no salga del bloque (ver
+    /// EmitSelfLink).
+    void SetBlock(u32 key, u32 count) {
+        block_key_ = key;
+        block_count_ = count;
+    }
+    /// Donde empieza el cuerpo, con la cache ya cargada (despues de BodyEnter).
+    void MarkBodyStart() {
+        body_start_ = e.Position();
+    }
 
 private:
     Emitter& e;
@@ -1679,6 +1693,9 @@ private:
     bool thumb_ = false;
     u32 next_pc_ = 0;
     u32 branch_target_ = 0;
+    u32 block_key_ = 0xFFFFFFFFu;
+    u32 block_count_ = 0;
+    u32 body_start_ = 0xFFFFFFFFu;
 
     /**
      * Lo que lee el juego como r15 en la instruccion de 'pc'. En ARM, +8. En
@@ -2956,6 +2973,11 @@ private:
      */
     void ExitDirect(u32 target_pc) {
         if (Linking()) {
+            if (BlockKey(target_pc) == block_key_ && body_start_ != 0xFFFFFFFFu &&
+                block_count_ != 0) {
+                EmitSelfLink(target_pc);
+                return;
+            }
             EmitLink(LinkFor(BlockKey(target_pc)), target_pc);
             return;
         }
@@ -3005,16 +3027,24 @@ private:
          * cambiar: la prueba nunca fallaba.
          */
         if (target == nullptr) {
-            // Indirecto: tiene que seguir en ARM y con el PC alineado (el
-            // despacho alinearia; aqui simplemente no se enlaza).
-            e.LdrImm(R1, kCpu, g_offsets.t);
-            e.CmpImm0(R1);
-            fails.push_back(e.BranchPlaceholder(kCondNe));
+            /**
+             * Indirecto, con el PC alineado segun el modo (el despacho
+             * alinearia; aqui simplemente no se enlaza): en ARM los dos bits
+             * de abajo a cero, en Thumb el de abajo. Desde 0.2.1.9 tambien
+             * a Thumb (los "bx lr" y "pop {pc}" de vuelta a codigo Thumb, que
+             * acababan en el despacho): clave = pc | TFlag, como TryRun.
+             */
             e.LdrImm(R1, kCpu, RegOffset(15));
-            e.Emit(0xE3100003u | (R1 << 16)); // TST r1, #3
+            e.LdrImm(R2, kCpu, g_offsets.t);
+            e.Emit(0xE3100001u | (R1 << 16)); // TST r1, #1
             fails.push_back(e.BranchPlaceholder(kCondNe));
-            // r3 = &g_fast[(pc >> 2) & (kFastSlots - 1)]
-            e.Ubfx(R2, R1, 2, kFastSlotBits);
+            // El bit 1 solo cuenta en ARM: r3 = TFlag ^ 1, y TST r1, r3, LSL #1.
+            e.Emit(0xE2200001u | (R2 << 16) | (R3 << 12));             // EOR r3, r2, #1
+            e.Emit(0xE1100080u | (R1 << 16) | R3);                     // TST r1, r3, LSL #1
+            fails.push_back(e.BranchPlaceholder(kCondNe));
+            e.Emit(0xE1800000u | (R1 << 16) | (R1 << 12) | R2); // ORR r1, r1, r2
+            // r3 = &g_fast[(clave >> 1) & (kFastSlots - 1)]
+            e.Ubfx(R2, R1, 1, kFastSlotBits);
             e.Mov32(R3, static_cast<u32>(reinterpret_cast<uintptr_t>(g_fast.data())));
             e.Emit(0xE0800000u | (R3 << 16) | (R3 << 12) | (3u << 7) | R2); // ADD r3, r3, r2, LSL #3
             e.LdrImm(R2, R3, 0);                                           // slot.pc
@@ -3056,6 +3086,44 @@ private:
                 e.Mov32(kRd, target_pc);
                 e.StrImm(kRd, kCpu, RegOffset(15));
             }
+            e.BranchTo(kAlways, exit_noflush);
+        });
+    }
+
+    /**
+     * EL SALTO AL PROPIO BLOQUE (0.2.1.9). Un bucle cuyo salto de vuelta cae
+     * al principio de su bloque ("loop: ... subs r2, r2, #1; bne loop") se
+     * enlazaba consigo mismo como con cualquier otro: volcar la cache, cargar
+     * el LinkInfo, mirar su entrada, saltar por registro al prologo del cuerpo
+     * y volver a cargar la cache, en cada vuelta. Ahora es un salto directo al
+     * cuerpo, despues de la carga de la cache: los registros cacheados ya
+     * tienen sus valores. Se vuelcan antes (los escritos), porque el cuerpo se
+     * emitio suponiendo que la memoria y los huecos coinciden al empezar. El
+     * presupuesto se descuenta igual que en un enlace (mismo LDRD/STRD, mismas
+     * cuentas en RunCompiled), y si no llega, se sale como un enlace fallido.
+     * Sin mirar link.entry: si este codigo corre, el bloque esta publicado.
+     */
+    void EmitSelfLink(u32 target_pc) {
+        std::vector<u32> fails;
+        FlushCachedRegs();
+        e.Mrs(kT0);
+        e.LdrdImm(kRn, kCpu, g_offsets.link);
+        u32 encoded = 0;
+        if (Emitter::EncodeImmediate(block_count_, &encoded)) {
+            e.Emit(0xE2500000u | (kRn << 16) | (kRn << 12) | encoded); // SUBS kRn, kRn, #count
+        } else {
+            e.Mov32(kRs, block_count_);
+            e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | kRs); // SUBS kRn, kRn, kRs
+        }
+        fails.push_back(e.BranchPlaceholder(kCondLo));
+        e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
+        e.StrdImm(kRn, kCpu, g_offsets.link);
+        e.MsrFlags(kT0);
+        e.BranchTo(kAlways, body_start_);
+        DeferCold(std::move(fails), [this, target_pc] {
+            e.MsrFlags(kT0);
+            e.Mov32(kRd, target_pc);
+            e.StrImm(kRd, kCpu, RegOffset(15));
             e.BranchTo(kAlways, exit_noflush);
         });
     }
@@ -3581,9 +3649,11 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity) {
     Compiler compiler{e, check_mode};
     compiler.SetCacheMap(block.cache_map);
     compiler.SetThumb(block.thumb);
+    compiler.SetBlock(block.pc, block.guest_count);
     compiler.Prologue();
     const u32 chain_entry = compiler.ChainEntryPosition();
     compiler.BodyEnter();
+    compiler.MarkBodyStart();
     u32 pc = block.pc & ~1u;
     bool terminated = false;
     // Vida de los flags del juego (0.1.5.7): ver ComputeFlagsLiveAfter.

@@ -293,6 +293,30 @@ public:
     [[nodiscard]] static std::string TakeRejectSummary();
 
     /**
+     * QUIEN ESPERA A LA GPU (0.2.1.9). "espera a la gpu" de crash.txt era un
+     * total: 9-11 ms por fotograma en el 3D de Pokemon Sol, y quitar la espera
+     * de la presentacion (0.2.1.8) apenas lo movio. Ahora cada espera se
+     * apunta en su motivo, y TakeGpuWaitSummary saca los que pesan, en ms por
+     * fotograma ('frames' fotogramas desde la ultima vez).
+     */
+    enum class GpuWait : u32 {
+        Scene,
+        WriteBack,
+        Reload,
+        Present,
+        Copy,
+        Clear,
+        Lut,
+        Frame,
+        VertexRing,
+        Fence,
+        Count,
+    };
+    static std::array<std::atomic<unsigned long long>, static_cast<u32>(GpuWait::Count)>
+        gpu_wait_us;
+    [[nodiscard]] static std::string TakeGpuWaitSummary(double frames);
+
+    /**
      * 4.5 (0.1.5.2): NO esperar a sceGxmFinish al cerrar cada escena.
      * 1 (por defecto, riesgo medio con interruptor) = EndScene cierra con
      * sceGxmEndScene y deja la espera pendiente; WaitGpu() la paga SOLO
@@ -460,7 +484,7 @@ private:
      * usando. Con no_finish_wait=0 no hace nada (ya se espero en EndScene).
      * Anota el tiempo en finish_us, igual que antes.
      */
-    void WaitGpu();
+    void WaitGpu(GpuWait why);
 
     /**
      * Deja las tablas de busqueda de la iluminacion listas para la GPU.
@@ -541,7 +565,7 @@ private:
     /// La primera valla del fotograma en curso (ver FlushForPresent).
     u32 frame_first_fence = 0;
     [[nodiscard]] bool FenceDone(u32 fence) const;
-    void WaitFence(u32 fence);
+    void WaitFence(u32 fence, GpuWait why);
 
     /// Vertices del lote en curso, en el formato de la CPU del invitado.
     std::vector<Pica::OutputVertex> batch;

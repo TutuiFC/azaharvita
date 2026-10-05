@@ -917,6 +917,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                     (fast_ops + slow) > 0.0 ? fast_ops / (fast_ops + slow) * 100.0 : 0.0;
             }
             stats_finish_ms = per_frame_ms(Common::FrameStats::finish_us);
+            stats_gpu_waits = Gxm::RasterizerGXM::TakeGpuWaitSummary(n);
             stats_texdecode_ms = per_frame_ms(Common::FrameStats::texture_decode_us);
             stats_texrehash_ms = per_frame_ms(Common::FrameStats::texture_rehash_us);
             stats_texrehash_kb = static_cast<double>(Common::FrameStats::texture_rehash_bytes.load(
@@ -1351,6 +1352,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 stats_gpu_queue_max)
                         .c_str());
                 Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
+                Common::VitaNote("esperas gpu", stats_gpu_waits.c_str());
                 Common::VitaNote("jit otro", Core::ArmJit::TakeRejectWords().c_str());
                 Common::VitaNote("vs flujo", Pica::Shader::Fast::TakeFlowSummary().c_str());
                 u32 code_bytes = 0;
