@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <vector>
 #include <fmt/format.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/kernel/sysmem.h>
 #include "common/hash.h"
 #include "common/vita_diag.h"
@@ -132,17 +133,50 @@ class Emitter {
 public:
     Emitter(u32* base_, u32 capacity_words_) : base{base_}, capacity{capacity_words_} {}
 
+    /**
+     * ZONA FRIA (0.2.3.4). Las posiciones con kColdIndex son de una segunda
+     * zona, lejos de la caliente: los saltos entre las dos se calculan con las
+     * direcciones de verdad. Ver CODIGO CALIENTE Y FRIO en EmitBlockCode.
+     */
+    void SetColdZone(u32* cold_base_, u32 cold_capacity_) {
+        cold_base = cold_base_;
+        cold_capacity = cold_capacity_;
+    }
+    [[nodiscard]] bool HasColdZone() const {
+        return cold_base != nullptr;
+    }
+    void ToCold() {
+        in_cold = cold_base != nullptr;
+    }
+    void ToHot() {
+        in_cold = false;
+    }
+    [[nodiscard]] u32 HotUsed() const {
+        return position;
+    }
+    [[nodiscard]] u32 ColdUsed() const {
+        return cold_position;
+    }
+
     bool Overflowed() const {
         return overflow;
     }
     u32 Position() const {
-        return position;
+        return in_cold ? (kColdIndex | cold_position) : position;
     }
-    u32* At(u32 index) const {
-        return base + index;
+    u32* Address(u32 index) const {
+        return (index & kColdIndex) != 0 ? cold_base + (index & ~kColdIndex) : base + index;
     }
 
     void Emit(u32 word) {
+        if (in_cold) {
+            if (cold_position >= cold_capacity) {
+                overflow = true;
+                return;
+            }
+            cold_base[cold_position++] = word;
+            return;
+        }
         if (position >= capacity) {
             overflow = true;
             return;
@@ -212,7 +246,7 @@ public:
 
     /// Salto con condicion a una etiqueta que se resuelve despues.
     u32 BranchPlaceholder(u32 cond) {
-        const u32 index = position;
+        const u32 index = Position();
         Emit((cond << 28) | 0x0A000000u);
         return index;
     }
@@ -220,8 +254,9 @@ public:
         if (overflow) {
             return;
         }
-        const s32 offset = static_cast<s32>(target_index) - static_cast<s32>(index + 2);
-        base[index] = (base[index] & 0xFF000000u) | (static_cast<u32>(offset) & 0x00FFFFFFu);
+        u32* const at = Address(index);
+        const s32 offset = static_cast<s32>(Address(target_index) - (at + 2));
+        *at = (*at & 0xFF000000u) | (static_cast<u32>(offset) & 0x00FFFFFFu);
     }
 
     /// Llamada a una funcion de C por r12. Destroza r0-r3, r12 y lr (y los
@@ -233,7 +268,7 @@ public:
 
     /// Salto a una posicion ya emitida: la vuelta de un camino frio (0.2.1.0).
     void BranchTo(u32 cond, u32 target_index) {
-        const s32 offset = static_cast<s32>(target_index) - static_cast<s32>(position + 2);
+        const s32 offset = static_cast<s32>(Address(target_index) - (Address(Position()) + 2));
         Emit((cond << 28) | 0x0A000000u | (static_cast<u32>(offset) & 0x00FFFFFFu));
     }
 
@@ -259,10 +294,15 @@ public:
     }
 
 private:
+    static constexpr u32 kColdIndex = 0x80000000u;
     u32* base;
     u32 capacity;
     u32 position = 0;
     bool overflow = false;
+    u32* cold_base = nullptr;
+    u32 cold_capacity = 0;
+    u32 cold_position = 0;
+    bool in_cold = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -909,6 +949,21 @@ struct Block {
 SceUID g_code_block = -1;
 u32* g_code = nullptr;
 u32 g_code_used_words = 0;
+/**
+ * CODIGO CALIENTE Y FRIO (0.2.3.4). La memoria de codigo en tres zonas:
+ * [0, g_cold_start) lo que se ejecuta (el cuerpo de cada bloque y sus
+ * enlaces), [g_cold_start, g_check_start) lo que casi nunca corre (prologo,
+ * epilogo y caminos lentos) y [g_check_start, final) un anillo con las
+ * variantes de comprobacion, que solo sirven la primera vez. Antes iba todo
+ * seguido, bloque a bloque, y el codigo que se ejecuta quedaba repartido por
+ * megas entre el que no: Pokemon Sol a ~21 ciclos por instruccion del juego
+ * con el 81 % de los registros en la cache de registros, lo que solo se
+ * explica esperando a la memoria para traer el propio codigo.
+ */
+u32 g_cold_start_words = 0;
+u32 g_cold_used_words = 0;
+u32 g_check_start_words = 0;
+u32 g_check_used_words = 0;
 /// Bloques generados (las dos variantes) desde el ultimo vaciado.
 u32 g_code_blocks = 0;
 bool g_ready = false;
@@ -1080,6 +1135,13 @@ bool Init(ARMul_State* cpu) {
     }
     g_code = static_cast<u32*>(base_address);
     g_code_used_words = 0;
+    {
+        const u32 total_words = g_code_bytes / 4;
+        g_check_start_words = total_words - total_words / 10;
+        g_cold_start_words = g_check_start_words / 2;
+        g_cold_used_words = 0;
+        g_check_used_words = 0;
+    }
     g_ready = true;
     Common::VitaNote("jit arm",
                      fmt::format("listo ({} MB de codigo)", g_code_bytes >> 20).c_str());
@@ -3446,6 +3508,8 @@ void ResetAll() {
     g_blocks.clear();
     g_fast.fill(FastSlot{});
     g_code_used_words = 0;
+    g_cold_used_words = 0;
+    g_check_used_words = 0;
     g_code_blocks = 0;
     g_pending.active = false;
     g_flush_requested = false;
@@ -3855,11 +3919,13 @@ bool Analyze(ARMul_State* cpu, Block& block) {
                 "jit regs",
                 fmt::format("{} bloques: {:.1f} instrucciones y {:.2f} saltos laterales de media; "
                             "accesos a registros en la cache: {:.0f}% con 5 huecos, {:.0f}% con 7, "
-                            "{:.0f}% con 9",
+                            "{:.0f}% con 9 | zonas: caliente {} KB de {}, fria {} KB de {}",
                             blocks, static_cast<double>(words) / blocks,
                             static_cast<double>(side_exits) / blocks,
                             percent(with_slots[0], total), percent(with_slots[1], total),
-                            percent(with_slots[2], total))
+                            percent(with_slots[2], total), g_code_used_words / 256,
+                            g_cold_start_words / 256, g_cold_used_words / 256,
+                            (g_check_start_words - g_cold_start_words) / 256)
                     .c_str());
         }
     }
@@ -3930,15 +3996,40 @@ std::vector<bool> ComputeFlagsLiveAfter(const std::vector<u32>& words) {
 /// no hace falta (esos bloques no encadenan).
 /// Una variante del bloque en 'start', con el dominio VM ya abierto. Las
 /// palabras escritas, o 0 si no cabe.
-u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity,
-                std::vector<Compiler::PendingSite>* sites = nullptr) {
+/// Lo que ocupa una variante en cada zona y donde se entra (0.2.3.4).
+struct EmittedVariant {
+    u32 hot_words = 0;
+    u32 cold_words = 0;
+    u32* entry = nullptr;
+};
+
+bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* cold,
+                 u32 cold_capacity, EmittedVariant& out,
+                 std::vector<Compiler::PendingSite>* sites = nullptr) {
     Emitter e{start, capacity};
+    if (cold != nullptr) {
+        e.SetColdZone(cold, cold_capacity);
+    }
     Compiler compiler{e, check_mode};
     compiler.SetCacheMap(block.cache_map);
     compiler.SetThumb(block.thumb);
     compiler.SetBlock(block.pc, block.guest_count);
-    compiler.Prologue();
-    const u32 chain_entry = compiler.ChainEntryPosition();
+    // El prologo solo lo usa la entrada desde TryRun: a la zona fria, y de
+    // ahi un salto al cuerpo, que es tambien la entrada de los enlaces.
+    u32 entry_index = 0;
+    u32 chain_entry = 0;
+    if (e.HasColdZone()) {
+        e.ToCold();
+        entry_index = e.Position();
+        compiler.Prologue();
+        const u32 to_body = e.BranchPlaceholder(kAlways);
+        e.ToHot();
+        chain_entry = compiler.ChainEntryPosition();
+        e.PatchBranch(to_body, chain_entry);
+    } else {
+        compiler.Prologue();
+        chain_entry = compiler.ChainEntryPosition();
+    }
     compiler.BodyEnter();
     compiler.MarkBodyStart();
     u32 pc = block.pc & ~1u;
@@ -4017,22 +4108,26 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity,
         compiler.FallThrough(pc);
     }
     compiler.ExitPendingInternal();
+    e.ToCold();
     compiler.Epilogue();
     compiler.EmitColdStubs();
     if (e.Overflowed()) {
-        return 0;
+        return false;
     }
     if (sites != nullptr) {
         *sites = std::move(compiler.link_sites);
     }
+    out.hot_words = e.HotUsed();
+    out.cold_words = e.ColdUsed();
+    out.entry = e.Address(entry_index);
     if (!check_mode) {
         // Punto de entrada de los enlaces (0.1.5.7): pila, kCpu, kPages y
         // flags ya los pone el bloque origen; aqui empieza BodyEnter. NO se
         // publica todavia en link.entry: eso lo hace TryRun cuando el bloque
         // ha pasado sus comprobaciones iniciales (0.1.8.1).
-        block.chain_entry = static_cast<u32>(reinterpret_cast<uintptr_t>(start + chain_entry));
+        block.chain_entry = static_cast<u32>(reinterpret_cast<uintptr_t>(e.Address(chain_entry)));
     }
-    return e.Position();
+    return true;
 }
 
 /**
@@ -4054,6 +4149,63 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity,
  * abierto; la sincronizacion de la cache de instrucciones la hace quien
  * llama.
  */
+/**
+ * VOLCADO DE CODIGO GENERADO (0.2.3.4). Uno de cada 997 bloques normales,
+ * hasta 48, a ux0:data/azahar/jit_volcado.bin: las instrucciones del juego,
+ * la cache de registros y lo generado en cada zona, para leerlo con objdump
+ * fuera de la consola. Registro: "JITB", pc, thumb, palabras del juego, de la
+ * zona caliente y de la fria, 16 bytes de cache_map, y las palabras.
+ */
+void DumpBlock(const Block& block, const u32* hot, u32 hot_words, const u32* cold, u32 cold_words) {
+    static u32 compiled = 0;
+    static u32 dumped = 0;
+    if (dumped >= 48 || ++compiled % 997 != 0) {
+        return;
+    }
+    const SceUID fd = sceIoOpen("ux0:data/azahar/jit_volcado.bin",
+                                SCE_O_WRONLY | SCE_O_CREAT | (dumped == 0 ? SCE_O_TRUNC : SCE_O_APPEND),
+                                0777);
+    if (fd < 0) {
+        return;
+    }
+    dumped++;
+    const u32 header[6] = {0x4254494Au, block.pc, block.thumb ? 1u : 0u,
+                           static_cast<u32>(block.words.size()), hot_words, cold_words};
+    sceIoWrite(fd, header, sizeof(header));
+    sceIoWrite(fd, block.cache_map.data(), sizeof(block.cache_map));
+    sceIoWrite(fd, block.words.data(), static_cast<SceSize>(block.words.size() * 4));
+    sceIoWrite(fd, hot, hot_words * 4);
+    sceIoWrite(fd, cold, cold_words * 4);
+    sceIoClose(fd);
+}
+
+/**
+ * La variante de comprobacion, en el anillo del final (0.2.3.4, ver CODIGO
+ * CALIENTE Y FRIO): cuando se llena se vuelve al principio y las que habia
+ * dejan de valer (StartCheck las vuelve a pedir si un bloque las necesita).
+ * Con el dominio VM abierto.
+ */
+BlockFn EmitCheckVariant(Block& block) {
+    const u32 ring_words = g_code_bytes / 4 - g_check_start_words;
+    for (u32 attempt = 0; attempt < 2; attempt++) {
+        u32* const start = g_code + g_check_start_words + g_check_used_words;
+        EmittedVariant out;
+        if (EmitVariant(block, true, start, ring_words - g_check_used_words, nullptr, 0, out)) {
+            sceKernelSyncVMDomain(g_code_block, start, out.hot_words * 4);
+            g_check_used_words += out.hot_words;
+            return reinterpret_cast<BlockFn>(out.entry);
+        }
+        if (g_check_used_words == 0) {
+            return nullptr;
+        }
+        for (auto& entry : g_blocks) {
+            entry.second.check_code = nullptr;
+        }
+        g_check_used_words = 0;
+    }
+    return nullptr;
+}
+
 Block* BlockOfLink(const LinkInfo* link) {
     return reinterpret_cast<Block*>(reinterpret_cast<uintptr_t>(link) - g_link_in_block);
 }
@@ -4146,21 +4298,27 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
         }
         return false;
     }
-    u32* const start = g_code + g_code_used_words;
-    const u32 capacity = g_code_bytes / 4 - g_code_used_words;
-    u32 used = 0;
     BlockFn code = nullptr;
     BlockFn check_code = nullptr;
     std::vector<Compiler::PendingSite> sites;
     if (normal) {
-        used = EmitVariant(block, false, start, capacity, &sites);
-        if (used == 0) {
+        u32* const start = g_code + g_code_used_words;
+        u32* const cold = g_code + g_cold_start_words + g_cold_used_words;
+        EmittedVariant out;
+        if (!EmitVariant(block, false, start, g_cold_start_words - g_code_used_words, cold,
+                         g_check_start_words - g_cold_start_words - g_cold_used_words, out,
+                         &sites)) {
             sceKernelCloseVMDomain();
             g_flush_requested = true;
             return false;
         }
-        code = reinterpret_cast<BlockFn>(start);
+        code = reinterpret_cast<BlockFn>(out.entry);
         for (const Compiler::PendingSite& pending : sites) {
+            // Los enlaces van en el cuerpo, en la zona caliente; uno en la fria
+            // no se parchea (seguiria mirando la entrada, como sin parche).
+            if (((pending.word0 | pending.bx) & 0x80000000u) != 0) {
+                continue;
+            }
             Block& target = *BlockOfLink(pending.target);
             Block::LinkSite site;
             site.word0 = start + pending.word0;
@@ -4176,32 +4334,30 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
             }
             target.incoming.push_back(site);
         }
+        // Sin esto la cache de instrucciones puede tener lo que hubiera antes
+        // en esa memoria y se ejecuta basura.
+        sceKernelSyncVMDomain(g_code_block, start, out.hot_words * 4);
+        sceKernelSyncVMDomain(g_code_block, cold, out.cold_words * 4);
+        DumpBlock(block, start, out.hot_words, cold, out.cold_words);
+        g_code_used_words += out.hot_words;
+        g_cold_used_words += out.cold_words;
     }
     if (check) {
-        // Si no cabe, la normal vale igual: la de comprobacion se pide otra
-        // vez en StartCheck, que entonces vaciara.
-        const u32 words = EmitVariant(block, true, start + used, capacity - used);
-        if (words != 0) {
-            check_code = reinterpret_cast<BlockFn>(start + used);
-            used += words;
-        } else if (!normal) {
+        // Si no cabe ni con el anillo vacio, la normal vale igual: la de
+        // comprobacion se pide otra vez en StartCheck.
+        check_code = EmitCheckVariant(block);
+        if (check_code == nullptr && !normal) {
             sceKernelCloseVMDomain();
-            g_flush_requested = true;
             return false;
         }
     }
-    // Sin esto la cache de instrucciones puede tener lo que hubiera antes en
-    // esa memoria y se ejecuta basura.
-    sceKernelSyncVMDomain(g_code_block, start, used * 4);
     sceKernelCloseVMDomain();
-    g_code_used_words += used;
     if (code != nullptr) {
         block.code = code;
         g_code_blocks++;
     }
     if (check_code != nullptr) {
         block.check_code = check_code;
-        g_code_blocks++;
     }
     return true;
 }
@@ -4739,7 +4895,7 @@ void CountInstructions(u32 instructions) {
 }
 
 void CodeUsage(u32& bytes, u32& blocks) {
-    bytes = g_code_used_words * 4;
+    bytes = (g_code_used_words + g_cold_used_words) * 4;
     blocks = g_code_blocks;
 }
 
