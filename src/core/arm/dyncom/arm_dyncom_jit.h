@@ -125,6 +125,12 @@ extern std::atomic<u32> direct_link;
 extern std::atomic<u32> vfp_native;
 
 /**
+ * Bloques Thumb en el JIT (0.2.1.7). 0 = al interprete, como hasta 0.2.1.6.
+ * Clave "jit_thumb=" de ajustes.txt.
+ */
+extern std::atomic<u32> thumb;
+
+/**
  * Llamar en el DESPACHO del interprete, con el PC ya alineado. Si hay codigo
  * para este bloque y cabe en el presupuesto, lo ejecuta y devuelve cuantas
  * instrucciones del juego ha ejecutado; con 0, el interprete sigue como

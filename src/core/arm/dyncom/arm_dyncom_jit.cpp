@@ -23,6 +23,7 @@
 #include "common/vita_diag.h"
 #include "common/vita_vm.h"
 #include "core/arm/dyncom/arm_dyncom_dec.h"
+#include "core/arm/dyncom/arm_dyncom_thumb.h"
 #include "core/arm/skyeye_common/armstate.h"
 #include "core/arm/skyeye_common/vfp/vfp.h"
 #include "core/memory.h"
@@ -34,6 +35,7 @@ std::atomic<u32> reg_cache{1};
 std::atomic<u32> vfp_data{1};
 std::atomic<u32> direct_link{1};
 std::atomic<u32> vfp_native{1};
+std::atomic<u32> thumb{1};
 
 namespace {
 
@@ -846,6 +848,21 @@ struct Block {
     u32 chain_entry = 0;
     std::vector<u32> words; ///< Las instrucciones, para crash.txt si difiere.
     /**
+     * BLOQUES THUMB (0.2.1.7). 'pc' es la CLAVE del bloque: la direccion, con
+     * el bit 0 a 1 si es Thumb (las instrucciones Thumb estan alineadas a 2 y
+     * las ARM a 4, asi que no se mezclan). En Thumb, 'words' son las
+     * instrucciones ARM equivalentes (TranslateThumbInstruction, la misma
+     * traduccion que usa el interprete), y los saltos, palabras B/BL/BLX
+     * sinteticas con el destino aparte en 'targets'. 'sizes': 2, o 4 para el
+     * par BL/BLX.
+     */
+    bool thumb = false;
+    std::vector<u8> sizes;
+    std::vector<u32> targets;
+    /// Bytes del juego que cubre e instrucciones que cuenta el interprete.
+    u32 guest_bytes = 0;
+    u32 guest_count = 0;
+    /**
      * Cache de registros (0.1.5.2, 4.3): guest -> host (r0-r3 o lr desde
      * 0.1.5.7, ver kCacheHosts) o -1.
      * Analyze lo rellena (a -1 si el interruptor esta apagado); EmitBlock se
@@ -878,6 +895,12 @@ struct FastSlot {
 std::array<FastSlot, kFastSlots> g_fast{};
 static_assert(sizeof(FastSlot) == 8 && offsetof(FastSlot, pc) == 0 && offsetof(FastSlot, block) == 4,
               "el enlace indirecto lee g_fast como pares de palabras (pc, block)");
+
+/// Hueco de g_fast de una clave: las ARM como el enlace indirecto del codigo
+/// generado (pc >> 2); las Thumb (bit 0), por medias palabras.
+inline u32 FastIndex(u32 key) {
+    return ((key & 1u) != 0 ? key >> 1 : key >> 2) & (kFastSlots - 1);
+}
 /// Desplazamiento de Block::link dentro de Block (0 en la practica; se mide en
 /// Init porque Block no tiene disposicion estandar).
 u32 g_link_in_block = 0;
@@ -1640,9 +1663,45 @@ public:
         ExitDirect(next_pc);
     }
 
+    /// Bloque Thumb (0.2.1.7): ver Block::thumb. Por instruccion, donde
+    /// empieza la siguiente y el destino de un salto sintetico.
+    void SetThumb(bool thumb_block) {
+        thumb_ = thumb_block;
+    }
+    void SetThumbInstruction(u32 next_pc, u32 target) {
+        next_pc_ = next_pc;
+        branch_target_ = target;
+    }
+
 private:
     Emitter& e;
     bool check_mode;
+    bool thumb_ = false;
+    u32 next_pc_ = 0;
+    u32 branch_target_ = 0;
+
+    /**
+     * Lo que lee el juego como r15 en la instruccion de 'pc'. En ARM, +8. En
+     * Thumb solo llegan aqui las dos formas que lo leen alineado (LDR literal
+     * y ADD Rd, PC, #imm, que el interprete lee con CHECK_READ_REG15_WA); el
+     * resto de lecturas del PC en Thumb se queda en el interprete (ver
+     * DecodeThumbBlock).
+     */
+    u32 PcRead(u32 pc) const {
+        return thumb_ ? ((pc + 4u) & ~3u) : pc + 8u;
+    }
+    /// La instruccion siguiente, y lo que se guarda en LR al llamar (en Thumb,
+    /// con el bit 0 a 1, como BL_2_THUMB y BLX_INST).
+    u32 NextPc(u32 pc) const {
+        return thumb_ ? next_pc_ : pc + 4u;
+    }
+    u32 LinkValue(u32 pc) const {
+        return thumb_ ? (next_pc_ | 1u) : pc + 4u;
+    }
+    /// La clave del bloque de un destino en el mismo modo que este.
+    u32 BlockKey(u32 pc) const {
+        return thumb_ ? (pc | 1u) : pc;
+    }
     /// guest -> registro del anfitrion (r0-r3 o lr) o -1 sin cachear. Ver
     /// SetCacheMap y kCacheHosts.
     std::array<s8, 16> cache_map{};
@@ -1750,7 +1809,7 @@ private:
     /// Carga un registro del juego; el PC se lee como direccion + 8.
     void LoadGuest(u32 host, u32 guest, u32 pc) {
         if (guest == 15) {
-            e.Mov32(host, pc + 8);
+            e.Mov32(host, PcRead(pc));
             return;
         }
         const s8 cached = CacheHost(guest);
@@ -2076,7 +2135,7 @@ private:
         if (rn == 15 && !reg_offset && !writeback) {
             // Un literal: la direccion es una constante.
             const u32 offset = inst & 0xFFFu;
-            e.Mov32(kRs, up ? pc + 8 + offset : pc + 8 - offset);
+            e.Mov32(kRs, up ? PcRead(pc) + offset : PcRead(pc) - offset);
         } else {
             u32 base = kRn;
             if (writeback) {
@@ -2136,7 +2195,7 @@ private:
 
         u32 address = kRs;
         if (rn == 15 && imm_offset && !writeback) {
-            e.Mov32(kRs, up ? pc + 8 + imm : pc + 8 - imm);
+            e.Mov32(kRs, up ? PcRead(pc) + imm : PcRead(pc) - imm);
         } else {
             u32 base = kRn;
             if (writeback) {
@@ -2373,7 +2432,7 @@ private:
         // 0.2.1.0: el inmediato (8 bits por 4) siempre cabe en el ADD/SUB, y con
         // el PC de base (las constantes en coma flotante) es una constante.
         if (rn == 15) {
-            e.Mov32(kRs, add ? pc + 8 + imm32 : pc + 8 - imm32);
+            e.Mov32(kRs, add ? PcRead(pc) + imm32 : PcRead(pc) - imm32);
         } else {
             AddImmediate(kRs, OperandHost(kRn, rn, pc), imm32, add);
         }
@@ -2897,7 +2956,7 @@ private:
      */
     void ExitDirect(u32 target_pc) {
         if (Linking()) {
-            EmitLink(LinkFor(target_pc), target_pc);
+            EmitLink(LinkFor(BlockKey(target_pc)), target_pc);
             return;
         }
         e.Mov32(kT0, target_pc);
@@ -3003,9 +3062,10 @@ private:
 
     /// El LinkInfo del bloque de 'pc', creando su entrada si hace falta (un
     /// bloque New no se enlaza hasta que se compile y se le ponga entry).
-    static const LinkInfo* LinkFor(u32 pc) {
-        Block& target = g_blocks[pc];
-        target.pc = pc;
+    static const LinkInfo* LinkFor(u32 key) {
+        Block& target = g_blocks[key];
+        target.pc = key;
+        target.thumb = (key & 1u) != 0;
         return &target.link;
     }
 
@@ -3040,14 +3100,25 @@ private:
         case Kind::Branch: {
             const u32 offset24 = inst & 0x00FFFFFFu;
             const s32 offset = static_cast<s32>(offset24 << 8) >> 6; // extiende signo, x4
-            const u32 target = pc + 8 + static_cast<u32>(offset);
+            // En Thumb, el destino ya calculado (B, Bcc y BL de dos medias).
+            const u32 target = thumb_ ? branch_target_ : pc + 8 + static_cast<u32>(offset);
             if (Bits(inst, 24, 24) == 1) {
-                StoreGuestConst(14, pc + 4);
+                StoreGuestConst(14, LinkValue(pc));
             }
             ExitDirect(target);
             break;
         }
         case Kind::BranchLinkExchangeImm: {
+            if (thumb_) {
+                // BLX_1_THUMB: LR = siguiente | 1, destino alineado, a ARM.
+                StoreGuestConst(14, LinkValue(pc));
+                e.Mov32(kT1, 0);
+                e.StrImm(kT1, kCpu, g_offsets.t);
+                e.Mov32(kT0, branch_target_);
+                StoreGuest(kT0, 15);
+                ExitIndirect();
+                break;
+            }
             // Como BLX_INST: LR = pc + 4 (desde ARM, sin bit 0), Thumb, y el
             // destino con el bit H como media palabra.
             const u32 offset24 = inst & 0x00FFFFFFu;
@@ -3066,7 +3137,7 @@ private:
             const bool link = Bits(inst, 5, 5) == 1;
             LoadGuest(kT0, rm, pc);
             if (link) {
-                e.Mov32(kT1, pc + 4);
+                e.Mov32(kT1, LinkValue(pc));
                 StoreGuest(kT1, 14);
             }
             // TFlag = destino & 1; PC = destino & ~1 (igual que BX_INST).
@@ -3101,7 +3172,7 @@ private:
         if (cond != kAlways) {
             // El camino no tomado: PC = siguiente.
             e.PatchBranch(skip, e.Position());
-            ExitDirect(pc + 4);
+            ExitDirect(NextPc(pc));
         }
     }
 };
@@ -3140,27 +3211,8 @@ void ResetAll() {
     g_link_withdrawn = 0;
 }
 
-/**
- * Las instrucciones del bloque que empieza en block.pc, con la MISMA extension
- * que el del interprete (InterpreterTranslateBlock): hasta la primera que
- * termina bloque o hasta el final de la pagina. False si alguna no se sabe
- * compilar: entonces el bloque entero es del interprete.
- *
- * Si la cache de registros esta encendida (0.1.5.2, 4.3), aqui se decide
- * QUE registros se cachean: se cuentan las lecturas de cada registro del
- * juego (excluido el PC, que es especial) y se quedan los tres mas leidos en
- * r0-r2. Los que solo se escriben o se leen una vez no merecen hueco. Con el
- * interruptor apagado el mapa se queda entero a -1 y el codigo generado es el
- * de 0.1.5.1 palabra por palabra.
- */
-bool Analyze(ARMul_State* cpu, Block& block) {
-    if ((cpu->Cpsr & (1u << 9)) != 0) {
-        block.reject = kRejectOther;
-        return false; // modo big-endian: no lo usa ningun juego, no se compila
-    }
-    block.words.clear();
-    block.cache_map.fill(-1);
-    block.uses_cache = false;
+/// Las instrucciones ARM del bloque (hasta 0.2.1.6, todo Analyze).
+bool DecodeArmBlock(ARMul_State* cpu, Block& block) {
     u32 pc = block.pc;
     bool ended = false;
     for (u32 i = 0; i < kMaxBlockInstructions; i++) {
@@ -3187,6 +3239,156 @@ bool Analyze(ARMul_State* cpu, Block& block) {
     if (!ended) {
         block.words.clear();
         block.reject = kRejectLong;
+        return false;
+    }
+    block.guest_bytes = static_cast<u32>(block.words.size()) * 4;
+    block.guest_count = static_cast<u32>(block.words.size());
+    return true;
+}
+
+/**
+ * BLOQUE THUMB (0.2.1.7). En Pokemon Sol un 10 % de los despachos eran codigo
+ * Thumb, y cada uno salia del codigo generado al despacho, pasaba por el
+ * interprete y volvia: ~9.600 viajes por fotograma, la mayoria de los ~15.000
+ * despachos sin enlazar, unos 6-10 ms de cada 52.
+ *
+ * Las mismas instrucciones que traduciria el interprete (InterpreterTranslate-
+ * Block con TFlag), cada una pasada a su equivalente ARM con la misma funcion
+ * que usa el (TranslateThumbInstruction), y el bloque acaba donde acaba el
+ * suyo: en el primer salto o al final de la pagina. Los saltos de Thumb no
+ * tienen equivalente ARM con su desplazamiento (van en medias palabras): son
+ * palabras B/BL/BLX con el destino aparte. Lo que en Thumb lee o escribe el PC
+ * con otra semantica que en ARM (MOV/ADD/CMP con r15, BX pc) se queda en el
+ * interprete, igual que el BL partido entre dos paginas.
+ */
+bool DecodeThumbBlock(ARMul_State* cpu, Block& block) {
+    const auto reject = [&block](u32 reason, u32 word) {
+        block.words.clear();
+        block.sizes.clear();
+        block.targets.clear();
+        block.reject = reason;
+        block.reject_word = word;
+        return false;
+    };
+    const auto halfword = [cpu](u32 addr) {
+        return GetThumbInstruction(cpu->memory.Read32(addr & 0xFFFFFFFCu), addr);
+    };
+    const u32 start = block.pc & ~1u;
+    u32 pc = start;
+    u32 count = 0;
+    bool ended = false;
+    for (u32 i = 0; i < kMaxBlockInstructions; i++) {
+        // La misma lectura que InterpreterTranslateInstruction.
+        const u32 raw = cpu->memory.Read32(pc & 0xFFFFFFFCu);
+        const u32 tinstr = GetThumbInstruction(raw, pc);
+        u32 arm = 0;
+        u32 size = 2;
+        u32 target = 0;
+        const ThumbDecodeStatus status = TranslateThumbInstruction(pc, raw, &arm, &size);
+        size = 2;
+        if (status == ThumbDecodeStatus::UNDEFINED) {
+            return reject(kRejectOther, tinstr);
+        }
+        if (status == ThumbDecodeStatus::BRANCH) {
+            const u32 format = tinstr >> 11;
+            if (format == 26 || format == 27) {
+                // Bcc, como B_COND_THUMB (las condiciones 0xE y 0xF no son salto).
+                const u32 cond = (tinstr >> 8) & 0xFu;
+                const u32 imm = ((tinstr & 0x7Fu) << 1) | ((tinstr & 0x80u) != 0 ? 0xFFFFFF00u : 0u);
+                target = pc + 4 + imm;
+                arm = (cond << 28) | 0x0A000000u;
+            } else if (format == 28) {
+                // B, como B_2_THUMB.
+                const u32 imm =
+                    ((tinstr & 0x3FFu) << 1) | ((tinstr & 0x400u) != 0 ? 0xFFFFF800u : 0u);
+                target = pc + 4 + imm;
+                arm = 0xEA000000u;
+            } else if (format == 30) {
+                // BL/BLX en dos medias (BL_1_THUMB + BL_2_THUMB o BLX_1_THUMB):
+                // solo juntas y en la misma pagina, que es como las junta el
+                // interprete en un bloque.
+                if (((pc + 2) & 0xFFFu) == 0) {
+                    return reject(kRejectOther, tinstr);
+                }
+                const u32 suffix = halfword(pc + 2);
+                const u32 high =
+                    ((tinstr & 0x7FFu) << 12) | ((tinstr & 0x400u) != 0 ? 0xFF800000u : 0u);
+                const u32 low = (suffix & 0x7FFu) << 1;
+                if ((suffix >> 11) == 31) {
+                    target = pc + 4 + high + low;
+                    arm = 0xEB000000u;
+                } else if ((suffix >> 11) == 29 && (suffix & 1u) == 0) {
+                    target = (pc + 4 + high + low) & 0xFFFFFFFCu;
+                    arm = 0xFA000000u;
+                } else {
+                    return reject(kRejectOther, tinstr);
+                }
+                size = 4;
+                count++; // el interprete cuenta las dos medias
+            } else {
+                // La segunda media suelta: al interprete.
+                return reject(kRejectOther, tinstr);
+            }
+        } else if ((tinstr & 0xFC00u) == 0x4400u) {
+            // Registros altos: ADD/CMP/MOV y BX/BLX. Con r15 de origen o de
+            // destino no hacen lo mismo que su equivalente ARM.
+            const u32 op = (tinstr >> 8) & 3u;
+            const u32 rd = (tinstr & 7u) | ((tinstr >> 4) & 8u);
+            const u32 rs = (tinstr >> 3) & 0xFu;
+            if (rs == 15 || (op != 3 && rd == 15)) {
+                return reject(kRejectPcWrite, tinstr);
+            }
+            if (op == 3) {
+                // BX/BLX Rm con su codificacion ARM completa.
+                arm = ((tinstr & 0x80u) != 0 ? 0xE12FFF30u : 0xE12FFF10u) | rs;
+            }
+        }
+        const Decoded decoded = Classify(arm);
+        if (decoded.kind == Kind::Unsupported) {
+            return reject(decoded.reject, tinstr);
+        }
+        block.words.push_back(arm);
+        block.sizes.push_back(static_cast<u8>(size));
+        block.targets.push_back(target);
+        count++;
+        pc += size;
+        if (decoded.terminator || (pc & 0xFFFu) == 0) {
+            ended = true; // salto, o fin de pagina como END_OF_PAGE
+            break;
+        }
+    }
+    if (!ended) {
+        return reject(kRejectLong, 0);
+    }
+    block.guest_bytes = pc - start;
+    block.guest_count = count;
+    return true;
+}
+
+/**
+ * Las instrucciones del bloque que empieza en block.pc, con la MISMA extension
+ * que el del interprete (InterpreterTranslateBlock): hasta la primera que
+ * termina bloque o hasta el final de la pagina. False si alguna no se sabe
+ * compilar: entonces el bloque entero es del interprete.
+ *
+ * Si la cache de registros esta encendida (0.1.5.2, 4.3), aqui se decide
+ * QUE registros se cachean: se cuentan las lecturas de cada registro del
+ * juego (excluido el PC, que es especial) y se quedan los tres mas leidos en
+ * r0-r2. Los que solo se escriben o se leen una vez no merecen hueco. Con el
+ * interruptor apagado el mapa se queda entero a -1 y el codigo generado es el
+ * de 0.1.5.1 palabra por palabra.
+ */
+bool Analyze(ARMul_State* cpu, Block& block) {
+    if ((cpu->Cpsr & (1u << 9)) != 0) {
+        block.reject = kRejectOther;
+        return false; // modo big-endian: no lo usa ningun juego, no se compila
+    }
+    block.words.clear();
+    block.sizes.clear();
+    block.targets.clear();
+    block.cache_map.fill(-1);
+    block.uses_cache = false;
+    if (!(block.thumb ? DecodeThumbBlock(cpu, block) : DecodeArmBlock(cpu, block))) {
         return false;
     }
     if (reg_cache.load(std::memory_order_relaxed) == 0) {
@@ -3378,10 +3580,11 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity) {
     Emitter e{start, capacity};
     Compiler compiler{e, check_mode};
     compiler.SetCacheMap(block.cache_map);
+    compiler.SetThumb(block.thumb);
     compiler.Prologue();
     const u32 chain_entry = compiler.ChainEntryPosition();
     compiler.BodyEnter();
-    u32 pc = block.pc;
+    u32 pc = block.pc & ~1u;
     bool terminated = false;
     // Vida de los flags del juego (0.1.5.7): ver ComputeFlagsLiveAfter.
     const std::vector<bool> flags_live = ComputeFlagsLiveAfter(block.words);
@@ -3407,10 +3610,14 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity) {
             i = end - 1;
             continue;
         }
+        const u32 size = block.thumb ? block.sizes[i] : 4u;
+        if (block.thumb) {
+            compiler.SetThumbInstruction(pc + size, block.targets[i]);
+        }
         compiler.SetFlagsLiveAfter(flags_live[i]);
         compiler.Instruction(inst, pc, decoded);
         terminated = decoded.terminator;
-        pc += 4;
+        pc += size;
     }
     compiler.SetFlagsLiveAfter(true);
     if (!terminated) {
@@ -3506,9 +3713,10 @@ BlockFn EmitBlock(Block& block, bool check_mode) {
 
 void NoteMismatch(const Block& block, const std::string& what) {
     Common::VitaNote("jit arm",
-                     fmt::format("DIFERENCIA en el bloque {:#010x} ({} instrucciones): {} -- el "
+                     fmt::format("DIFERENCIA en el bloque {:#010x}{} ({} instrucciones): {} -- el "
                                  "bloque vuelve al interprete",
-                                 block.pc, block.words.size(), what)
+                                 block.pc & ~1u, block.thumb ? " thumb" : "",
+                                 block.words.size(), what)
                          .c_str());
     for (std::size_t base = 0; base < block.words.size() && base < 32; base += 8) {
         std::string line = fmt::format("{:#010x}:", block.pc + static_cast<u32>(base) * 4);
@@ -3586,7 +3794,7 @@ bool DueForCheck(const Block& block);
 
 Block* Acquire(ARMul_State* cpu, u32 pc) {
     g_local.dispatches++;
-    FastSlot& slot = g_fast[(pc >> 2) & (kFastSlots - 1)];
+    FastSlot& slot = g_fast[FastIndex(pc)];
     Block* block;
     if (slot.pc == pc) [[likely]] {
         block = slot.block;
@@ -3594,6 +3802,7 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
         // Los punteros a elementos de un unordered_map sobreviven al rehash.
         block = &g_blocks[pc];
         block->pc = pc;
+        block->thumb = (pc & 1u) != 0;
         slot.pc = pc;
         slot.block = block;
     }
@@ -3623,7 +3832,7 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
         Common::FrameStats::jit_rejected.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
-    block->link.count = static_cast<u32>(block->words.size());
+    block->link.count = block->guest_count;
     block->code = nullptr;
     block->check_code = nullptr;
     // Las dos variantes de una vez si le toca comprobacion (la primera vez, siempre).
@@ -3641,7 +3850,7 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
 /// tabla rapida (0.1.5.7: el enlace indirecto del codigo generado busca ahi,
 /// asi que conviene que tenga los bloques que de verdad se usan).
 Block* Peek(u32 pc) {
-    FastSlot& slot = g_fast[(pc >> 2) & (kFastSlots - 1)];
+    FastSlot& slot = g_fast[FastIndex(pc)];
     Block* block = nullptr;
     if (slot.pc == pc) [[likely]] {
         block = slot.block;
@@ -3702,16 +3911,18 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
         const ScopedMicros timer{g_compile_us};
         ResetAll();
     }
-    if (cpu->TFlag != 0) {
+    const bool in_thumb = cpu->TFlag != 0;
+    if (in_thumb && thumb.load(std::memory_order_relaxed) == 0) {
         g_local.dispatches++;
         g_local.rejects[kRejectThumb]++;
-        return 0; // Thumb: el interprete (de momento)
+        return 0; // Thumb apagado: el interprete
     }
     Memory::PageTable* table = cpu->memory.fast_page_table;
     if (table == nullptr) {
         return 0;
     }
-    Block* block = Acquire(cpu, cpu->Reg[15]);
+    // El PC ya viene alineado segun el modo (DISPATCH); en Thumb, clave con el bit 0.
+    Block* block = Acquire(cpu, in_thumb ? (cpu->Reg[15] | 1u) : cpu->Reg[15]);
     if (block == nullptr) {
         return 0;
     }
@@ -3774,14 +3985,23 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
         if (!cpu->NirqSig && !(cpu->Cpsr & 0x80)) {
             break;
         }
-        if (cpu->TFlag != 0 || g_flush_requested) {
+        if (g_flush_requested ||
+            (cpu->TFlag != 0 && thumb.load(std::memory_order_relaxed) == 0)) {
             break;
         }
-        cpu->Reg[15] &= 0xFFFFFFFCu;
+        // El mismo alineado que DISPATCH, segun el modo.
+        u32 key;
+        if (cpu->TFlag != 0) {
+            cpu->Reg[15] &= 0xFFFFFFFEu;
+            key = cpu->Reg[15] | 1u;
+        } else {
+            cpu->Reg[15] &= 0xFFFFFFFCu;
+            key = cpu->Reg[15];
+        }
         // Solo se encadena a un bloque YA compilado, y sin tocar nada: si no lo
         // esta, el despacho de verdad lo contara, lo compilara o lo mandara al
         // interprete, como siempre.
-        Block* next = Peek(cpu->Reg[15]);
+        Block* next = Peek(key);
         if (next == nullptr || next->link.count > budget_left - done || DueForCheck(*next)) {
             break;
         }
@@ -4037,12 +4257,13 @@ void ApplyInvalidations() {
         }
     }
     g_invalid_ranges.clear();
-    for (auto& [pc, block] : g_blocks) {
+    for (auto& [key, block] : g_blocks) {
         // Un bloque no pasa del final de su pagina. Sin palabras (rechazado),
-        // se cuenta hasta ahi: rehacer de mas no rompe nada.
-        const u32 words = block.words.empty() ? kMaxBlockInstructions
-                                               : static_cast<u32>(block.words.size());
-        const u32 end = std::min(pc + words * 4, (pc & ~0xFFFu) + 0x1000u);
+        // se cuenta hasta ahi: rehacer de mas no rompe nada. La clave de un
+        // bloque Thumb lleva el bit 0 (0.2.1.7).
+        const u32 pc = key & ~1u;
+        const u32 bytes = block.words.empty() ? kMaxBlockInstructions * 4 : block.guest_bytes;
+        const u32 end = std::min(pc + bytes, (pc & ~0xFFFu) + 0x1000u);
         const auto next = std::upper_bound(
             merged.begin(), merged.end(), pc,
             [](u32 value, const std::pair<u32, u32>& range) { return value < range.first; });
@@ -4066,6 +4287,8 @@ void ApplyInvalidations() {
         block.link.runs = 0;
         block.reject = kRejectNone;
         block.words.clear();
+        block.sizes.clear();
+        block.targets.clear();
     }
 }
 

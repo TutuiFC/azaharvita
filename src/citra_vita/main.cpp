@@ -382,6 +382,9 @@ struct UserSettings {
     /// 0.2.1.1: saltar el lote mientras compila su shader de vertices
     /// (RasterizerGXM::async_vs). ON.
     bool async_shaders = true;
+    /// 0.2.1.7: bloques Thumb en el JIT (Core::ArmJit::thumb). Sin fila en el
+    /// menu: solo ajustes.txt, para apagarlo si diera problemas.
+    bool jit_thumb = true;
 };
 UserSettings g_user;
 
@@ -426,6 +429,10 @@ void ApplyUserSettings() {
     // (o no) el enlace ya parcheado en su codigo.
     const u32 want_link = g_user.jit_direct_link ? 1u : 0u;
     if (Core::ArmJit::direct_link.exchange(want_link, std::memory_order_relaxed) != want_link) {
+        Core::ArmJit::Reset();
+    }
+    const u32 want_thumb = g_user.jit_thumb ? 1u : 0u;
+    if (Core::ArmJit::thumb.exchange(want_thumb, std::memory_order_relaxed) != want_thumb) {
         Core::ArmJit::Reset();
     }
     // 0.1.6.0: solo cambia que shaders se traducen a partir de ahora.
@@ -516,6 +523,7 @@ void LoadUserSettings() {
         g_user.gpu_scale = value == 1 || value == 4 ? value : 2;
     }
     read_bool("shaders_asinc=", g_user.async_shaders);
+    read_bool("jit_thumb=", g_user.jit_thumb);
 }
 
 /// El contenido de ajustes.txt, una clave por linea.
@@ -526,14 +534,15 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
         "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
-        "resolucion_gpu2=%d\nshaders_asinc=%d\n",
+        "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
         g_user.vs_escapes ? 1 : 0, g_user.full_vertex_dedup ? 1 : 0, g_user.sound ? 1 : 0,
         g_user.screen_layout, g_user.skip_repeated ? 1 : 0, g_user.vs_specialize ? 1 : 0,
         g_user.gpu_screen_copy ? 1 : 0, g_user.gpu_thread ? 1 : 0,
-        g_user.unlimited_speed ? 1 : 0, g_user.gpu_scale, g_user.async_shaders ? 1 : 0);
+        g_user.unlimited_speed ? 1 : 0, g_user.gpu_scale, g_user.async_shaders ? 1 : 0,
+        g_user.jit_thumb ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
