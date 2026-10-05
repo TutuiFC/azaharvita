@@ -156,6 +156,7 @@ public:
     static std::array<std::atomic<u32>, 3> reload_causes;
     static std::atomic<u32> soft_fills;
     static std::atomic<u32> soft_fill_kb;
+    static std::atomic<u32> lazy_fill_kb;
     static std::atomic<u32> texture_copies;
     static std::atomic<u32> texture_copy_kb;
     [[nodiscard]] static std::string TakeSurfaceSummary();
@@ -444,6 +445,20 @@ private:
     /// El quad de la superficie a la copia, en una escena suya.
     bool AccelerateFillOnGpu(const Pica::MemoryFillConfig& config);
     bool FillGuestMemory(const Pica::MemoryFillConfig& config);
+    /**
+     * RELLENOS DE PROFUNDIDAD SIN ESCRIBIR (0.2.2.7). El borrado de la
+     * profundidad lo hace la GPU (depth_needs_clear, que solo lee el primer
+     * pixel del invitado); el resto del patron se escribe en la memoria del
+     * invitado solo si algo va a leerla (ApplyLazyFills).
+     */
+    struct LazyFill {
+        PAddr start = 0;
+        u32 bytes = 0;
+        u32 texel = 0;
+        u32 bpp = 0;
+    };
+    std::vector<LazyFill> lazy_fills;
+    void ApplyLazyFills(PAddr addr, u32 size);
     bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip,
                     u32 in_width, u32 in_height);
     /// Rellenos pendientes (ver AccelerateFill): el quad del color dentro de la

@@ -67,6 +67,7 @@ std::atomic<u32> RasterizerGXM::gpu_fills{0};
 std::array<std::atomic<u32>, 3> RasterizerGXM::reload_causes{};
 std::atomic<u32> RasterizerGXM::soft_fills{0};
 std::atomic<u32> RasterizerGXM::soft_fill_kb{0};
+std::atomic<u32> RasterizerGXM::lazy_fill_kb{0};
 std::atomic<u32> RasterizerGXM::texture_copies{0};
 std::atomic<u32> RasterizerGXM::texture_copy_kb{0};
 
@@ -3002,6 +3003,8 @@ const SceGxmTexture* RasterizerGXM::TextureFromCopy(u32 unit) {
     }
     const PAddr address = config->GetPhysicalAddress();
     const u32 span = TextureBytes(format, config->width, config->height);
+    // El cache decodifica de la memoria del invitado.
+    ApplyLazyFills(address, span);
     /**
      * El origen de una copia de mosaico a mosaico no se vuelca al presentar
      * (copied), y la transferencia por software lo volcaba en cada fotograma:
@@ -3686,13 +3689,14 @@ void FillPattern(u8* dst, u32 bytes, u32 texel, u32 bpp) {
 
 std::string RasterizerGXM::TakeSurfaceSummary() {
     return fmt::format("recargas: lote soft {} relleno/transf {} volcar+invalidar {} | "
-                       "rellenos por software {} ({} KB) | copias de textura {} ({} KB) | "
+                       "rellenos por software {} ({} KB, {} KB sin escribir) | copias de textura {} ({} KB) | "
                        "texturas en la gpu {}, volcados por textura {}",
                        reload_causes[0].exchange(0, std::memory_order_relaxed),
                        reload_causes[1].exchange(0, std::memory_order_relaxed),
                        reload_causes[2].exchange(0, std::memory_order_relaxed),
                        soft_fills.exchange(0, std::memory_order_relaxed),
                        soft_fill_kb.exchange(0, std::memory_order_relaxed),
+                       lazy_fill_kb.exchange(0, std::memory_order_relaxed),
                        texture_copies.exchange(0, std::memory_order_relaxed),
                        texture_copy_kb.exchange(0, std::memory_order_relaxed),
                        gpu_texture_transfers.exchange(0, std::memory_order_relaxed),
@@ -3776,10 +3780,63 @@ bool RasterizerGXM::FillGuestMemory(const Pica::MemoryFillConfig& config) {
         bpp = 2;
     }
     const u32 bytes = end - start;
+    /**
+     * Solo profundidad (0.2.2.7): el tramo entero dentro del buffer de
+     * profundidad de una superficie y sin tocar ningun color. Pokemon Sol
+     * borra asi 512 KB unas catorce veces por fotograma ("rellenos por
+     * software" de 0.2.2.6: ~7 MB por fotograma escritos sin que nadie los
+     * lea). Los pendientes que este cubre entero ya no hacen falta; los que
+     * pisa a medias, antes al invitado.
+     */
+    bool depth_only = false;
+    for (const auto& surface : surfaces) {
+        if (surface->Overlaps(start, bytes)) {
+            depth_only = false;
+            break;
+        }
+        const PAddr depth_end =
+            surface->guest_depth_address + surface->guest_depth_stride * surface->height;
+        if (surface->guest_depth_address != 0 && start >= surface->guest_depth_address &&
+            end <= depth_end) {
+            depth_only = true;
+        }
+    }
+    std::erase_if(lazy_fills, [start, end](const LazyFill& fill) {
+        return fill.start >= start && fill.start + fill.bytes <= end;
+    });
     InvalidateRegion(start, bytes);
-    FillPattern(memory.GetPhysicalPointer(start), bytes, texel, bpp);
+    u8* const guest = memory.GetPhysicalPointer(start);
+    // El primer pixel siempre: es de donde saca ClearDepthIfNeeded el valor.
+    // 192 es multiplo de 2, 3 y 4, asi que el patron sigue en fase despues.
+    constexpr u32 kEagerBytes = 192;
+    if (depth_only && bytes > kEagerBytes) {
+        FillPattern(guest, kEagerBytes, texel, bpp);
+        if (lazy_fills.size() >= 8) {
+            const LazyFill oldest = lazy_fills.front();
+            lazy_fills.erase(lazy_fills.begin());
+            FillPattern(memory.GetPhysicalPointer(oldest.start), oldest.bytes, oldest.texel,
+                        oldest.bpp);
+        }
+        lazy_fills.push_back({start + kEagerBytes, bytes - kEagerBytes, texel, bpp});
+        lazy_fill_kb.fetch_add(bytes / 1024, std::memory_order_relaxed);
+        return true;
+    }
+    FillPattern(guest, bytes, texel, bpp);
     soft_fill_kb.fetch_add(bytes / 1024, std::memory_order_relaxed);
     return true;
+}
+
+void RasterizerGXM::ApplyLazyFills(PAddr addr, u32 size) {
+    if (lazy_fills.empty()) {
+        return;
+    }
+    std::erase_if(lazy_fills, [this, addr, size](const LazyFill& fill) {
+        if (addr >= fill.start + fill.bytes || fill.start >= addr + size) {
+            return false;
+        }
+        FillPattern(memory.GetPhysicalPointer(fill.start), fill.bytes, fill.texel, fill.bpp);
+        return true;
+    });
 }
 
 bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
@@ -4222,6 +4279,7 @@ void RasterizerGXM::ClearDepthIfNeeded(Surface& surface) {
 }
 
 void RasterizerGXM::FlushPending() {
+    ApplyLazyFills(0, 0xFFFFFFFFu);
     MaterializeAllCopies();
     EndScene();
     for (auto& surface : surfaces) {
@@ -4728,6 +4786,8 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
  * queda para recargarse antes del siguiente lote de GPU o de copiarla.
  */
 void RasterizerGXM::PrepareSoftwareBatch() {
+    // El software lee y escribe la profundidad en el invitado.
+    ApplyLazyFills(0, 0xFFFFFFFFu);
     // El software lee sus texturas de la memoria del invitado.
     MaterializeTextureCopies();
     const PAddr address =
@@ -5411,6 +5471,7 @@ void RasterizerGXM::FlushAll() {
 }
 
 void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
+    ApplyLazyFills(addr, size);
     // Alguien va a leer una pantalla copiada en la GPU: a la memoria.
     MaterializeCopies(addr, size);
     /**
@@ -5458,6 +5519,8 @@ void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
+    // Antes de que el invitado escriba encima: lo pendiente va debajo.
+    ApplyLazyFills(addr, size);
     // El invitado escribe encima de una pantalla copiada en la GPU: se olvida.
     DropCopies(addr, size);
     /**
@@ -5509,6 +5572,7 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    ApplyLazyFills(addr, size);
     MaterializeCopies(addr, size);
     DropCopies(addr, size);
     // Las dos cosas y en este orden: el invitado se lleva lo que hemos dibujado

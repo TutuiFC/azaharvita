@@ -1247,6 +1247,8 @@ std::atomic<SceUID> g_worker_uid{-1};
 std::atomic<unsigned long long> g_worker_busy_since{0};
 std::atomic<u32> g_jobs_queued{0};
 std::atomic<bool> g_worker_boosted{false};
+/// El trabajo en marcha es grande (CgJob::heavy): ese no se sube (0.2.2.7).
+std::atomic<bool> g_worker_heavy{false};
 /// Justo por encima de los ayudantes y del hilo de la GPU (159).
 constexpr int kCgBoostedPriority = Common::kVitaPriorityHelper - 1;
 
@@ -1294,6 +1296,7 @@ void* CgWorkerMain(void*) {
             g_jobs.erase(pick);
             g_jobs_queued.store(static_cast<u32>(g_jobs.size()), std::memory_order_relaxed);
         }
+        g_worker_heavy.store(job->heavy, std::memory_order_relaxed);
         g_worker_busy_since.store(Common::VitaMicros(), std::memory_order_relaxed);
         for (std::size_t i = 0; i < job->sources.size(); i++) {
             // Los de vertices dejan de pedirse con el compilador roto; los de
@@ -1331,7 +1334,14 @@ void* CgWorkerMain(void*) {
  * momento en vez de ir a 1 FPS minutos, y el resultado queda en la cache.
  */
 void CgMarkStarved() {
-    if (g_worker_boosted.load(std::memory_order_relaxed)) {
+    /**
+     * Uno grande no se sube (0.2.2.7): son minutos, y subido se llevaba un
+     * nucleo entero por delante de la GPU y de los ayudantes (New Super Mario
+     * Bros. 2 en 0.2.2.6: 600 ms por fotograma mientras compilaba). Sus lotes
+     * van por la CPU como antes de 0.2.2.3; compila con lo que sobre.
+     */
+    if (g_worker_boosted.load(std::memory_order_relaxed) ||
+        g_worker_heavy.load(std::memory_order_relaxed)) {
         return;
     }
     const SceUID thread = g_worker_uid.load(std::memory_order_acquire);
