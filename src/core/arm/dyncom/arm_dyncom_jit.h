@@ -117,6 +117,11 @@ extern std::atomic<u32> vfp_data;
  */
 extern std::atomic<u32> direct_link;
 
+/// Los enlaces directos se parchean para saltar sin comprobaciones cuando el
+/// destino esta publicado (0.2.2.9). 0 = como antes. Se lee al compilar y al
+/// publicar cada bloque.
+extern std::atomic<u32> direct_link_patch;
+
 /**
  * Aritmetica VFP en el hardware de la Vita (0.1.7.0), con el FPSCR del juego
  * cargado durante cada instruccion. 0 = por las funciones del interprete

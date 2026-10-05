@@ -34,6 +34,7 @@ std::atomic<u32> mode{1};
 std::atomic<u32> reg_cache{1};
 std::atomic<u32> vfp_data{1};
 std::atomic<u32> direct_link{1};
+std::atomic<u32> direct_link_patch{1};
 std::atomic<u32> vfp_native{1};
 std::atomic<u32> thumb{1};
 
@@ -872,6 +873,22 @@ struct Block {
     std::array<s8, 16> cache_map{
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     bool uses_cache = false;
+    /**
+     * ENLACES PARCHEADOS (0.2.2.9). Los enlaces directos de otros bloques que
+     * apuntan a este: con la entrada publicada se reescriben para saltar
+     * directos (ver PatchSite) y al despublicarla se dejan como estaban.
+     */
+    struct LinkSite {
+        u32* word0 = nullptr; ///< MOVW r0 del enlace
+        u8 ldrd = 0;          ///< palabras desde word0 hasta el LDRD del presupuesto
+        u8 count = 0;         ///< ... hasta el LDR r2, [r0, #kLinkCount]
+        u8 bx = 0;            ///< ... hasta el BX r1
+        u32 orig0 = 0;
+        u32 orig_count = 0;
+        u32 orig_bx = 0;
+        bool patched = false;
+    };
+    std::vector<LinkSite> incoming;
 };
 
 SceUID g_code_block = -1;
@@ -3013,6 +3030,8 @@ private:
      */
     void EmitLink(const LinkInfo* target, u32 target_pc) {
         std::vector<u32> fails;
+        PendingSite site{};
+        site.target = target;
         FlushCachedRegs();
         e.Mrs(kT0);
         /**
@@ -3058,7 +3077,12 @@ private:
         } else {
             // Directo: el LinkInfo del destino es fijo (los elementos de
             // g_blocks no se mueven): MOVW/MOVT, sin literal ni salto (0.1.8.1).
-            e.Mov32(R0, static_cast<u32>(reinterpret_cast<uintptr_t>(target)));
+            // Siempre las dos, para que el parche sepa donde esta todo.
+            const u32 ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(target));
+            site.word0 = e.Position();
+            e.Emit(0xE3000000u | ((ptr & 0xF000u) << 4) | (R0 << 12) | (ptr & 0x0FFFu));
+            e.Emit(0xE3400000u | (((ptr >> 16) & 0xF000u) << 4) | (R0 << 12) |
+                   ((ptr >> 16) & 0x0FFFu));
         }
         /**
          * r0 = LinkInfo* del destino. Enlazable? (0.1.8.1) entry ya implica que
@@ -3071,14 +3095,20 @@ private:
         e.CmpImm0(R1);
         fails.push_back(e.BranchPlaceholder(kCondEq));
         // Presupuesto y enlaces de una vez: LDRD kRn (budget), kRm (hops).
+        site.ldrd = e.Position();
         e.LdrdImm(kRn, kCpu, g_offsets.link);
+        site.count = e.Position();
         e.LdrImm(R2, R0, kLinkCount);
         e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | R2); // SUBS kRn, kRn, r2
         fails.push_back(e.BranchPlaceholder(kCondLo));
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
         e.StrdImm(kRn, kCpu, g_offsets.link);
         e.MsrFlags(kT0);
+        site.bx = e.Position();
         e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
+        if (target != nullptr) {
+            link_sites.push_back(site);
+        }
         const bool store_pc = target != nullptr;
         DeferCold(std::move(fails), [this, store_pc, target_pc] {
             e.MsrFlags(kT0);
@@ -3103,6 +3133,18 @@ private:
      * cuentas en RunCompiled), y si no llega, se sale como un enlace fallido.
      * Sin mirar link.entry: si este codigo corre, el bloque esta publicado.
      */
+public:
+    /// Un enlace directo emitido, en palabras desde el principio del codigo
+    /// (ver Block::LinkSite).
+    struct PendingSite {
+        const LinkInfo* target = nullptr;
+        u32 word0 = 0;
+        u32 ldrd = 0;
+        u32 count = 0;
+        u32 bx = 0;
+    };
+    std::vector<PendingSite> link_sites;
+
     void EmitSelfLink(u32 target_pc) {
         std::vector<u32> fails;
         FlushCachedRegs();
@@ -3644,7 +3686,8 @@ std::vector<bool> ComputeFlagsLiveAfter(const std::vector<u32>& words) {
 /// no hace falta (esos bloques no encadenan).
 /// Una variante del bloque en 'start', con el dominio VM ya abierto. Las
 /// palabras escritas, o 0 si no cabe.
-u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity) {
+u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity,
+                std::vector<Compiler::PendingSite>* sites = nullptr) {
     Emitter e{start, capacity};
     Compiler compiler{e, check_mode};
     compiler.SetCacheMap(block.cache_map);
@@ -3698,6 +3741,9 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity) {
     if (e.Overflowed()) {
         return 0;
     }
+    if (sites != nullptr) {
+        *sites = std::move(compiler.link_sites);
+    }
     if (!check_mode) {
         // Punto de entrada de los enlaces (0.1.5.7): pila, kCpu, kPages y
         // flags ya los pone el bloque origen; aqui empieza BodyEnter. NO se
@@ -3716,6 +3762,95 @@ u32 EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity) {
  * de zona se compilan miles por segundo ("compilar" en crash.txt). Deja
  * block.code y block.check_code; false si no cabe (se pide vaciar).
  */
+/**
+ * ENLACE DIRECTO PARCHEADO (0.2.2.9). Con la entrada del destino publicada,
+ * tres palabras del enlace se reescriben: la primera salta al LDRD del
+ * presupuesto (fuera MOVW/MOVT del LinkInfo, la carga de su entrada y la
+ * comparacion), la carga de su cuenta pasa a MOVW con la cuenta y el BX r1
+ * final a un B a la entrada. En Pokemon Sol son ~96.000 enlaces por
+ * fotograma, en bloques de 6-7 instrucciones del juego. Lo demas (vuelco de
+ * la cache, presupuesto, flags) es igual. Hay que llamarlo con el dominio VM
+ * abierto; la sincronizacion de la cache de instrucciones la hace quien
+ * llama.
+ */
+Block* BlockOfLink(const LinkInfo* link) {
+    return reinterpret_cast<Block*>(reinterpret_cast<uintptr_t>(link) - g_link_in_block);
+}
+
+void PatchSite(Block::LinkSite& site, const Block& target) {
+    u32* const w = site.word0;
+    const auto branch = [](const u32* from, const u32* to) {
+        const s32 offset = static_cast<s32>(to - (from + 2));
+        return 0xEA000000u | (static_cast<u32>(offset) & 0x00FFFFFFu);
+    };
+    const u32 count = target.link.count;
+    w[0] = branch(w, w + site.ldrd);
+    w[site.count] = 0xE3000000u | ((count & 0xF000u) << 4) | (2u << 12) | (count & 0x0FFFu);
+    w[site.bx] = branch(w + site.bx, reinterpret_cast<const u32*>(target.link.entry));
+    site.patched = true;
+}
+
+void UnpatchSite(Block::LinkSite& site) {
+    u32* const w = site.word0;
+    w[0] = site.orig0;
+    w[site.count] = site.orig_count;
+    w[site.bx] = site.orig_bx;
+    site.patched = false;
+}
+
+void SyncSite(const Block::LinkSite& site) {
+    sceKernelSyncVMDomain(g_code_block, site.word0, (static_cast<u32>(site.bx) + 1) * 4);
+}
+
+/// Publica la entrada del bloque y parchea los enlaces que esperan por el.
+void PublishEntry(Block& block) {
+    if (block.link.entry != 0) {
+        return;
+    }
+    block.link.entry = block.chain_entry;
+    if (block.incoming.empty() || block.chain_entry == 0 ||
+        direct_link_patch.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
+    if (sceKernelOpenVMDomain() < 0) {
+        return;
+    }
+    for (Block::LinkSite& site : block.incoming) {
+        if (!site.patched) {
+            PatchSite(site, block);
+            SyncSite(site);
+        }
+    }
+    sceKernelCloseVMDomain();
+}
+
+/// Despublica la entrada: los enlaces parcheados vuelven a mirar entry.
+void WithdrawEntry(Block& block) {
+    block.link.entry = 0;
+    bool any = false;
+    for (const Block::LinkSite& site : block.incoming) {
+        any = any || site.patched;
+    }
+    if (!any) {
+        return;
+    }
+    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
+    if (sceKernelOpenVMDomain() < 0) {
+        // Sin poder escribir el codigo, los enlaces seguirian saltando al
+        // bloque viejo: se tira todo en el siguiente TryRun.
+        g_flush_requested = true;
+        return;
+    }
+    for (Block::LinkSite& site : block.incoming) {
+        if (site.patched) {
+            UnpatchSite(site);
+            SyncSite(site);
+        }
+    }
+    sceKernelCloseVMDomain();
+}
+
 bool EmitBlockCode(Block& block, bool normal, bool check) {
     const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
     const int open_rc = sceKernelOpenVMDomain();
@@ -3735,14 +3870,31 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
     u32 used = 0;
     BlockFn code = nullptr;
     BlockFn check_code = nullptr;
+    std::vector<Compiler::PendingSite> sites;
     if (normal) {
-        used = EmitVariant(block, false, start, capacity);
+        used = EmitVariant(block, false, start, capacity, &sites);
         if (used == 0) {
             sceKernelCloseVMDomain();
             g_flush_requested = true;
             return false;
         }
         code = reinterpret_cast<BlockFn>(start);
+        for (const Compiler::PendingSite& pending : sites) {
+            Block& target = *BlockOfLink(pending.target);
+            Block::LinkSite site;
+            site.word0 = start + pending.word0;
+            site.ldrd = static_cast<u8>(pending.ldrd - pending.word0);
+            site.count = static_cast<u8>(pending.count - pending.word0);
+            site.bx = static_cast<u8>(pending.bx - pending.word0);
+            site.orig0 = site.word0[0];
+            site.orig_count = site.word0[site.count];
+            site.orig_bx = site.word0[site.bx];
+            // Ya publicado: parcheado desde ya (lo sincroniza el Sync de abajo).
+            if (target.link.entry != 0 && direct_link_patch.load(std::memory_order_relaxed) != 0) {
+                PatchSite(site, target);
+            }
+            target.incoming.push_back(site);
+        }
     }
     if (check) {
         // Si no cabe, la normal vale igual: la de comprobacion se pide otra
@@ -4015,9 +4167,7 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
      * fallado el bloque estaria en la lista negra y Acquire no lo daria): ya
      * puede ser destino de un enlace del codigo generado (0.1.8.1).
      */
-    if (block->link.entry == 0) {
-        block->link.entry = block->chain_entry;
-    }
+    PublishEntry(*block);
     /**
      * Una entrada de cada kTimeSampleEvery otra vez (0.2.1.0). En 0.1.8.1 se
      * cronometraban todas para quitar ruido al reparto entre "jit" y "resto",
@@ -4084,9 +4234,7 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
          * de 18.245 en 0.1.8.0 en el mismo punto. No le toca comprobacion, asi
          * que ya paso (y se cerro en el despacho) la ultima de las iniciales.
          */
-        if (next->link.entry == 0) {
-            next->link.entry = next->chain_entry;
-        }
+        PublishEntry(*next);
         g_local.dispatches++;
         done += RunCompiled(cpu, *next, pages, budget_left - done - next->link.count);
     }
@@ -4174,7 +4322,7 @@ void CompletePendingCheck(ARMul_State* cpu) {
     if (!what.empty()) {
         block.state = BlockState::Blacklisted;
         // 0.1.5.7: y deja de ser enlazable desde el codigo generado.
-        block.link.entry = 0;
+        WithdrawEntry(block);
         Common::FrameStats::jit_mismatches.fetch_add(1, std::memory_order_relaxed);
         NoteMismatch(block, what);
     }
@@ -4352,8 +4500,8 @@ void ApplyInvalidations() {
         block.visits = 0;
         block.code = nullptr;
         block.check_code = nullptr;
+        WithdrawEntry(block);
         block.chain_entry = 0;
-        block.link.entry = 0;
         block.link.runs = 0;
         block.reject = kRejectNone;
         block.words.clear();
