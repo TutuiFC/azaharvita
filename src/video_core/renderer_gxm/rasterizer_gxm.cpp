@@ -3582,7 +3582,16 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
      * del invitado (CopyTiledGuest no voltea), asi que basta con que el salto
      * sea de filas de mosaicos enteras.
      */
+    /**
+     * Y de las que valgan, la que mejor encaje (0.2.2.8): con varias
+     * superficies en la misma direccion (Inazuma Eleven GO, ver
+     * AccelerateFillOnGpu) se cogia la primera, y la copia del 3D de 480x400
+     * salia rechazada por "medidas" contra la de 240x400. Primero el ancho y
+     * el tamano de pixel de la copia, despues que este al dia, despues que
+     * tenga dibujado nuevo.
+     */
     u32 first_row = 0;
+    u32 best_score = 0;
     for (auto& surface : surfaces) {
         const u32 row_bytes = surface->width * surface->bpp;
         if (src < surface->guest_address || row_bytes == 0 ||
@@ -3593,9 +3602,17 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         if (offset % (row_bytes * 8) != 0) {
             continue;
         }
-        source = surface.get();
-        first_row = offset / row_bytes;
-        break;
+        const u32 row = offset / row_bytes;
+        const bool fits = surface->width == config.input_width &&
+                          surface->bpp == Pica::BytesPerPixel(in_format) &&
+                          row + in_height <= surface->height;
+        const u32 score = 1 + (fits ? 4u : 0u) + (!surface->needs_reload ? 2u : 0u) +
+                          (surface->dirty ? 1u : 0u);
+        if (score > best_score) {
+            best_score = score;
+            source = surface.get();
+            first_row = row;
+        }
     }
     if (source == nullptr) {
         return reject("sin superficie");
@@ -3854,6 +3871,16 @@ bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
      * invitado (CopyTiledGuest no voltea), asi que una franja de filas del
      * invitado es una franja de filas nuestra.
      */
+    /**
+     * LA QUE ENCAJE ENTERA, PRIMERO (0.2.2.8). Inazuma Eleven GO dibuja en la
+     * misma direccion con tres tamanos (480x400 el 3D, 240x320 la pantalla de
+     * abajo, 240x400) y aqui se cogia la primera que contuviera el tramo: el
+     * borrado de 240x320 caia como franja en la de 240x400, que estaba por
+     * recargar, y se iba a software; eso marcaba las tres para recargar y el
+     * siguiente borrado volvia a fallar. ~30 recargas y 2 volcados por
+     * fotograma (crash.txt de 0.2.2.1). Si no hay una entera, la primera que
+     * lo contenga, como antes.
+     */
     Surface* target = nullptr;
     u32 first_row = 0;
     u32 rows = 0;
@@ -3869,10 +3896,15 @@ bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
         if (offset % (row_bytes * 8) != 0 || bytes % (row_bytes * 8) != 0) {
             continue;
         }
-        target = surface.get();
-        first_row = offset / row_bytes;
-        rows = bytes / row_bytes;
-        break;
+        const bool exact = offset == 0 && bytes / row_bytes == surface->height;
+        if (target == nullptr || exact) {
+            target = surface.get();
+            first_row = offset / row_bytes;
+            rows = bytes / row_bytes;
+        }
+        if (exact) {
+            break;
+        }
     }
     if (target == nullptr) {
         return false;
@@ -3940,6 +3972,24 @@ bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
     target->clears[target->clear_count++] = {first_row, rows, texel};
     target->clear_pending = true;
     target->copied = false;
+    /**
+     * Las demas superficies sobre esa memoria ya no la reflejan (0.2.2.8):
+     * lo mismo que haria InvalidateRegion con el relleno por software, pero
+     * solo con ellas. La que se rellena no se toca: su color es el relleno.
+     */
+    for (auto& other : surfaces) {
+        if (other.get() == target || !other->Overlaps(start, end - start)) {
+            continue;
+        }
+        if (open_surface == other.get()) {
+            EndScene();
+        }
+        other->dirty = false;
+        other->needs_reload = true;
+        other->clear_pending = false;
+        other->clear_count = 0;
+        other->copied = false;
+    }
     // Lo demas que pudiera tener esa memoria, como en el relleno por software.
     DropCopies(start, end - start);
     if (textures != nullptr) {
