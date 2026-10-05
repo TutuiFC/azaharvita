@@ -162,6 +162,9 @@ private:
     bool overlay_combo_held = false;
     /// False = el overlay no se dibuja (SELECT+TRIANGULO lo enciende otra vez).
     bool stats_overlay_visible = true;
+    /// Las ~30 lineas de diagnostico (0.2.2.2). Sin esto, una sola linea con
+    /// los FPS: ver DrawStatsOverlay.
+    bool stats_overlay_full = false;
     bool audio_stretching = true;
     /// Estadisticas del JIT para el overlay (ver DrawStatsOverlay).
     bool stats_jit_on = false;

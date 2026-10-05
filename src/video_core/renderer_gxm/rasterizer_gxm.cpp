@@ -720,6 +720,8 @@ struct RasterizerGXM::Surface {
     /// Se creo con profundidad de 16 bits (D16 del invitado) o de 24+8.
     bool depth16 = false;
     bool scene_open = false;
+    /// La valla de la ultima escena que dibujo en ella (0.2.2.2, WriteBack).
+    u32 last_fence = 0;
     SceGxmRenderTarget* render_target = nullptr;
     SceUID driver_uid = -1;
     SceGxmColorSurface color_surface{};
@@ -2492,6 +2494,7 @@ void RasterizerGXM::EndScene() {
         done.address = fence_address;
         done.value = fence_sent;
         sceGxmEndScene(context, nullptr, &done);
+        open_surface->last_fence = fence_sent;
     }
     if (frame_first_fence == 0) {
         frame_first_fence = fence_sent;
@@ -2625,8 +2628,19 @@ void RasterizerGXM::WriteBack(Surface& surface) {
     if (surface.clear_pending) {
         ApplyClearOnCpu(surface);
     }
-    // Lee color_buffer: la GPU pudo no haber terminado si 4.5 difirio la espera.
-    WaitGpu(GpuWait::WriteBack);
+    /**
+     * Lee color_buffer: la escena que lo dibujo tiene que haber acabado. Solo
+     * ESA (0.2.2.2): era sceGxmFinish, esperar tambien a todo lo mandado
+     * despues, y con la GPU hasta dos fotogramas por detras (desde 0.2.2.0)
+     * eso es esperar fotogramas enteros. Pokemon Sol en sus efectos ("volcado"
+     * 8-9 ms por fotograma) e Inazuma Eleven GO en cada fotograma de partido.
+     * Leer no choca con las escenas que la muestrean despues.
+     */
+    if (surface.last_fence != 0 && open_surface != &surface) {
+        WaitFence(surface.last_fence, GpuWait::WriteBack);
+    } else {
+        WaitGpu(GpuWait::WriteBack);
+    }
     surface.dirty = false;
     u8* guest = memory.GetPhysicalPointer(surface.guest_address);
     if (guest == nullptr) {

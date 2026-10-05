@@ -231,9 +231,19 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
     if (overlay_toggle) {
         if (!overlay_combo_held) {
             overlay_combo_held = true;
-            stats_overlay_visible = !stats_overlay_visible;
-            Common::VitaNote("tecla", stats_overlay_visible ? "SELECT+TRIANGULO: overlay ON"
-                                                            : "SELECT+TRIANGULO: overlay OFF");
+            // Apagado -> compacto -> completo -> apagado (0.2.2.2).
+            if (!stats_overlay_visible) {
+                stats_overlay_visible = true;
+                stats_overlay_full = false;
+            } else if (!stats_overlay_full) {
+                stats_overlay_full = true;
+            } else {
+                stats_overlay_visible = false;
+            }
+            stats_next_update_us = 0;
+            Common::VitaNote("tecla", !stats_overlay_visible ? "SELECT+TRIANGULO: overlay OFF"
+                                      : stats_overlay_full   ? "SELECT+TRIANGULO: overlay completo"
+                                                             : "SELECT+TRIANGULO: overlay compacto");
         }
         return;
     }
@@ -1420,6 +1430,33 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     AppendOneDecimal(line2, n2, stats_speed_percent);
     line2[n2++] = '%';
     line2[n2] = '\0';
+
+    /**
+     * OVERLAY COMPACTO (0.2.2.2). Las ~30 lineas son unos 2.000 caracteres, y
+     * vita2d dibuja cada uno con su propia llamada: cada actualizacion (una
+     * por segundo) costaba ~150 ms en el hilo que presenta, entre 3 y 20 ms
+     * por fotograma de media en crash.txt ("ovl"), un tiron cada segundo y
+     * FPS de menos justo mientras se miraban los FPS. Por defecto, una linea;
+     * todo lo demas ya va a crash.txt cada 10 s.
+     */
+    if (!stats_overlay_full) {
+        char compact[96];
+        std::size_t c = 0;
+        const auto put = [&](const char* text) {
+            while (*text != '\0' && c < sizeof(compact) - 8) {
+                compact[c++] = *text++;
+            }
+        };
+        put(line1);
+        put("  ");
+        put(line2);
+        put("  ms ");
+        AppendMillis(compact, c, stats_frame_ms);
+        compact[c] = '\0';
+        vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 20, 0xFF60C0FF, 0.8f,
+                             compact);
+        return;
+    }
 
     // Cuentas de vaciado de la cache de traduccion: para decidir si merece la
     // pena agrandar TRANS_CACHE_SIZE. "cap" es la unica que tiene que ver con
