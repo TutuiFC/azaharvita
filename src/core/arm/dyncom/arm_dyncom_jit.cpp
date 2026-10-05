@@ -42,8 +42,14 @@ namespace {
 // ---------------------------------------------------------------------------
 
 /// Memoria de codigo. Cuando se llena se tira todo y se empieza de cero (lo
-/// mismo que hace la cache de traduccion del interprete).
-constexpr u32 kCodeBytes = 8u * 1024u * 1024u;
+/// mismo que hace la cache de traduccion del interprete). 16 MB desde 0.2.1.2:
+/// con 8, Pokemon Sol la llenaba en su 3D y la vaciaba en bucle ("codigo"
+/// bajando de 7 MB a 175 KB y "compilar" en 750 ms por fotograma). Si no hay
+/// memoria para 16, se queda en 8. Los saltos entre bloques y a C van por
+/// registro, asi que el tamano no esta limitado por el alcance de B/BL.
+constexpr u32 kCodeBytesWanted = 16u * 1024u * 1024u;
+constexpr u32 kCodeBytesFallback = 8u * 1024u * 1024u;
+u32 g_code_bytes = kCodeBytesFallback;
 /// Un bloque se compila la SEGUNDA vez que se despacha: el codigo que solo
 /// corre una vez (arranque, cargas) no merece lo que cuesta compilarlo.
 constexpr u32 kCompileAfterVisits = 2;
@@ -990,7 +996,12 @@ bool Init(ARMul_State* cpu) {
                                         .c_str());
         return false;
     }
-    g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", kCodeBytes);
+    g_code_bytes = kCodeBytesWanted;
+    g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", g_code_bytes);
+    if (g_code_block < 0) {
+        g_code_bytes = kCodeBytesFallback;
+        g_code_block = sceKernelAllocMemBlockForVM("azahar_arm_jit", g_code_bytes);
+    }
     if (g_code_block < 0) {
         Common::VitaNote("jit arm", fmt::format("sin memoria ejecutable ({:#x}): JIT apagado",
                                                 static_cast<u32>(g_code_block))
@@ -1005,7 +1016,8 @@ bool Init(ARMul_State* cpu) {
     g_code = static_cast<u32*>(base_address);
     g_code_used_words = 0;
     g_ready = true;
-    Common::VitaNote("jit arm", "listo (8 MB de codigo)");
+    Common::VitaNote("jit arm",
+                     fmt::format("listo ({} MB de codigo)", g_code_bytes >> 20).c_str());
     return true;
 }
 
@@ -3435,7 +3447,7 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
         return false;
     }
     u32* const start = g_code + g_code_used_words;
-    const u32 capacity = kCodeBytes / 4 - g_code_used_words;
+    const u32 capacity = g_code_bytes / 4 - g_code_used_words;
     u32 used = 0;
     BlockFn code = nullptr;
     BlockFn check_code = nullptr;

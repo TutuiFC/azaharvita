@@ -108,6 +108,8 @@ struct CgJob {
     const SceShaccCgCompileOutput* output = nullptr;
     u32 used_variant = 0;
     std::atomic<bool> done{false};
+    /// Cuando se encolo (VitaMicros), para saber cuanto lleva esperando.
+    unsigned long long submitted_us = 0;
 };
 
 /// 'urgent' pone el trabajo delante de la cola (los de fragmentos: sin ellos

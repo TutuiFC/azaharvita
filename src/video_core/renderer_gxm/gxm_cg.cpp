@@ -1241,6 +1241,7 @@ void CgSubmit(std::shared_ptr<CgJob> job, bool urgent) {
         }
         Common::VitaNote("gxm compila", "hilo de compilacion en segundo plano listo");
     }
+    job->submitted_us = Common::VitaMicros();
     if (urgent) {
         g_jobs.push_front(std::move(job));
     } else {

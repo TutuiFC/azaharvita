@@ -1112,6 +1112,8 @@ void CopyTiledGuest(u8* guest, u8* linear, u32 width, u32 height, u32 linear_str
  * dibujado.
  */
 struct RasterizerGXM::PipelineCache {
+    static constexpr unsigned long long kAsyncFsWindowUs = 2000000;
+
     struct Entry {
         /**
          * Esta entrada sirve, o esta guardada SOLO para no volver a intentarlo.
@@ -1363,6 +1365,11 @@ struct RasterizerGXM::PipelineCache {
         if (it != entries.end() && it->second->job != nullptr) {
             Entry& pending = *it->second;
             if (!pending.job->done.load(std::memory_order_acquire)) {
+                // Como con los de vertices (0.2.1.2): si el compilador lleva
+                // demasiado con el, por software, que se vea.
+                if (Common::VitaMicros() - pending.job->submitted_us > kAsyncFsWindowUs) {
+                    return fail("fs compilando largo");
+                }
                 return fail("fs compilando");
             }
             const SceShaccCgCompileOutput* output = pending.job->output;
@@ -1726,6 +1733,8 @@ struct RasterizerGXM::HwShaderCache {
         std::shared_ptr<CgJob> job;
     };
 
+    static constexpr unsigned long long kAsyncVsWindowUs = 1000000;
+
     /// Tope de programas traducidos. Un juego usa decenas; pasado esto se deja
     /// de traducir y los nuevos se quedan en la CPU, que es correcto.
     static constexpr std::size_t kMaxPrograms = 384;
@@ -1757,7 +1766,17 @@ struct RasterizerGXM::HwShaderCache {
             Program& found = *it->second;
             if (found.job != nullptr) {
                 if (!found.job->done.load(std::memory_order_acquire)) {
-                    *out_reason = "vs compilando";
+                    /**
+                     * SALTAR SOLO UN RATO (0.2.1.2). Con los shaders
+                     * asincronos el lote se salta mientras compila; en
+                     * Pokemon Sol el compilador no acababa nunca y la
+                     * pantalla de arriba se quedaba en negro (miles de
+                     * "saltados por compilar"). Pasado kAsyncVsWindowUs el
+                     * lote se dibuja por la CPU: lento, pero se ve.
+                     */
+                    const bool young = Common::VitaMicros() - found.job->submitted_us <
+                                       kAsyncVsWindowUs;
+                    *out_reason = young ? "vs compilando" : "vs compilando largo";
                     return nullptr;
                 }
                 const SceShaccCgCompileOutput* output = found.job->output;
@@ -1916,8 +1935,14 @@ private:
          * aparte (sin congelar) y queda en la cache de la tarjeta, asi que el
          * tope sube de 16 a 32 KB: el coste se paga una vez y la siguiente
          * partida lo lee al momento. Mas grande que eso, a la CPU.
+         *
+         * 0.2.1.2: otra vez 16 KB. crash.txt de Pokemon Sol en 0.2.1.1: uno
+         * de 24 KB entra en el compilador y no sale en toda la partida (el de
+         * 26 KB de la anterior lo tumbo). El hilo es uno solo, y detras se
+         * quedan TODOS los demas, los de fragmentos tambien: el 3D entero
+         * saltado y la pantalla de arriba en negro.
          */
-        constexpr std::size_t kMaxCompileSource = 32u * 1024u;
+        constexpr std::size_t kMaxCompileSource = 16u * 1024u;
         // De la cache de la tarjeta: es leer un fichero, aqui mismo.
         if (const SceShaccCgCompileOutput* cached =
                 LoadCgCache(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", sources.front().c_str())) {
@@ -5349,6 +5374,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             std::strcmp(reason, "vs tope de programas") != 0 &&
             std::strcmp(reason, "vs compilador roto") != 0 &&
             std::strcmp(reason, "vs compilando") != 0 &&
+            std::strcmp(reason, "vs compilando largo") != 0 &&
             std::strcmp(reason, "vs con geometria") != 0) {
             using namespace Pica::Shader::Generator::GXM;
             auto used = hw_shaders->used_bools.find(program_key);
