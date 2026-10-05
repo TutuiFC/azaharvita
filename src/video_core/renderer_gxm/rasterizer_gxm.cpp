@@ -2929,6 +2929,46 @@ bool SameTextureFormat(Pica::PixelFormat pixel, Pica::TexturingRegs::TextureForm
     }
 }
 
+/**
+ * Bytes de la textura en el invitado. NO TexturingRegs::NibblesPerPixel: no
+ * conoce ETC1 ni ETC1A4 y para ellos llama a UNIMPLEMENTED, que escribe en el
+ * registro de la tarjeta; con esto en cada lote, New Super Mario Bros. 2 se
+ * quedo a 0,1 FPS en 0.2.2.5. Formato desconocido: 0, no pisa nada.
+ */
+u32 TextureBytes(Pica::TexturingRegs::TextureFormat format, u32 width, u32 height) {
+    using TextureFormat = Pica::TexturingRegs::TextureFormat;
+    u32 nibbles = 0;
+    switch (format) {
+    case TextureFormat::RGBA8:
+        nibbles = 8;
+        break;
+    case TextureFormat::RGB8:
+        nibbles = 6;
+        break;
+    case TextureFormat::RGB5A1:
+    case TextureFormat::RGB565:
+    case TextureFormat::RGBA4:
+    case TextureFormat::IA8:
+    case TextureFormat::RG8:
+        nibbles = 4;
+        break;
+    case TextureFormat::I8:
+    case TextureFormat::A8:
+    case TextureFormat::IA4:
+    case TextureFormat::ETC1A4:
+        nibbles = 2;
+        break;
+    case TextureFormat::I4:
+    case TextureFormat::A4:
+    case TextureFormat::ETC1:
+        nibbles = 1;
+        break;
+    default:
+        break;
+    }
+    return nibbles * width * height / 2;
+}
+
 /// La unidad de textura tal como la ve el cache: configuracion, formato y si
 /// esta encendida.
 bool TextureUnit(const Pica::TexturingRegs& texturing, u32 unit,
@@ -2961,8 +3001,7 @@ const SceGxmTexture* RasterizerGXM::TextureFromCopy(u32 unit) {
         return nullptr;
     }
     const PAddr address = config->GetPhysicalAddress();
-    const u32 span = Pica::TexturingRegs::NibblesPerPixel(format) * config->width *
-                     config->height / 2;
+    const u32 span = TextureBytes(format, config->width, config->height);
     /**
      * El origen de una copia de mosaico a mosaico no se vuelca al presentar
      * (copied), y la transferencia por software lo volcaba en cada fotograma:
@@ -3031,8 +3070,7 @@ void RasterizerGXM::MaterializeTextureCopies() {
         Pica::TexturingRegs::TextureFormat format{};
         if (TextureUnit(texturing, unit, config, format)) {
             MaterializeCopies(config->GetPhysicalAddress(),
-                              Pica::TexturingRegs::NibblesPerPixel(format) * config->width *
-                                  config->height / 2);
+                              TextureBytes(format, config->width, config->height));
         }
     }
 }
