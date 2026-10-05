@@ -562,6 +562,18 @@ struct BadSourceHash {
 std::unordered_set<BadSource, BadSourceHash> g_bad_sources;
 std::unordered_set<BadSource, BadSourceHash> g_no_opt_sources;
 bool g_bad_loaded = false;
+/**
+ * SOSPECHOSO (0.2.3.5). Sin volcado no se culpa al shader que se estaba
+ * compilando (0.2.1.6), pero entonces uno que tumba el compilador sin dejar
+ * volcado -- Pokemon Sol, al entrar en combate en 0.2.3.3: la sesion acaba
+ * compilando uno de 12.699 bytes y no hay psp2core -- tumbaba el juego en
+ * cada combate. Ahora queda apuntado aqui; si la siguiente sesion vuelve a
+ * acabar compilando ESE MISMO, a la lista negra (a la CPU). Si se llega a
+ * compilar bien, deja de ser sospechoso.
+ */
+constexpr char kSuspectPath[] = "ux0:/data/azahar/shadercache/cg_sospechoso.bin";
+BadSource g_suspect{};
+bool g_has_suspect = false;
 
 /// Lo que se apunta en kCompilingPath antes de compilar.
 struct CompilingMarker {
@@ -648,18 +660,50 @@ void LoadBadSources() {
     SceIoStat marker_stat{};
     const bool marker_dated = sceIoGetstat(kCompilingPath, &marker_stat) >= 0;
     const SceUID crashed_fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
+    {
+        const SceUID suspect_fd = sceIoOpen(kSuspectPath, SCE_O_RDONLY, 0);
+        if (suspect_fd >= 0) {
+            g_has_suspect = sceIoRead(suspect_fd, &g_suspect, sizeof(g_suspect)) ==
+                            static_cast<int>(sizeof(g_suspect));
+            sceIoClose(suspect_fd);
+        }
+    }
     if (crashed_fd >= 0 && marker_dated && !CompilerCrashDumpSince(marker_stat)) {
         CompilingMarker interrupted{{}, SCE_SHACCCG_PROFILE_VP, 1, 0, 0};
         sceIoRead(crashed_fd, &interrupted, sizeof(interrupted));
         sceIoClose(crashed_fd);
         sceIoRemove(kCompilingPath);
-        sceIoRemove(kCompilingSourcePath);
-        Common::VitaNote("gxm shader",
-                         fmt::format("la sesion anterior acabo compilando un shader de {} bytes, "
-                                     "sin volcado de la consola (cerrado o colgado por otra "
-                                     "cosa): no se le culpa, se compilara otra vez",
-                                     interrupted.source_size)
-                             .c_str());
+        if (g_has_suspect && g_suspect == interrupted.source) {
+            StoreBadSource(interrupted.source);
+            sceIoRemove(kSuspectPath);
+            g_has_suspect = false;
+            sceIoRename(kCompilingSourcePath,
+                        fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir,
+                                    interrupted.source.hash_city)
+                            .c_str());
+            Common::VitaNote("gxm shader",
+                             fmt::format("la sesion anterior acabo compilando un shader de {} "
+                                         "bytes por SEGUNDA vez seguida, sin volcado: a la "
+                                         "lista negra (sus lotes, por la CPU)",
+                                         interrupted.source_size)
+                                 .c_str());
+        } else {
+            sceIoRemove(kCompilingSourcePath);
+            const SceUID suspect_fd =
+                sceIoOpen(kSuspectPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+            if (suspect_fd >= 0) {
+                sceIoWrite(suspect_fd, &interrupted.source, sizeof(interrupted.source));
+                sceIoClose(suspect_fd);
+            }
+            g_suspect = interrupted.source;
+            g_has_suspect = true;
+            Common::VitaNote("gxm shader",
+                             fmt::format("la sesion anterior acabo compilando un shader de {} "
+                                         "bytes, sin volcado de la consola: se compilara otra "
+                                         "vez; si vuelve a pasar con el, a la lista negra",
+                                         interrupted.source_size)
+                                 .c_str());
+        }
     } else if (crashed_fd >= 0) {
         // El de 0.2.0.6 y 0.2.0.7 solo traia el hash: se toma como uno de
         // vertices optimizado, que es lo que se caia.
@@ -1190,6 +1234,10 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         }
     }
     StoreCached(key, cache_path, *output);
+    if (g_has_suspect && g_suspect == BadSource{key.hash_city, key.hash_fnv}) {
+        sceIoRemove(kSuspectPath);
+        g_has_suspect = false;
+    }
     // 0.1.7.9: la salida pasa a un bloque nuestro y el compilador suelta todo
     // lo suyo. Si no hay memoria ni para la copia, se devuelve la original
     // (como antes de 0.1.7.9) y el compilador se queda como estaba.
