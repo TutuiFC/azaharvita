@@ -897,13 +897,9 @@ struct Block {
      * directos (ver PatchSite) y al despublicarla se dejan como estaban.
      */
     struct LinkSite {
-        u32* word0 = nullptr; ///< MOVW r0 del enlace
-        u8 ldrd = 0;          ///< palabras desde word0 hasta el LDRD del presupuesto
-        u8 count = 0;         ///< ... hasta el LDR r2, [r0, #kLinkCount]
-        u8 bx = 0;            ///< ... hasta el BX r1
+        u32* word0 = nullptr; ///< primera palabra del enlace (ver EmitDirectLink)
         u32 orig0 = 0;
         u32 orig_count = 0;
-        u32 orig_count2 = 0;
         u32 orig_bx = 0;
         bool patched = false;
     };
@@ -912,6 +908,11 @@ struct Block {
     /// DecodeArmBlock): la comprobacion deja correr al interprete por ellos.
     u32 side_exits = 0;
 };
+
+/// Palabras de un enlace directo que cambia el parche, desde la primera (ver
+/// EmitDirectLink): la resta de la cuenta y el salto a la entrada.
+constexpr u32 kLinkSiteCount = 1;
+constexpr u32 kLinkSiteBx = 7;
 
 SceUID g_code_block = -1;
 u32* g_code = nullptr;
@@ -1876,7 +1877,8 @@ private:
      * ejecutan. Ahora va todo detras del epilogo: el camino caliente queda
      * seguido, mas corto y sin el salto. Cada trozo guarda los registros
      * cacheados escritos HASTA su punto (cache_written), que es lo que vuelca.
-     * Un trozo no puede crear otros.
+     * Un trozo puede crear otros (el enlace de un salto lateral crea los
+     * suyos, 0.2.3.7): EmitColdStubs sigue hasta que no queda ninguno.
      */
     struct ColdStub {
         std::vector<u32> branches;
@@ -3083,62 +3085,63 @@ private:
      * Destino FIJO (B, BL, el camino no tomado de un salto condicional): su
      * LinkInfo va como constante en el codigo.
      *
-     * DESDE 0.2.3.6, SIN TOCAR LOS FLAGS. Ya parcheado (ver PatchSite) son
-     * nueve instrucciones, una de ellas un NOP, y ninguna toca APSR: el
-     * presupuesto se descuenta con SUB y su signo elige el camino con un ADD
-     * al PC, en vez de SUBS + BLO entre un MRS y un MSR. Sin parchear, la
-     * prueba de la entrada si usa los flags, que se guardan en kT0 y se
-     * reponen enseguida.
+     * DESDE 0.2.3.6, SIN TOCAR LOS FLAGS: el presupuesto se descuenta con
+     * SUB y su signo elige el camino con un ADD al PC, en vez de SUBS + BLO
+     * entre un MRS y un MSR.
      *
-     *   w0  MRS kT0                  (parche: B w7)
-     *   w1  MOVW r0 / w2 MOVT r0     LinkInfo del destino
-     *   w3  LDR r1, [r0, #entry] / w4 CMP r1, #0 / w5 BEQ fallo (con flags en kT0)
-     *   w6  MSR kT0
-     *   w7  LDRD kRn, kRm, presupuesto y enlaces
-     *   w8  LDR r2, [r0, #count]     (parche: SUB kRn, kRn, #cuenta)
-     *   w9  SUB kRn, kRn, r2         (parche: NOP)
-     *   w10 MOV kT1, kRn, ASR #31    0 o -1
-     *   w11 ADD pc, pc, kT1, LSL #2  -1: a w12; 0: a w13
-     *   w12 B fallo (flags intactos)
-     *   w13 ADD kRm, kRm, #1 / w14 STRD
-     *   w15 BX r1                    (parche: B entrada)
+     * Y DESDE 0.2.3.7, LA PRUEBA DE LA ENTRADA FUERA DE LINEA. Solo sirve
+     * hasta que el destino se publica y el parche (PatchSite) la salta; en
+     * 0.2.3.6 seguia ocupando siete palabras en medio del codigo caliente de
+     * cada enlace. Ahora va en la zona fria y el enlace parcheado son siete
+     * instrucciones seguidas:
+     *
+     *   w0  B prueba                 (parche: LDRD kRn, kRm, presupuesto y enlaces)
+     *   w1  SUB kRn, kRn, r2         (parche: SUB kRn, kRn, #cuenta)
+     *   w2  MOV kT1, kRn, ASR #31    0 o -1
+     *   w3  ADD pc, pc, kT1, LSL #2  -1: a w4; 0: a w5
+     *   w4  B fallo
+     *   w5  ADD kRm, kRm, #1 / w6 STRD
+     *   w7  BX r1                    (parche: B entrada)
+     *
+     *   prueba: MRS kT0; MOVW/MOVT r0, LinkInfo del destino; LDR r1, entrada;
+     *   CMP r1, #0; BEQ fallo (reponiendo los flags); MSR kT0; LDRD kRn, kRm;
+     *   LDR r2, cuenta; B w1
      */
     void EmitDirectLink(const LinkInfo* target, u32 target_pc) {
-        std::vector<u32> fails_flags;
-        std::vector<u32> fails_plain;
+        FlushCachedRegs();
         PendingSite site{};
         site.target = target;
-        FlushCachedRegs();
-        const u32 ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(target));
-        site.word0 = e.Position();
-        e.Mrs(kT0);
-        e.Emit(0xE3000000u | ((ptr & 0xF000u) << 4) | (R0 << 12) | (ptr & 0x0FFFu));
-        e.Emit(0xE3400000u | (((ptr >> 16) & 0xF000u) << 4) | (R0 << 12) |
-               ((ptr >> 16) & 0x0FFFu));
-        e.LdrImm(R1, R0, kLinkEntry);
-        e.CmpImm0(R1);
-        fails_flags.push_back(e.BranchPlaceholder(kCondEq));
-        e.MsrFlags(kT0);
-        site.ldrd = e.Position();
-        e.LdrdImm(kRn, kCpu, g_offsets.link);
-        site.count = e.Position();
-        e.LdrImm(R2, R0, kLinkCount);
-        e.Emit(0xE0400000u | (kRn << 16) | (kRn << 12) | R2);                 // SUB kRn, kRn, r2
-        e.Emit(0xE1A00000u | (kT1 << 12) | (31u << 7) | (2u << 5) | kRn);      // MOV kT1, kRn, ASR #31
-        e.Emit(0xE08FF000u | (2u << 7) | kT1);                                // ADD pc, pc, kT1, LSL #2
-        fails_plain.push_back(e.BranchPlaceholder(kAlways));
+        site.word0 = e.Address(e.Position());
+        const u32 to_check = e.BranchPlaceholder(kAlways);
+        const u32 checked = e.Position();
+        e.Emit(0xE0400000u | (kRn << 16) | (kRn << 12) | R2);            // SUB kRn, kRn, r2
+        e.Emit(0xE1A00000u | (kT1 << 12) | (31u << 7) | (2u << 5) | kRn); // MOV kT1, kRn, ASR #31
+        e.Emit(0xE08FF000u | (2u << 7) | kT1);                           // ADD pc, pc, kT1, LSL #2
+        const u32 no_budget = e.BranchPlaceholder(kAlways);
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
         e.StrdImm(kRn, kCpu, g_offsets.link);
-        site.bx = e.Position();
         e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
         link_sites.push_back(site);
-        DeferCold(std::move(fails_flags), [this, target_pc] {
+        const u32 ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(target));
+        DeferCold({to_check}, [this, ptr, checked, target_pc] {
+            e.Mrs(kT0);
+            e.Emit(0xE3000000u | ((ptr & 0xF000u) << 4) | (R0 << 12) | (ptr & 0x0FFFu));
+            e.Emit(0xE3400000u | (((ptr >> 16) & 0xF000u) << 4) | (R0 << 12) |
+                   ((ptr >> 16) & 0x0FFFu));
+            e.LdrImm(R1, R0, kLinkEntry);
+            e.CmpImm0(R1);
+            const u32 no_entry = e.BranchPlaceholder(kCondEq);
+            e.MsrFlags(kT0);
+            e.LdrdImm(kRn, kCpu, g_offsets.link);
+            e.LdrImm(R2, R0, kLinkCount);
+            e.BranchTo(kAlways, checked);
+            e.PatchBranch(no_entry, e.Position());
             e.MsrFlags(kT0);
             e.Mov32(kRd, target_pc);
             e.StrImm(kRd, kCpu, RegOffset(15));
             e.BranchTo(kAlways, exit_noflush);
         });
-        DeferCold(std::move(fails_plain), [this, target_pc] {
+        DeferCold({no_budget}, [this, target_pc] {
             e.Mov32(kRd, target_pc);
             e.StrImm(kRd, kCpu, RegOffset(15));
             e.BranchTo(kAlways, exit_noflush);
@@ -3220,14 +3223,11 @@ private:
     }
 
 public:
-    /// Un enlace directo emitido, en palabras desde el principio del codigo
-    /// (ver Block::LinkSite).
+    /// Un enlace directo emitido (ver Block::LinkSite), en la zona caliente o,
+    /// el de un salto lateral, en la fria.
     struct PendingSite {
         const LinkInfo* target = nullptr;
-        u32 word0 = 0;
-        u32 ldrd = 0;
-        u32 count = 0;
-        u32 bx = 0;
+        u32* word0 = nullptr;
     };
     std::vector<PendingSite> link_sites;
 
@@ -3304,9 +3304,27 @@ public:
         if (side_exit_) {
             // Salto lateral de un superbloque (0.2.3.1): si no se toma, se
             // sigue con la instruccion siguiente, que se compila a continuacion.
-            const u32 not_taken = e.BranchPlaceholder(cond ^ 1u);
             const s32 offset = static_cast<s32>((inst & 0x00FFFFFFu) << 8) >> 6;
             const u32 target = thumb_ ? branch_target_ : pc + 8 + static_cast<u32>(offset);
+            if (!internal_ && Linking()) {
+                /**
+                 * Tomado, a la zona fria (0.2.3.7): la devolucion y el enlace
+                 * (unas trece palabras) iban en linea con un salto por encima,
+                 * y en Pokemon Sol hay 0.6 saltos laterales por bloque. En el
+                 * codigo caliente queda solo el B condicional. El vuelco de la
+                 * cache del enlace es el de este punto (DeferCold guarda
+                 * cache_written), y el enlace se parchea igual (PendingSite
+                 * lleva su direccion).
+                 */
+                const u32 taken = e.BranchPlaceholder(cond);
+                const u32 refund = side_refund_;
+                DeferCold({taken}, [this, refund, target] {
+                    EmitRefund(refund);
+                    ExitDirect(target);
+                });
+                return;
+            }
+            const u32 not_taken = e.BranchPlaceholder(cond ^ 1u);
             if (internal_) {
                 EmitRefund(internal_skip_);
                 internal_branches_.emplace_back(e.BranchPlaceholder(kAlways), target);
@@ -4184,31 +4202,29 @@ void PatchSite(Block::LinkSite& site, const Block& target) {
         const s32 offset = static_cast<s32>(to - (from + 2));
         return 0xEA000000u | (static_cast<u32>(offset) & 0x00FFFFFFu);
     };
-    // Ver EmitDirectLink: SUB kRn, kRn, #cuenta y un NOP donde iban la carga
-    // de la cuenta y la resta por registro. Una cuenta que no quepa en el
-    // inmediato (no pasa: son 256 como mucho) deja el enlace sin parchear.
+    // Ver EmitDirectLink. Una cuenta que no quepa en el inmediato (no pasa:
+    // son 256 como mucho) deja el enlace sin parchear.
     u32 encoded = 0;
     if (!Emitter::EncodeImmediate(target.link.count, &encoded)) {
         return;
     }
-    w[0] = branch(w, w + site.ldrd);
-    w[site.count] = 0xE2400000u | (kRn << 16) | (kRn << 12) | encoded;
-    w[site.count + 1] = 0xE1A00000u;
-    w[site.bx] = branch(w + site.bx, reinterpret_cast<const u32*>(target.link.entry));
+    const u32 link = g_offsets.link;
+    w[0] = 0xE1C000D0u | (kCpu << 16) | (kRn << 12) | ((link & 0xF0u) << 4) | (link & 0xFu);
+    w[kLinkSiteCount] = 0xE2400000u | (kRn << 16) | (kRn << 12) | encoded;
+    w[kLinkSiteBx] = branch(w + kLinkSiteBx, reinterpret_cast<const u32*>(target.link.entry));
     site.patched = true;
 }
 
 void UnpatchSite(Block::LinkSite& site) {
     u32* const w = site.word0;
     w[0] = site.orig0;
-    w[site.count] = site.orig_count;
-    w[site.count + 1] = site.orig_count2;
-    w[site.bx] = site.orig_bx;
+    w[kLinkSiteCount] = site.orig_count;
+    w[kLinkSiteBx] = site.orig_bx;
     site.patched = false;
 }
 
 void SyncSite(const Block::LinkSite& site) {
-    sceKernelSyncVMDomain(g_code_block, site.word0, (static_cast<u32>(site.bx) + 1) * 4);
+    sceKernelSyncVMDomain(g_code_block, site.word0, (kLinkSiteBx + 1) * 4);
 }
 
 /// Publica la entrada del bloque y parchea los enlaces que esperan por el.
@@ -4290,21 +4306,12 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
         }
         code = reinterpret_cast<BlockFn>(out.entry);
         for (const Compiler::PendingSite& pending : sites) {
-            // Los enlaces van en el cuerpo, en la zona caliente; uno en la fria
-            // no se parchea (seguiria mirando la entrada, como sin parche).
-            if (((pending.word0 | pending.bx) & 0x80000000u) != 0) {
-                continue;
-            }
             Block& target = *BlockOfLink(pending.target);
             Block::LinkSite site;
-            site.word0 = start + pending.word0;
-            site.ldrd = static_cast<u8>(pending.ldrd - pending.word0);
-            site.count = static_cast<u8>(pending.count - pending.word0);
-            site.bx = static_cast<u8>(pending.bx - pending.word0);
+            site.word0 = pending.word0;
             site.orig0 = site.word0[0];
-            site.orig_count = site.word0[site.count];
-            site.orig_count2 = site.word0[site.count + 1];
-            site.orig_bx = site.word0[site.bx];
+            site.orig_count = site.word0[kLinkSiteCount];
+            site.orig_bx = site.word0[kLinkSiteBx];
             // Ya publicado: parcheado desde ya (lo sincroniza el Sync de abajo).
             if (target.link.entry != 0 && direct_link_patch.load(std::memory_order_relaxed) != 0) {
                 PatchSite(site, target);

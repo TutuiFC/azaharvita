@@ -125,6 +125,23 @@ std::size_t g_compile_bytes = 0;
 std::size_t g_compile_budget = static_cast<std::size_t>(-1);
 bool g_compile_over_budget = false;
 
+/**
+ * MEMORIA A CERO Y LIBERACION DIFERIDA (0.2.3.7). Las caidas del compilador
+ * con volcado, todas, de 0.2.0.x a 0.2.3.5 (los 17 que hay en ux0:data), son
+ * en el MISMO sitio: SceShaccCg+0x65ea8, "ldr r0, [r0, #4]" de una funcion
+ * que lee el tipo de un nodo, llamada justo despues de un "si el nodo no es
+ * NULL" (SceShaccCg+0x7dc26). El nodo vale 0x18, 1 o 0x72646461 ("addr",
+ * texto de un shader): un campo que nunca se escribio, o un bloque ya
+ * liberado y reutilizado. Con el reservador de Sony en un proceso recien
+ * arrancado esa memoria sale de paginas nuevas, a cero, y el campo vale NULL;
+ * con el heap del emulador, lleno de restos, vale basura. Por eso cada bloque
+ * sale a cero, y lo liberado espera en una cola (hasta kQuarantineBytes)
+ * antes de volver al heap, para que un acceso tardio lea lo que habia.
+ */
+constexpr std::size_t kQuarantineBytes = 8u * 1024u * 1024u;
+std::deque<std::pair<void*, std::size_t>> g_quarantine;
+std::size_t g_quarantine_bytes = 0;
+
 void* CgAlloc(unsigned int size) {
     /**
      * Sin NULL por presupuesto (0.2.0.8). libshacccg no comprueba lo que le
@@ -143,10 +160,12 @@ void* CgAlloc(unsigned int size) {
      * memoria invalido dentro de libshacccg con la pila pasando por CgAlloc),
      * lo que encaja con accesos NEON de 16 bytes que exigen esa alineacion.
      */
-    void* pointer = memalign(16, (size + 15u) & ~15u);
+    const std::size_t rounded = (size + 15u) & ~15u;
+    void* pointer = memalign(16, rounded);
     if (pointer == nullptr) {
         return nullptr;
     }
+    std::memset(pointer, 0, rounded);
     try {
         g_compile_allocs.insert(pointer);
     } catch (...) {
@@ -169,14 +188,26 @@ void CgFree(void* pointer) {
     if (pointer == nullptr) {
         return;
     }
+    const std::size_t size = malloc_usable_size(pointer);
     if (g_compile_allocs.erase(pointer) != 0) {
-        const std::size_t size = malloc_usable_size(pointer);
         g_live_bytes = g_live_bytes > size ? g_live_bytes - size : 0;
         if (g_tracking) {
             g_compile_bytes = g_compile_bytes > size ? g_compile_bytes - size : 0;
         }
     }
-    std::free(pointer);
+    try {
+        g_quarantine.emplace_back(pointer, size);
+    } catch (...) {
+        std::free(pointer);
+        return;
+    }
+    g_quarantine_bytes += size;
+    while (g_quarantine_bytes > kQuarantineBytes) {
+        const auto oldest = g_quarantine.front();
+        g_quarantine.pop_front();
+        g_quarantine_bytes -= oldest.second;
+        std::free(oldest.first);
+    }
 }
 
 /**
