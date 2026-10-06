@@ -384,6 +384,41 @@ void EmitVfpBank(Emitter& e, u32 base, bool load) {
     e.Emit((load ? 0xEC900B20u : 0xEC800B20u) | (base << 16));
 }
 
+/**
+ * EL FPSCR DEL JUEGO, TAMBIEN FIJO (0.3.0.2). Con los VFP fijos, el FPSCR de
+ * la Vita es el del juego durante toda la cadena: se pone al entrar desde C++
+ * y se guarda (y vuelve el del emulador, que se apunta aqui al entrar) al
+ * volver y alrededor de cada llamada a C. Hasta ahora cada racha de
+ * aritmetica VFP hacia dos VMRS y dos VMSR, y en el Cortex-A9 cada acceso al
+ * FPSCR espera a que el VFP vacie su tuberia: en el codigo de vectores del 3D
+ * (rachas de tres a seis operaciones entre cargas) costaba tanto como las
+ * propias cuentas. El codigo entero no mira el FPSCR, asi que da igual cual
+ * tenga mientras corre.
+ */
+u32 g_host_fpscr = 0;
+
+u32 FpscrOffset() {
+    return g_offsets.vfp + VFP_FPSCR * 4;
+}
+
+/// Al entrar: apunta el FPSCR del emulador y pone el del juego (con t0 y t1).
+void EmitGuestFpscrIn(Emitter& e, u32 t0, u32 t1) {
+    e.Emit(0xEEF10A10u | (t0 << 12)); // VMRS t0, FPSCR
+    e.Mov32(t1, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_host_fpscr)));
+    e.StrImm(t0, t1, 0);
+    e.LdrImm(t0, kCpu, FpscrOffset());
+    e.Emit(0xEEE10A10u | (t0 << 12)); // VMSR FPSCR, t0
+}
+
+/// Al salir: guarda el del juego y repone el del emulador (con un registro).
+void EmitGuestFpscrOut(Emitter& e, u32 t) {
+    e.Emit(0xEEF10A10u | (t << 12)); // VMRS t, FPSCR
+    e.StrImm(t, kCpu, FpscrOffset());
+    e.Mov32(t, static_cast<u32>(reinterpret_cast<uintptr_t>(&g_host_fpscr)));
+    e.LdrImm(t, t, 0);
+    e.Emit(0xEEE10A10u | (t << 12)); // VMSR FPSCR, t
+}
+
 /// Flags del juego -> APSR, con r0-r3.
 void EmitLoadFlags(Emitter& e) {
     e.LdrImm(R0, kCpu, g_offsets.n);
@@ -1265,6 +1300,7 @@ bool Init(ARMul_State* cpu) {
             if (vfp) {
                 EmitExtBase(e, 14);
                 EmitVfpBank(e, 14, true);
+                EmitGuestFpscrIn(e, kT0, kT1);
             }
             e.Emit(0xE12FFF10u | kRd); // BX kRd
             // Salida: lr ya lo vuelco el bloque (o es suyo, sin cachear).
@@ -1277,6 +1313,7 @@ bool Init(ARMul_State* cpu) {
             if (vfp) {
                 EmitExtBase(e, 14);
                 EmitVfpBank(e, 14, false);
+                EmitGuestFpscrOut(e, kT0);
             }
             EmitExitTail(e, vfp);
         }
@@ -2196,6 +2233,7 @@ private:
         if (vfp_regs_) {
             EmitExtBase(e, kRs);
             EmitVfpBank(e, kRs, false);
+            EmitGuestFpscrOut(e, kRs);
         }
     }
 
@@ -2205,6 +2243,8 @@ private:
         if (vfp_regs_) {
             EmitExtBase(e, kRs);
             EmitVfpBank(e, kRs, true);
+            e.LdrImm(kRs, kCpu, FpscrOffset());
+            e.Emit(0xEEE10A10u | (kRs << 12)); // VMSR FPSCR, kRs (el del juego)
         }
         if (!cache_dirty) {
             return;
@@ -2933,13 +2973,15 @@ public:
         if (keep_flags) {
             e.MsrFlags(kT0);
         }
-        // kT1 = &ExtReg[0] (con los VFP fijos, los operandos ya estan).
+        // Con los VFP fijos el FPSCR del juego ya esta puesto (ver EL FPSCR
+        // DEL JUEGO, TAMBIEN FIJO) y los operandos en sus registros.
         if (!vfp_regs_) {
+            // kT1 = &ExtReg[0]
             e.Mov32(kT1, g_offsets.ext);
             e.AddReg(kT1, kCpu, kT1);
+            e.Emit(0xEEF10A10u | (kRn << 12)); // VMRS kRn, FPSCR (el del emulador)
+            e.Emit(0xEEE10A10u | (kRd << 12)); // VMSR FPSCR, kRd (el del juego)
         }
-        e.Emit(0xEEF10A10u | (kRn << 12)); // VMRS kRn, FPSCR (el del emulador)
-        e.Emit(0xEEE10A10u | (kRd << 12)); // VMSR FPSCR, kRd (el del juego)
         for (u32 k = 0; k < count; k++) {
             const u32 cond = insts[k] >> 28;
             const bool conditional = conditions && cond != kAlways;
@@ -2949,9 +2991,11 @@ public:
                 e.PatchBranch(skip, e.Position());
             }
         }
-        e.Emit(0xEEF10A10u | (kRd << 12)); // VMRS kRd, FPSCR (el del juego, con flags)
-        e.StrImm(kRd, kCpu, fpscr_offset);
-        e.Emit(0xEEE10A10u | (kRn << 12)); // VMSR FPSCR, kRn (vuelve el del emulador)
+        if (!vfp_regs_) {
+            e.Emit(0xEEF10A10u | (kRd << 12)); // VMRS kRd, FPSCR (el del juego, con flags)
+            e.StrImm(kRd, kCpu, fpscr_offset);
+            e.Emit(0xEEE10A10u | (kRn << 12)); // VMSR FPSCR, kRn (vuelve el del emulador)
+        }
         const u32 back = e.Position();
         // kT0 es de los que la llamada conserva; los flags se reponen despues
         // de cada una para la condicion de la siguiente.
@@ -3072,6 +3116,17 @@ private:
     void VfpMrs(u32 inst) {
         const u32 rt = Bits(inst, 12, 15);
         const u32 fpscr_offset = g_offsets.vfp + VFP_FPSCR * 4;
+        if (vfp_regs_) {
+            // El FPSCR del juego es el de la Vita (ver EL FPSCR DEL JUEGO,
+            // TAMBIEN FIJO): se lee de ahi, no de memoria.
+            if (rt == 15) {
+                e.Emit(0xEEF1FA10u); // VMRS APSR_nzcv, FPSCR
+            } else {
+                e.Emit(0xEEF10A10u | (kRd << 12)); // VMRS kRd, FPSCR
+                StoreGuest(kRd, rt);
+            }
+            return;
+        }
         if (rt == 15) {
             e.LdrImm(kT0, kCpu, fpscr_offset);
             // AND kT0, kT0, #0xF0000000 (0xF0 rotado 8: rot = 4)
