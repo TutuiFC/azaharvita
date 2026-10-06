@@ -127,6 +127,12 @@ extern std::atomic<u32> direct_link_patch;
 /// al decodificar cada bloque; al cambiarlo se vacia la cache de bloques.
 extern std::atomic<u32> superblocks;
 
+/// Registros fijos (0.3.0.0): r0-r3 del juego en r0-r3 del anfitrion durante
+/// las cadenas de bloques (ver REGISTROS FIJOS). 0 = la cache de cada bloque,
+/// como antes. Solo con la cache de registros encendida; al cambiarlo se
+/// vacia la cache de bloques.
+extern std::atomic<u32> global_regs;
+
 /**
  * Aritmetica VFP en el hardware de la Vita (0.1.7.0), con el FPSCR del juego
  * cargado durante cada instruccion. 0 = por las funciones del interprete

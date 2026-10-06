@@ -41,6 +41,7 @@ std::atomic<u32> vfp_data{1};
 std::atomic<u32> direct_link{1};
 std::atomic<u32> direct_link_patch{1};
 std::atomic<u32> superblocks{1};
+std::atomic<u32> global_regs{1};
 std::atomic<u32> vfp_native{1};
 std::atomic<u32> thumb{1};
 
@@ -942,6 +943,8 @@ struct Block {
     std::array<s8, 16> cache_map{
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     bool uses_cache = false;
+    /// r0-r3 del juego fijos en r0-r3 del anfitrion (ver REGISTROS FIJOS).
+    bool global_regs = false;
     /**
      * ENLACES PARCHEADOS (0.2.2.9). Los enlaces directos de otros bloques que
      * apuntan a este: con la entrada publicada se reescriben para saltar
@@ -986,6 +989,9 @@ u32 g_cold_used_words = 0;
 constexpr u32 kSharedWords = 64;
 u32* g_shared_enter = nullptr;
 u32* g_shared_exit = nullptr;
+/// Las mismas con r0-r3 del juego cargados al entrar y guardados al salir.
+u32* g_shared_enter_regs = nullptr;
+u32* g_shared_exit_regs = nullptr;
 u32 g_code_flushes = 0;
 
 /**
@@ -1191,12 +1197,13 @@ bool Init(ARMul_State* cpu) {
     g_code = static_cast<u32*>(base_address);
     g_code_used_words = 0;
     {
-        // Sin prologos ni epilogos (0.2.3.8) la fria ocupa unas seis decimas
-        // de la caliente (crash.txt de 0.2.3.7 menos lo que ya no va): tres
-        // quintos para la caliente.
+        // En 0.2.3.9 la fria se lleno antes (caliente 5064 KB, fria 4054 KB:
+        // ocho decimas de la caliente, con los saltos laterales enteros alli).
+        // Desde 0.3.0.0 la caliente adelgaza un poco mas (registros fijos) y
+        // la fria tambien (una salida por enlace): 55 % para la caliente.
         const u32 total_words = g_code_bytes / 4;
         g_check_start_words = total_words - total_words / 10;
-        g_cold_start_words = g_check_start_words / 5 * 3;
+        g_cold_start_words = g_check_start_words / 20 * 11;
         g_cold_used_words = kSharedWords;
         g_check_used_words = 0;
     }
@@ -1213,10 +1220,25 @@ bool Init(ARMul_State* cpu) {
         e.MovReg(kRd, R2);
         EmitLoadFlags(e);
         e.Emit(0xE12FFF10u | kRd); // BX kRd
+        const u32 enter_regs_at = e.Position();
+        EmitEnterHead(e);
+        e.MovReg(kRd, R2);
+        EmitLoadFlags(e);
+        for (u32 g = 0; g < 4; g++) {
+            e.LdrImm(g, kCpu, RegOffset(g));
+        }
+        e.Emit(0xE12FFF10u | kRd); // BX kRd
+        // La salida con r0-r3 los guarda y sigue por la de siempre.
+        const u32 exit_regs_at = e.Position();
+        for (u32 g = 0; g < 4; g++) {
+            e.StrImm(g, kCpu, RegOffset(g));
+        }
         const u32 exit_at = e.Position();
         EmitExitTail(e);
         g_shared_enter = shared;
         g_shared_exit = shared + exit_at;
+        g_shared_enter_regs = shared + enter_regs_at;
+        g_shared_exit_regs = shared + exit_regs_at;
         sceKernelSyncVMDomain(g_code_block, shared, kSharedWords * 4);
         sceKernelCloseVMDomain();
         if (e.Overflowed()) {
@@ -1690,9 +1712,36 @@ public:
         return e.Position();
     }
 
+    /**
+     * REGISTROS FIJOS (0.3.0.0). r0-r3 del juego viven en r0-r3 del
+     * anfitrion durante toda una cadena de bloques: no se cargan al entrar en
+     * cada bloque ni se guardan en cada enlace, solo al entrar desde C++
+     * (g_shared_enter_regs), al volver (g_shared_exit_regs) y alrededor de
+     * cada llamada a C (FlushForCall/ReloadCachedRegs). En la muestra de
+     * bloques de Pokemon Sol (jit_volcado.bin de 0.2.3.9) el 24 % del codigo
+     * caliente eran LDR/STR del estado de la CPU, y los de r0 y r1 los que
+     * mas: la carga de la cache al entrar en cada bloque y su vuelco en cada
+     * salida. r0-r3 son el 63 % de los accesos a registros del juego. El
+     * quinto hueco (lr) sigue siendo de cada bloque, como antes. Solo la
+     * variante normal: la de comprobacion entra y sale por C++ y se queda como
+     * estaba.
+     */
+    void SetGlobalRegs(bool global) {
+        global_regs_ = global;
+    }
+
     /// Primeras instrucciones del cuerpo: cache de registros (4.3).
     void BodyEnter() {
-        LoadCachedRegs();
+        if (!global_regs_) {
+            LoadCachedRegs();
+            return;
+        }
+        for (u32 g = 4; g < 16; g++) {
+            const s8 host = cache_map[g];
+            if (host >= 0) {
+                e.LdrImm(static_cast<u32>(host), kCpu, RegOffset(g));
+            }
+        }
     }
 
     void Epilogue() {
@@ -1776,7 +1825,7 @@ public:
         }
         // CLREX tambien lleva 0xF ahi: siempre se ejecuta.
         if (decoded.kind == Kind::Clrex) {
-            FlushCachedRegs();
+            FlushForCall();
             e.Mrs(kFlags);
             e.MovReg(kT0, kFlags);
             e.MovReg(R0, kCpu);
@@ -2023,6 +2072,7 @@ private:
     u32 exit_noflush = 0;
     const u32* shared_exit_ = nullptr;
     u32* profile_counter_ = nullptr;
+    bool global_regs_ = false;
 
     void DeferCold(std::vector<u32> branches, std::function<void()> body) {
         DeferCold(std::move(branches), cache_written, std::move(body));
@@ -2061,12 +2111,27 @@ private:
         if (!cache_dirty) {
             return;
         }
-        for (u32 g = 0; g < 16; g++) {
+        // Con los registros fijos, r0-r3 siguen en sus huecos al enlazar y los
+        // guarda g_shared_exit_regs al volver a C++.
+        for (u32 g = global_regs_ ? 4u : 0u; g < 16; g++) {
             const s8 host = cache_map[g];
             if (host >= 0 && cache_written[g]) {
                 e.StrImm(static_cast<u32>(host), kCpu, RegOffset(g));
             }
         }
+    }
+
+    /// El vuelco antes de una llamada a C: con los registros fijos, r0-r3
+    /// siempre (pueden venir escritos de otro bloque).
+    void FlushForCall() {
+        if (!global_regs_) {
+            FlushCachedRegs();
+            return;
+        }
+        for (u32 g = 0; g < 4; g++) {
+            e.StrImm(g, kCpu, RegOffset(g));
+        }
+        FlushCachedRegs();
     }
 
     /// Recarga r0-r2 despues de un helper que pudo escribir cpu->Reg (LDM...).
@@ -2246,7 +2311,7 @@ private:
         }
         e.Mrs(kFlags);
         SaveAccessOperands(address, store, data);
-        FlushCachedRegs();
+        FlushForCall();
         e.MovReg(kT0, kFlags);
         e.MovReg(R0, kT1);
         if (store) {
@@ -2540,7 +2605,7 @@ private:
         if (!load) {
             LoadGuest(kRm, Bits(inst, 0, 3), pc);
         }
-        FlushCachedRegs();
+        FlushForCall();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
         if (check_mode) {
@@ -2595,7 +2660,7 @@ private:
             }
             return;
         }
-        FlushCachedRegs();
+        FlushForCall();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
         if (read) {
@@ -2795,7 +2860,7 @@ public:
                 const u32 cond = inst >> 28;
                 const bool conditional = conditions && cond != kAlways;
                 const u32 skip = conditional ? e.BranchPlaceholder(cond ^ 1u) : 0;
-                FlushCachedRegs();
+                FlushForCall();
                 e.MovReg(R0, kCpu);
                 e.Mov32(R1, inst);
                 e.Call(reinterpret_cast<const void*>(&HelperVfpCdp));
@@ -2879,7 +2944,7 @@ private:
 
     /// La aritmetica VFP por la funcion del interprete (lo de 0.1.6.1).
     void VfpCdpHelper(u32 inst) {
-        FlushCachedRegs();
+        FlushForCall();
         e.Mrs(kT0);
         e.MovReg(R0, kCpu);
         e.Mov32(R1, inst);
@@ -2923,7 +2988,7 @@ private:
             VfpTransferFast(inst, pc, index);
             return;
         }
-        FlushCachedRegs();
+        FlushForCall();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
         e.Mov32(R0, pc);
@@ -3025,7 +3090,7 @@ private:
             e.MsrFlags(kFlags);
         }
         DeferCold(std::move(slow), written_before, [this, inst, pc, index, keep_flags, back] {
-            FlushCachedRegs();
+            FlushForCall();
             if (keep_flags) {
                 e.MovReg(kT0, kFlags);
             }
@@ -3051,7 +3116,7 @@ private:
             BlockTransferFast(inst, pc);
             return;
         }
-        FlushCachedRegs();
+        FlushForCall();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
         e.Mov32(R0, pc);
@@ -3155,7 +3220,7 @@ private:
             e.MsrFlags(kFlags);
         }
         DeferCold(std::move(slow), written_before, [this, inst, pc, keep_flags, back] {
-            FlushCachedRegs();
+            FlushForCall();
             if (keep_flags) {
                 e.MovReg(kT0, kFlags);
             }
@@ -3230,16 +3295,20 @@ private:
      * instrucciones seguidas:
      *
      *   w0  B prueba                 (parche: LDRD kRn, kRm, presupuesto y enlaces)
-     *   w1  SUB kRn, kRn, r2         (parche: SUB kRn, kRn, #cuenta)
+     *   w1  SUB kRn, kRn, kT1        (parche: SUB kRn, kRn, #cuenta)
      *   w2  MOV kT1, kRn, ASR #31    0 o -1
      *   w3  ADD pc, pc, kT1, LSL #2  -1: a w4; 0: a w5
      *   w4  B fallo
      *   w5  ADD kRm, kRm, #1 / w6 STRD
-     *   w7  BX r1                    (parche: B entrada)
+     *   w7  BX kRd                   (parche: B entrada)
      *
-     *   prueba: MRS kT0; MOVW/MOVT r0, LinkInfo del destino; LDR r1, entrada;
-     *   CMP r1, #0; BEQ fallo (reponiendo los flags); MSR kT0; LDRD kRn, kRm;
-     *   LDR r2, cuenta; B w1
+     *   prueba: MRS kT0; MOVW/MOVT kRs, LinkInfo del destino; LDR kRd, entrada;
+     *   CMP kRd, #0; BEQ fallo (reponiendo los flags); MSR kT0; LDRD kRn, kRm;
+     *   LDR kT1, cuenta; B w1
+     *
+     * Sin r0-r3 desde 0.3.0.0: con los registros fijos son del juego. Y el
+     * fallo por presupuesto salta a la cola del de la entrada (una salida en
+     * la zona fria por enlace, no dos).
      */
     void EmitDirectLink(const LinkInfo* target, u32 target_pc) {
         FlushCachedRegs();
@@ -3248,34 +3317,31 @@ private:
         site.word0 = e.Address(e.Position());
         const u32 to_check = e.BranchPlaceholder(kAlways);
         const u32 checked = e.Position();
-        e.Emit(0xE0400000u | (kRn << 16) | (kRn << 12) | R2);            // SUB kRn, kRn, r2
+        e.Emit(0xE0400000u | (kRn << 16) | (kRn << 12) | kT1);           // SUB kRn, kRn, kT1
         e.Emit(0xE1A00000u | (kT1 << 12) | (31u << 7) | (2u << 5) | kRn); // MOV kT1, kRn, ASR #31
         e.Emit(0xE08FF000u | (2u << 7) | kT1);                           // ADD pc, pc, kT1, LSL #2
         const u32 no_budget = e.BranchPlaceholder(kAlways);
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
         e.StrdImm(kRn, kCpu, g_offsets.link);
-        e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
+        e.Emit(0xE12FFF10u | kRd); // BX kRd -> entrada del destino
         link_sites.push_back(site);
         const u32 ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(target));
-        DeferCold({to_check}, [this, ptr, checked, target_pc] {
+        DeferCold({to_check}, [this, ptr, checked, target_pc, no_budget] {
             e.Mrs(kT0);
-            e.Emit(0xE3000000u | ((ptr & 0xF000u) << 4) | (R0 << 12) | (ptr & 0x0FFFu));
-            e.Emit(0xE3400000u | (((ptr >> 16) & 0xF000u) << 4) | (R0 << 12) |
+            e.Emit(0xE3000000u | ((ptr & 0xF000u) << 4) | (kRs << 12) | (ptr & 0x0FFFu));
+            e.Emit(0xE3400000u | (((ptr >> 16) & 0xF000u) << 4) | (kRs << 12) |
                    ((ptr >> 16) & 0x0FFFu));
-            e.LdrImm(R1, R0, kLinkEntry);
-            e.CmpImm0(R1);
+            e.LdrImm(kRd, kRs, kLinkEntry);
+            e.CmpImm0(kRd);
             const u32 no_entry = e.BranchPlaceholder(kCondEq);
             e.MsrFlags(kT0);
             e.LdrdImm(kRn, kCpu, g_offsets.link);
-            e.LdrImm(R2, R0, kLinkCount);
+            e.LdrImm(kT1, kRs, kLinkCount);
             e.BranchTo(kAlways, checked);
             e.PatchBranch(no_entry, e.Position());
             e.MsrFlags(kT0);
-            e.Mov32(kRd, target_pc);
-            e.StrImm(kRd, kCpu, RegOffset(15));
-            BranchExitNoFlush();
-        });
-        DeferCold({no_budget}, [this, target_pc] {
+            // Aqui llega tambien el que se queda sin presupuesto (flags intactos).
+            e.PatchBranch(no_budget, e.Position());
             e.Mov32(kRd, target_pc);
             e.StrImm(kRd, kCpu, RegOffset(15));
             BranchExitNoFlush();
@@ -3310,46 +3376,48 @@ private:
          * "pop {pc}" de vuelta a codigo Thumb, que acababan en el despacho):
          * clave = pc | TFlag, como TryRun.
          */
-        e.LdrImm(R1, kCpu, RegOffset(15));
-        e.LdrImm(R2, kCpu, g_offsets.t);
-        e.Emit(0xE3100001u | (R1 << 16)); // TST r1, #1
+        // Sin r0-r3 (0.3.0.0, ver REGISTROS FIJOS): kRs = clave, kRd y kT1
+        // temporales.
+        e.LdrImm(kRs, kCpu, RegOffset(15));
+        e.LdrImm(kRd, kCpu, g_offsets.t);
+        e.Emit(0xE3100001u | (kRs << 16)); // TST kRs, #1
         fails.push_back(e.BranchPlaceholder(kCondNe));
-        // El bit 1 solo cuenta en ARM: r3 = TFlag ^ 1, y TST r1, r3, LSL #1.
-        e.Emit(0xE2200001u | (R2 << 16) | (R3 << 12)); // EOR r3, r2, #1
-        e.Emit(0xE1100080u | (R1 << 16) | R3);         // TST r1, r3, LSL #1
+        // El bit 1 solo cuenta en ARM: kT1 = TFlag ^ 1, y TST kRs, kT1, LSL #1.
+        e.Emit(0xE2200001u | (kRd << 16) | (kT1 << 12)); // EOR kT1, kRd, #1
+        e.Emit(0xE1100080u | (kRs << 16) | kT1);         // TST kRs, kT1, LSL #1
         fails.push_back(e.BranchPlaceholder(kCondNe));
-        e.Emit(0xE1800000u | (R1 << 16) | (R1 << 12) | R2); // ORR r1, r1, r2
-        // r3 = &g_fast[(clave >> 1) & (kFastSlots - 1)]
-        e.Ubfx(R2, R1, 1, kFastSlotBits);
-        e.Mov32(R3, static_cast<u32>(reinterpret_cast<uintptr_t>(g_fast.data())));
-        e.Emit(0xE0800000u | (R3 << 16) | (R3 << 12) | (3u << 7) | R2); // ADD r3, r3, r2, LSL #3
-        e.LdrImm(R2, R3, 0);                                           // slot.pc
-        e.Emit(0xE1500000u | (R2 << 16) | R1);                         // CMP r2, r1
+        e.Emit(0xE1800000u | (kRs << 16) | (kRs << 12) | kRd); // ORR kRs, kRs, kRd
+        // kT1 = &g_fast[(clave >> 1) & (kFastSlots - 1)]
+        e.Ubfx(kRd, kRs, 1, kFastSlotBits);
+        e.Mov32(kT1, static_cast<u32>(reinterpret_cast<uintptr_t>(g_fast.data())));
+        e.Emit(0xE0800000u | (kT1 << 16) | (kT1 << 12) | (3u << 7) | kRd); // ADD kT1, kT1, kRd, LSL #3
+        e.LdrImm(kRd, kT1, 0);                                            // slot.pc
+        e.Emit(0xE1500000u | (kRd << 16) | kRs);                          // CMP kRd, kRs
         fails.push_back(e.BranchPlaceholder(kCondNe));
-        e.LdrImm(R0, R3, 4); // slot.block
+        e.LdrImm(kRs, kT1, 4); // slot.block
         if (g_link_in_block != 0) {
-            e.Mov32(R2, g_link_in_block);
-            e.AddReg(R0, R0, R2);
+            e.Mov32(kRd, g_link_in_block);
+            e.AddReg(kRs, kRs, kRd);
         }
         /**
-         * r0 = LinkInfo* del destino. Enlazable? (0.1.8.1) entry ya implica que
-         * el bloque ha pasado sus kFullChecks comprobaciones (TryRun no lo
+         * kRs = LinkInfo* del destino. Enlazable? (0.1.8.1) entry ya implica
+         * que el bloque ha pasado sus kFullChecks comprobaciones (TryRun no lo
          * publica antes, ver PublishLinkEntry), asi que aqui no se mira ni se
          * incrementa 'runs'. Las comprobaciones por muestreo siguen en las
          * entradas por TryRun.
          */
-        e.LdrImm(R1, R0, kLinkEntry);
-        e.CmpImm0(R1);
+        e.LdrImm(kRd, kRs, kLinkEntry);
+        e.CmpImm0(kRd);
         fails.push_back(e.BranchPlaceholder(kCondEq));
         // Presupuesto y enlaces de una vez: LDRD kRn (budget), kRm (hops).
         e.LdrdImm(kRn, kCpu, g_offsets.link);
-        e.LdrImm(R2, R0, kLinkCount);
-        e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | R2); // SUBS kRn, kRn, r2
+        e.LdrImm(kT1, kRs, kLinkCount);
+        e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | kT1); // SUBS kRn, kRn, kT1
         fails.push_back(e.BranchPlaceholder(kCondLo));
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
         e.StrdImm(kRn, kCpu, g_offsets.link);
         e.MsrFlags(kT0);
-        e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
+        e.Emit(0xE12FFF10u | kRd); // BX kRd -> entrada del destino
         DeferCold(std::move(fails), [this] {
             e.MsrFlags(kT0);
             BranchExitNoFlush();
@@ -3878,6 +3946,7 @@ bool Analyze(ARMul_State* cpu, Block& block) {
     block.targets.clear();
     block.cache_map.fill(-1);
     block.uses_cache = false;
+    block.global_regs = false;
     if (!(block.thumb ? DecodeThumbBlock(cpu, block) : DecodeArmBlock(cpu, block))) {
         return false;
     }
@@ -3989,7 +4058,16 @@ bool Analyze(ARMul_State* cpu, Block& block) {
         }
     }
     u32 placed = 0;
-    for (u32 pass = 0; pass < kCacheHosts.size(); pass++) {
+    // REGISTROS FIJOS (0.3.0.0): r0-r3 en r0-r3 en todos los bloques; el lr,
+    // para el mas usado del resto.
+    block.global_regs = global_regs.load(std::memory_order_relaxed) != 0;
+    if (block.global_regs) {
+        for (u32 g = 0; g < 4; g++) {
+            block.cache_map[g] = static_cast<s8>(kCacheHosts[g]);
+        }
+        placed = 4;
+    }
+    for (u32 pass = placed; pass < kCacheHosts.size(); pass++) {
         u32 best = 16;
         u32 best_count = 1; // al menos dos usos: uno solo no compensa
         for (u32 g = 0; g < 15; g++) {
@@ -4142,8 +4220,10 @@ bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* c
     // prologo.
     u32 entry_index = 0;
     u32 chain_entry = 0;
+    const bool global = block.global_regs && !check_mode;
+    compiler.SetGlobalRegs(global);
     if (e.HasColdZone()) {
-        compiler.SetSharedExit(g_shared_exit);
+        compiler.SetSharedExit(global ? g_shared_exit_regs : g_shared_exit);
         chain_entry = compiler.ChainEntryPosition();
         entry_index = chain_entry;
         if (g_profile_active) {
@@ -4700,7 +4780,8 @@ u64 RunCompiled(ARMul_State* cpu, Block& block, u8* const* pages, u64 chain_budg
     g_link_refund = 0;
     // block.code es el cuerpo (0.2.3.8): se entra por g_shared_enter.
     using EnterFn = void (*)(ARMul_State*, u8* const*, BlockFn);
-    reinterpret_cast<EnterFn>(g_shared_enter)(cpu, pages, block.code);
+    reinterpret_cast<EnterFn>(block.global_regs ? g_shared_enter_regs : g_shared_enter)(
+        cpu, pages, block.code);
     const u32 hops = cpu->jit_link_hops;
     const u64 linked = budget - cpu->jit_link_budget - g_link_withdrawn;
     const u64 executed = block.link.count + linked - g_link_refund;
