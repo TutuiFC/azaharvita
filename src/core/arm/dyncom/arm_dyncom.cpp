@@ -154,9 +154,11 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
     state->NumInstrsToExecute = num_instructions;
 #ifdef __PSVITA__
     const unsigned long long slice_begin = Common::VitaMicros();
+    Core::ArmJit::PmuSliceBegin();
 #endif
     const u32 ticks_executed = InterpreterMainLoop(state.get());
 #ifdef __PSVITA__
+    Core::ArmJit::PmuSliceEnd(ticks_executed);
     // El tiempo real de la rodaja (JIT + interprete), para separar dentro de
     // 'cpu' lo que es el ARM de verdad de lo demas (servicios, sonido,
     // temporizadores). Las instrucciones las cuenta el propio JIT al final de

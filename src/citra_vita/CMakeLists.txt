@@ -33,6 +33,9 @@ target_link_libraries(azahar PRIVATE
     SceKernelModulemgr_stub
     SceShaccCg_stub
     SceSysmodule_stub
+    # Los contadores del procesador (arm pmu en crash.txt): libperf se carga
+    # con sceSysmoduleLoadModule. Ver PmuSliceBegin en arm_dyncom_jit.cpp.
+    ScePerf_stub
     SceCtrl_stub
     SceTouch_stub
     SceAudio_stub

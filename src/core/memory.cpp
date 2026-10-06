@@ -46,11 +46,41 @@ namespace Memory {
 
 void PageTable::Clear() {
     pointers.raw.fill(nullptr);
-#ifndef __PSVITA__
+#ifdef __PSVITA__
+    if (pointers.jit) {
+        for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
+            pointers.jit[i] = JitTableEntry(nullptr, i);
+        }
+    }
+#else
     pointers.refs.fill(MemoryRef());
 #endif
     attributes.fill(PageType::Unmapped);
 }
+
+#ifdef __PSVITA__
+namespace {
+// Una pagina y un poco: un acceso desalineado al final de la pagina se pasa
+// unos bytes.
+alignas(16) u8 g_jit_fill_page[CITRA_PAGE_SIZE + 16];
+} // Anonymous namespace
+
+u32 JitTableEntry(const u8* pointer, std::size_t page) {
+    const u8* const target = pointer != nullptr ? pointer : g_jit_fill_page;
+    return static_cast<u32>(reinterpret_cast<uintptr_t>(target)) -
+           (static_cast<u32>(page) << CITRA_PAGE_BITS);
+}
+
+const u32* PageTable::JitTable() {
+    if (!pointers.jit) {
+        pointers.jit = std::make_unique<u32[]>(PAGE_TABLE_NUM_ENTRIES);
+        for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
+            pointers.jit[i] = JitTableEntry(pointers.raw[i], i);
+        }
+    }
+    return pointers.jit.get();
+}
+#endif
 
 class RasterizerCacheMarker {
 public:

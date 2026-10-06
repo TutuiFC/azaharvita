@@ -4072,9 +4072,11 @@ SWI_INST: {
         static unsigned int svc_tick = 0;
         const bool svc_timed = (++svc_tick & 7u) == 0;
         const unsigned long long svc_begin = svc_timed ? Common::VitaMicros() : 0;
+        Core::ArmJit::PmuSvcBegin();
 #endif
         Kernel::SVCContext{cpu->system}.CallSVC(inst_cream->num & 0xFFFF);
 #ifdef __PSVITA__
+        Core::ArmJit::PmuSvcEnd();
         if (svc_timed) {
             Core::ArmJit::AddSvcTime((Common::VitaMicros() - svc_begin) * 8);
         }

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string>
 #include <boost/serialization/array.hpp>
@@ -27,6 +28,11 @@ class DspInterface;
 }
 
 namespace Memory {
+
+#ifdef __PSVITA__
+/// La pagina de relleno de la tabla del JIT (ver PageTable::JitTable).
+u32 JitTableEntry(const u8* pointer, std::size_t page);
+#endif
 
 /**
  * Page size used by the ARM architecture. This is the smallest granularity with which memory can
@@ -80,7 +86,11 @@ struct PageTable {
 
             Entry& operator=(MemoryRef value) {
                 pointers.raw[idx] = value.GetPtr();
-#ifndef __PSVITA__
+#ifdef __PSVITA__
+                if (pointers.jit) {
+                    pointers.jit[idx] = JitTableEntry(pointers.raw[idx], idx);
+                }
+#else
                 pointers.refs[idx] = std::move(value);
 #endif
                 return *this;
@@ -107,7 +117,9 @@ struct PageTable {
 
     private:
         std::array<u8*, PAGE_TABLE_NUM_ENTRIES> raw;
-#ifndef __PSVITA__
+#ifdef __PSVITA__
+        std::unique_ptr<u32[]> jit;
+#else
         std::array<MemoryRef, PAGE_TABLE_NUM_ENTRIES> refs;
 #endif
         friend struct PageTable;
@@ -126,6 +138,23 @@ struct PageTable {
     u8* const* RawPointers() const {
         return pointers.raw.data();
     }
+
+#ifdef __PSVITA__
+    /**
+     * LA TABLA DEL JIT (0.2.3.6). Una entrada por pagina, como 'raw', pero con
+     * el puntero de la pagina MENOS su direccion: el codigo generado suma la
+     * entrada y la direccion del juego y ya tiene la del dato. Sin quedarse con
+     * el desplazamiento dentro de la pagina (UBFX) y sin mirar si es nula: las
+     * paginas sin puntero llevan una pagina de relleno. En este port las unicas
+     * sin puntero son las sin mapear (no hay registros de hardware mapeados,
+     * los watchpoints no existen y RasterizerMarkRegionCached solo lo llaman
+     * los renderers de OpenGL y Vulkan), y en una consola de verdad tocarlas
+     * es un fallo de pagina: un juego que funciona no lo hace. Se crea la
+     * primera vez que el JIT la pide (4 MB); desde entonces Entry::operator= y
+     * Clear la mantienen igual que 'raw'.
+     */
+    const u32* JitTable();
+#endif
 
     /**
      * Array of fine grained page attributes. If it is set to any value other than `Memory`, then

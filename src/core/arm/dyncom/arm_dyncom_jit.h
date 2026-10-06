@@ -56,7 +56,7 @@
  * el resultado del interprete, que es la referencia.
  *
  * 0.1.5.7, TRES OPTIMIZACIONES DEL CODIGO GENERADO (el detalle, en el .cpp):
- *   1. ENLACE EN LINEA (EmitLink). Cada salida de un bloque intenta saltar al
+ *   1. ENLACE EN LINEA (EmitDirectLink). Cada salida de un bloque intenta saltar al
  *      siguiente sin volver a C++, con las mismas condiciones que el despacho
  *      (interrupcion, Thumb, alineacion, presupuesto, comprobacion). Salidas
  *      con destino fijo (B, BL, camino no tomado, fin de pagina) por un
@@ -218,6 +218,25 @@ void AddSvcTime(u64 microseconds);
 /// Instrucciones ejecutadas antes de una llamada al sistema (el interprete
 /// pone su cuenta a cero ahi).
 void CountInstructions(u32 instructions);
+
+/**
+ * CONTADORES DEL PROCESADOR (0.2.3.6), ver PmuSliceBegin en el .cpp. Las
+ * rodajas del ARM los encienden y apagan, y las llamadas al sistema los
+ * paran mientras duran.
+ */
+void PmuSliceBegin();
+void PmuSliceEnd(u32 instructions);
+void PmuSvcBegin();
+void PmuSvcEnd();
+constexpr u32 kPmuCounters = 6;
+struct PmuStats {
+    /// Dos juegos de eventos (ver kPmuEvents): [juego * kPmuCounters + contador].
+    std::array<u64, 2 * kPmuCounters> counts{};
+    /// Instrucciones del juego mientras contaba cada juego.
+    std::array<u64, 2> instructions{};
+};
+/// Lo contado desde la ultima llamada (lo pone a cero).
+void TakePmu(PmuStats& out);
 
 /// Tira todo el codigo generado. La llama ResetTransCache: cuando el
 /// interprete tira sus traducciones, el JIT tira las suyas por lo mismo.

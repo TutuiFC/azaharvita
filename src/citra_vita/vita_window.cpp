@@ -884,6 +884,40 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                         stats_arm_check_ms, stats_arm_compile_ms,
                                         stats_arm_rest_ms, stats_dsp_ms)
                                 .c_str());
+                        {
+                            // Los contadores del Cortex-A9 (0.2.3.6): ver
+                            // PmuSliceBegin en arm_dyncom_jit.cpp.
+                            Core::ArmJit::PmuStats pmu{};
+                            Core::ArmJit::TakePmu(pmu);
+                            const auto ratio = [](u64 part, u64 whole) {
+                                return whole > 0 ? static_cast<double>(part) /
+                                                       static_cast<double>(whole)
+                                                 : 0.0;
+                            };
+                            const u64* a = &pmu.counts[0];
+                            const u64* b = &pmu.counts[Core::ArmJit::kPmuCounters];
+                            if (a[0] > 0 || b[0] > 0) {
+                                Common::VitaNote(
+                                    "arm pmu",
+                                    fmt::format(
+                                        "ciclos por instr. del juego {:.1f} | ipc {:.2f} | "
+                                        "parado: codigo {:.0f}% datos {:.0f}% tlb {:.0f}% | "
+                                        "saltos fallados {:.2f} por instr. || ciclos {:.1f} | "
+                                        "fallos de cache por instr.: codigo {:.2f} datos {:.2f} "
+                                        "| parado: tlb codigo {:.0f}% tlb datos {:.0f}% "
+                                        "escritura {:.0f}%",
+                                        ratio(a[0], pmu.instructions[0]), ratio(a[1], a[0]),
+                                        ratio(a[2], a[0]) * 100.0, ratio(a[3], a[0]) * 100.0,
+                                        ratio(a[4], a[0]) * 100.0,
+                                        ratio(a[5], pmu.instructions[0]),
+                                        ratio(b[0], pmu.instructions[1]),
+                                        ratio(b[1], pmu.instructions[1]),
+                                        ratio(b[2], pmu.instructions[1]),
+                                        ratio(b[3], b[0]) * 100.0, ratio(b[4], b[0]) * 100.0,
+                                        ratio(b[5], b[0]) * 100.0)
+                                        .c_str());
+                            }
+                        }
                         // Y el desglose de un vertice (0.1.7.2), en us por vertice.
                         const double s = static_cast<double>(
                             Common::FrameStats::vtx_samples.exchange(0, std::memory_order_relaxed));

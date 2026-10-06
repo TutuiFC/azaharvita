@@ -21,6 +21,9 @@
 #include <fmt/format.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/perf.h>
+#include <psp2/sysmodule.h>
 #include "common/hash.h"
 #include "common/vita_diag.h"
 #include "common/vita_vm.h"
@@ -97,14 +100,14 @@ enum HostReg : u32 {
     R2 = 2,
     R3 = 3,
     kCpu = 4,   ///< ARMul_State*
-    kPages = 5, ///< tabla de punteros por pagina (PageTable::RawPointers)
+    kPages = 5, ///< tabla del JIT (PageTable::JitTable; ver MemoryAccess)
     kRn = 6,    ///< operando base
     kRm = 7,    ///< segundo operando / desplazamiento
     kRs = 8,    ///< registro de desplazamiento / direccion calculada
     kRd = 9,    ///< resultado / dato
     kT0 = 10,   ///< temporal; tambien guarda los flags a traves de llamadas
-    kT1 = 11,   ///< puntero de pagina
-    kFlags = 12 ///< copia del APSR mientras se hace un acceso a memoria
+    kT1 = 11,   ///< entrada de la tabla del JIT
+    kFlags = 12 ///< copia del APSR a traves de una llamada
 };
 
 // Condiciones ARM (mismos numeros que ConditionCode).
@@ -339,11 +342,12 @@ u32 ExtOffset(u32 vfp_reg) {
  * Al terminar un bloque, su propio codigo intenta saltar al siguiente sin
  * volver a C++. Antes (0.1.5.2) hacia DOS llamadas a C++ por salto, cada una
  * con una busqueda en g_blocks (un unordered_map): mas caro que volver a
- * TryRun. Ahora todo se comprueba en linea (ver Compiler::EmitLink) con las
+ * TryRun. Ahora todo se comprueba en linea (ver Compiler::EmitDirectLink y
+ * EmitIndirectLink) con las
  * MISMAS condiciones que el bucle de TryRun, que son las del despacho del
  * interprete entre dos bloques:
  *   - sin interrupcion pendiente sin enmascarar (NirqSig y el bit I de Cpsr);
- *     desde 0.1.8.2 solo en el despacho y en TryRun, ver EmitLink
+ *     desde 0.1.8.2 solo en el despacho y en TryRun, ver EmitIndirectLink
  *   - en modo ARM (TFlag = 0) y con el PC alineado
  *   - el destino compilado y enlazable (LinkInfo::entry != 0)
  *   - al destino no le toca comprobacion (DueForCheck con LinkInfo::runs)
@@ -452,44 +456,6 @@ enum AccessKind : u32 {
     kSignedHalf = 3,
     kSignedByte = 4,
 };
-
-u32 SlowReadRaw(ARMul_State* cpu, u32 address, u32 kind) {
-    switch (kind) {
-    case kWord:
-        return cpu->ReadMemory32(address);
-    case kHalf:
-        return cpu->ReadMemory16(address);
-    case kByte:
-        return cpu->ReadMemory8(address);
-    case kSignedHalf:
-        return static_cast<u32>(static_cast<s32>(static_cast<s16>(cpu->ReadMemory16(address))));
-    default:
-        return static_cast<u32>(static_cast<s32>(static_cast<s8>(cpu->ReadMemory8(address))));
-    }
-}
-
-u32 SlowRead(ARMul_State* cpu, u32 address, u32 kind) {
-    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
-    const u32 value = SlowReadRaw(cpu, address, kind);
-    StopLinksIfRescheduled(cpu);
-    return value;
-}
-
-void SlowWrite(ARMul_State* cpu, u32 address, u32 value, u32 kind) {
-    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
-    switch (kind) {
-    case kWord:
-        cpu->WriteMemory32(address, value);
-        break;
-    case kHalf:
-        cpu->WriteMemory16(address, static_cast<u16>(value));
-        break;
-    default:
-        cpu->WriteMemory8(address, static_cast<u8>(value));
-        break;
-    }
-    StopLinksIfRescheduled(cpu);
-}
 
 /**
  * LDREX y STREX (y sus variantes de byte y media palabra), 0.2.1.0: lo mismo
@@ -937,6 +903,7 @@ struct Block {
         u8 bx = 0;            ///< ... hasta el BX r1
         u32 orig0 = 0;
         u32 orig_count = 0;
+        u32 orig_count2 = 0;
         u32 orig_bx = 0;
         bool patched = false;
     };
@@ -1948,11 +1915,11 @@ private:
     /**
      * Vuelca r0-r2 a ARMul_State::Reg. Hace falta ANTES de:
      *   - cualquier Call (AAPCS destruye r0-r3, y ademas los helpers leen
-     *     cpu->Reg: BlockTransfer, Cp15, SlowWrite...);
+     *     cpu->Reg: BlockTransfer, Cp15, LDREX...);
      *   - el epilogo (usa r0-r1 para los flags);
      *   - FallThrough y los terminadores que escriben Reg[15] por su cuenta.
-     * No hace falta en el camino RAPIDO de MemoryAccess: ese no toca r0-r3
-     * ni cpu->Reg (solo kT0/kT1/kFlags y la pagina).
+     * No hace falta en MemoryAccess: no toca r0-r3 ni cpu->Reg (solo kT0,
+     * kT1 y la memoria del juego).
      */
     void FlushCachedRegs() {
         if (!cache_dirty) {
@@ -2120,112 +2087,68 @@ private:
      * 0.2.1.0 puede ser el hueco de la cache del registro del juego (sin pasar
      * por kRd y un MOV).
      *
-     * Camino normal: el mismo que MemorySystem::Read32Fast/Write32Fast --
-     * puntero = paginas[direccion >> 12]; si no es nulo, acceso directo con el
-     * desplazamiento de la pagina; si es nulo, la funcion de siempre del
-     * interprete (ReadMemory32 & co.), que sabe de hardware y de memoria
-     * especial, en un camino frio (ColdStub). Los flags del juego estan en
-     * APSR y la comparacion con cero los pisaria: se guardan en r12 y se
-     * reponen al final.
+     * TRES INSTRUCCIONES (0.2.3.6): entrada = tabla_del_jit[direccion >> 12]
+     * y el dato en [entrada + direccion] (ver PageTable::JitTable). Sin tocar
+     * los flags y sin camino lento. Hasta 0.2.3.5 era lo de
+     * MemorySystem::Read32Fast -- puntero de la pagina, comparacion con cero y
+     * salto a la funcion del interprete si era nulo, desplazamiento dentro de
+     * la pagina con UBFX -- y, con los flags del juego vivos, un MRS y un MSR
+     * alrededor: de seis a ocho instrucciones, mas un camino frio de una
+     * docena, en algo mas de un tercio de las instrucciones de Pokemon Sol.
      *
-     * Variante de comprobacion: siempre por CheckRead/CheckWrite (diario).
+     * Variante de comprobacion: siempre por CheckRead/CheckWrite (diario), que
+     * miran la tabla de verdad. Guarda y repone los flags SIEMPRE: la normal
+     * ya no los toca, asi que una comprobacion que los perdiera daria una
+     * DIFERENCIA que no es.
      */
-    void MemoryAccess(u32 address, bool store, u32 kind, u32 pc, u32 data = kRd) {
-        /**
-         * 0.1.5.7: los flags solo se guardan y reponen si alguien los va a leer
-         * despues (flags_live_after, ver ComputeFlagsLiveAfter). En el caso
-         * tipico "ldr r0, [..]; cmp r0, #0; bne" el CMP los sobrescribe todos
-         * antes de que nadie los lea, y el MRS y el MSR sobran. La variante de
-         * comprobacion hace LO MISMO, para que un error en el analisis se vea
-         * como DIFERENCIA en vez de quedar escondido.
-         */
-        const bool keep_flags = flags_live_after;
-        if (keep_flags) {
-            e.Mrs(kFlags);
-        }
-        if (check_mode) {
-            SaveAccessOperands(address, store, data);
-            FlushCachedRegs();
-            if (keep_flags) {
-                e.MovReg(kT0, kFlags);
-            }
-            e.MovReg(R0, kT1);
-            if (store) {
-                e.MovReg(R1, kRd);
-                e.Mov32(R2, kind);
-                e.Call(reinterpret_cast<const void*>(&CheckWriteThunk));
-            } else {
-                e.Mov32(R1, kind);
-                e.Call(reinterpret_cast<const void*>(&CheckReadThunk));
-                e.MovReg(kRd, R0);
-            }
-            if (keep_flags) {
-                e.MsrFlags(kT0);
-            }
-            ReloadCachedRegs();
-            if (!store && data != kRd) {
-                e.MovReg(data, kRd);
-            }
+    void MemoryAccess(u32 address, bool store, u32 kind, u32 data = kRd) {
+        if (!check_mode) {
+            e.LsrImm(kT0, address, 12);
+            e.LdrRegLsl2(kT1, kPages, kT0);
+            EmitAccess(store, kind, data, address);
             return;
         }
-        e.LsrImm(kT0, address, 12);
-        e.LdrRegLsl2(kT1, kPages, kT0);
-        e.CmpImm0(kT1);
-        const u32 to_slow = e.BranchPlaceholder(kCondEq);
-        e.Ubfx(kT0, address, 0, 12);
-        // [kT1, kT0]
+        e.Mrs(kFlags);
+        SaveAccessOperands(address, store, data);
+        FlushCachedRegs();
+        e.MovReg(kT0, kFlags);
+        e.MovReg(R0, kT1);
+        if (store) {
+            e.MovReg(R1, kRd);
+            e.Mov32(R2, kind);
+            e.Call(reinterpret_cast<const void*>(&CheckWriteThunk));
+        } else {
+            e.Mov32(R1, kind);
+            e.Call(reinterpret_cast<const void*>(&CheckReadThunk));
+            e.MovReg(kRd, R0);
+        }
+        e.MsrFlags(kT0);
+        ReloadCachedRegs();
+        if (!store && data != kRd) {
+            e.MovReg(data, kRd);
+        }
+    }
+
+    /// El acceso en [kT1, index]: la entrada de la tabla del JIT mas la
+    /// direccion del juego.
+    void EmitAccess(bool store, u32 kind, u32 data, u32 index) {
         switch (kind) {
         case kWord:
-            e.Emit((store ? 0xE7800000u : 0xE7900000u) | (kT1 << 16) | (data << 12) | kT0);
+            e.Emit((store ? 0xE7800000u : 0xE7900000u) | (kT1 << 16) | (data << 12) | index);
             break;
         case kByte:
-            e.Emit((store ? 0xE7C00000u : 0xE7D00000u) | (kT1 << 16) | (data << 12) | kT0);
+            e.Emit((store ? 0xE7C00000u : 0xE7D00000u) | (kT1 << 16) | (data << 12) | index);
             break;
         case kHalf:
-            e.Emit((store ? 0xE18000B0u : 0xE19000B0u) | (kT1 << 16) | (data << 12) | kT0);
+            e.Emit((store ? 0xE18000B0u : 0xE19000B0u) | (kT1 << 16) | (data << 12) | index);
             break;
         case kSignedHalf:
-            e.Emit(0xE19000F0u | (kT1 << 16) | (data << 12) | kT0);
+            e.Emit(0xE19000F0u | (kT1 << 16) | (data << 12) | index);
             break;
         case kSignedByte:
-            e.Emit(0xE19000D0u | (kT1 << 16) | (data << 12) | kT0);
+            e.Emit(0xE19000D0u | (kT1 << 16) | (data << 12) | index);
             break;
         }
-        const u32 back = e.Position();
-        if (keep_flags) {
-            e.MsrFlags(kFlags);
-        }
-        DeferCold({to_slow}, [this, address, store, kind, pc, data, keep_flags, back] {
-            // r12 no sobrevive a la llamada: los flags van a r10. r0-r3 y lr se
-            // destruyen, asi que la cache se vuelca antes y se recarga despues
-            // (SlowRead/SlowWrite leen y escriben cpu->Reg).
-            SaveAccessOperands(address, store, data);
-            FlushCachedRegs();
-            if (keep_flags) {
-                e.MovReg(kT0, kFlags);
-            }
-            e.Mov32(R0, pc);
-            e.StrImm(R0, kCpu, RegOffset(15));
-            e.MovReg(R0, kCpu);
-            e.MovReg(R1, kT1);
-            if (store) {
-                e.MovReg(R2, kRd);
-                e.Mov32(R3, kind);
-                e.Call(reinterpret_cast<const void*>(&SlowWrite));
-            } else {
-                e.Mov32(R2, kind);
-                e.Call(reinterpret_cast<const void*>(&SlowRead));
-                e.MovReg(kRd, R0);
-            }
-            if (keep_flags) {
-                e.MovReg(kFlags, kT0);
-            }
-            ReloadCachedRegs();
-            if (!store && data != kRd) {
-                e.MovReg(data, kRd);
-            }
-            e.BranchTo(kAlways, back);
-        });
     }
 
     /// La direccion a kT1 y el valor a guardar a kRd, ANTES del vuelco y de
@@ -2241,14 +2164,14 @@ private:
 
     /// Carga en el registro del juego 'rd' (no el PC): directa a su hueco si
     /// esta cacheado (0.2.1.0).
-    void LoadInto(u32 address, u32 kind, u32 pc, u32 rd) {
+    void LoadInto(u32 address, u32 kind, u32 rd) {
         const s8 cached = CacheHost(rd);
         if (cached >= 0) {
-            MemoryAccess(address, false, kind, pc, static_cast<u32>(cached));
+            MemoryAccess(address, false, kind, static_cast<u32>(cached));
             cache_written[rd] = true;
             return;
         }
-        MemoryAccess(address, false, kind, pc);
+        MemoryAccess(address, false, kind);
         e.StrImm(kRd, kCpu, RegOffset(rd));
     }
 
@@ -2338,17 +2261,17 @@ private:
             // LDR al PC (fin de bloque): como LDR_INST con Rd = 15, pasa a Thumb
             // si el bit 0 viene puesto y deja el PC sin ese bit.
             // kT0 en vez de R2: R2 es un hueco de la cache de registros.
-            MemoryAccess(address, false, kind, pc);
+            MemoryAccess(address, false, kind);
             e.Ubfx(kT0, kRd, 0, 1);
             e.StrImm(kT0, kCpu, g_offsets.t);
             e.Emit(0xE3C00001u | (kRd << 16) | (kRd << 12)); // BIC kRd, kRd, #1
             StoreGuest(kRd, 15);
         } else if (load) {
-            LoadInto(address, kind, pc, rd);
+            LoadInto(address, kind, rd);
         } else {
             // Despues de escribir el base; el PC se guarda como PC+8.
             const u32 value = OperandHost(kRd, rd, pc);
-            MemoryAccess(address, true, kind, pc, value);
+            MemoryAccess(address, true, kind, value);
         }
     }
 
@@ -2392,10 +2315,10 @@ private:
         }
         const u32 kind = sh == 1 ? kHalf : sh == 2 ? kSignedByte : kSignedHalf;
         if (load) {
-            LoadInto(address, kind, pc, rd);
+            LoadInto(address, kind, rd);
         } else {
             const u32 value = OperandHost(kRd, rd, pc);
-            MemoryAccess(address, true, kHalf, pc, value);
+            MemoryAccess(address, true, kHalf, value);
         }
     }
 
@@ -2432,17 +2355,17 @@ private:
         // ya esta escrito, asi que kRs se puede reutilizar.
         const u32 second = 0xE2800004u | (address << 16) | (kRs << 12);
         if (load) {
-            MemoryAccess(address, false, kWord, pc);
+            MemoryAccess(address, false, kWord);
             StoreGuest(kRd, rd);
             e.Emit(second);
-            MemoryAccess(kRs, false, kWord, pc);
+            MemoryAccess(kRs, false, kWord);
             StoreGuest(kRd, rd + 1);
         } else {
             LoadGuest(kRd, rd, pc);
-            MemoryAccess(address, true, kWord, pc);
+            MemoryAccess(address, true, kWord);
             e.Emit(second);
             LoadGuest(kRd, rd + 1, pc);
-            MemoryAccess(kRs, true, kWord, pc);
+            MemoryAccess(kRs, true, kWord);
         }
     }
 
@@ -2612,11 +2535,11 @@ private:
         // kRs = direccion base+/-imm. Para double, la segunda palabra es +4.
         if (single) {
             if (load) {
-                MemoryAccess(kRs, false, kWord, pc);
+                MemoryAccess(kRs, false, kWord);
                 e.StrImm(kRd, kCpu, ExtOffset(d));
             } else {
                 e.LdrImm(kRd, kCpu, ExtOffset(d));
-                MemoryAccess(kRs, true, kWord, pc);
+                MemoryAccess(kRs, true, kWord);
             }
             return;
         }
@@ -2625,17 +2548,17 @@ private:
         // (VLDR_INST/VSTR_INST del interprete), no en ExtReg[N] y [N+1].
         const u32 next_word = 0xE2800004u | (kRs << 16) | (kRs << 12); // ADD kRs, kRs, #4
         if (load) {
-            MemoryAccess(kRs, false, kWord, pc);
+            MemoryAccess(kRs, false, kWord);
             e.StrImm(kRd, kCpu, ExtOffset(d * 2));
             e.Emit(next_word);
-            MemoryAccess(kRs, false, kWord, pc);
+            MemoryAccess(kRs, false, kWord);
             e.StrImm(kRd, kCpu, ExtOffset(d * 2 + 1));
         } else {
             e.LdrImm(kRd, kCpu, ExtOffset(d * 2));
-            MemoryAccess(kRs, true, kWord, pc);
+            MemoryAccess(kRs, true, kWord);
             e.Emit(next_word);
             e.LdrImm(kRd, kCpu, ExtOffset(d * 2 + 1));
-            MemoryAccess(kRs, true, kWord, pc);
+            MemoryAccess(kRs, true, kWord);
         }
     }
 
@@ -2889,8 +2812,9 @@ private:
 
     /**
      * kT1 = puntero directo a 'words' palabras seguidas desde 'start', o un
-     * salto a 'slow' si no se puede: desalineada, en dos paginas o sin
-     * puntero de pagina (hardware). Pisa kRm y los flags.
+     * salto a 'slow' si no se puede: desalineada o en dos paginas. Con la
+     * tabla del JIT (0.2.3.6, ver MemoryAccess) no hay pagina nula que mirar:
+     * el puntero es la entrada mas la direccion. Pisa kRm y los flags.
      */
     void DirectSpan(u32 start, u32 words, std::vector<u32>& slow) {
         e.Emit(0xE3100003u | (start << 16)); // TST start, #3
@@ -2903,10 +2827,7 @@ private:
         }
         e.LsrImm(kRm, start, 12);
         e.LdrRegLsl2(kT1, kPages, kRm);
-        e.CmpImm0(kT1);
-        slow.push_back(e.BranchPlaceholder(kCondEq)); // sin puntero
-        e.Ubfx(kRm, start, 0, 12);
-        e.AddReg(kT1, kT1, kRm);
+        e.AddReg(kT1, kT1, start);
     }
 
     /**
@@ -2918,8 +2839,8 @@ private:
      * direccion y el base nuevo salen del mismo inmediato (imm32, que en
      * FSTMX/FLDMX lleva una palabra de mas que no se copia), y las palabras van
      * seguidas en ExtReg (s(d+i), o d(d+i) en ExtReg[2(d+i)] y [2(d+i)+1]).
-     * Solo si el tramo entero esta alineado a 4 y cae en UNA pagina con
-     * puntero; si no, la funcion de siempre, en un camino frio. La escritura
+     * Solo si el tramo entero esta alineado a 4 y cae en UNA pagina; si no,
+     * la funcion de siempre, en un camino frio. La escritura
      * del base, despues de los accesos, como alli. Desde 0.2.1.0 sin volcar
      * la cache: el base se lee de su hueco (los accesos no tocan registros ARM).
      */
@@ -3011,13 +2932,13 @@ private:
      * por fotograma, casi todas LDM/STM (los push/pop de cada funcion).
      *
      * Camino rapido, con EXACTAMENTE la cuenta de BlockTransfer: si el tramo
-     * de memoria entero esta alineado a 4 y cae en UNA pagina con puntero (RAM
-     * normal, sin efectos), se copian las palabras directamente, en el mismo
+     * de memoria entero esta alineado a 4 y cae en UNA pagina, se copian las
+     * palabras directamente, en el mismo
      * orden que el interprete: la escritura del base ANTES de los accesos
      * (en un LDM que carga el propio base gana lo cargado), STM guarda el base
      * ORIGINAL si esta en la lista y el PC como PC+8, y un LDM que carga el PC
      * pasa a Thumb si el bit 0 viene puesto. Cualquier otra cosa (dos paginas,
-     * hardware, desalineado) va a la funcion de siempre, en un camino frio.
+     * desalineado) va a la funcion de siempre, en un camino frio.
      *
      * 0.2.1.0: SIN volcar ni recargar la cache. Los registros cacheados se
      * guardan y se cargan directamente desde y hacia su hueco; antes cada
@@ -3134,7 +3055,7 @@ private:
                 EmitSelfLink(target_pc);
                 return;
             }
-            EmitLink(LinkFor(BlockKey(target_pc)), target_pc);
+            EmitDirectLink(LinkFor(BlockKey(target_pc)), target_pc);
             return;
         }
         e.Mov32(kT0, target_pc);
@@ -3145,32 +3066,93 @@ private:
     /// Salida con Reg[15] (y TFlag) ya escritos (BX, LDM con el PC...).
     void ExitIndirect() {
         if (Linking()) {
-            EmitLink(nullptr, 0);
+            EmitIndirectLink();
             return;
         }
         to_epilogue.push_back(e.BranchPlaceholder(kAlways));
     }
 
     /**
-     * ENLACE AL SIGUIENTE BLOQUE, EN LINEA (0.1.5.7). Ver LinkContext.
+     * ENLACE AL SIGUIENTE BLOQUE, EN LINEA (0.1.5.7). Ver LinkContext. Las
+     * condiciones son EXACTAMENTE las del bucle de TryRun (y las del despacho
+     * del interprete). Si alguna falla, un camino frio escribe el PC del
+     * destino (si es fijo) y sale sin volver a volcar la cache
+     * (exit_noflush). r0-r3 y r6-r9 estan libres: la cache se vuelca al
+     * empezar.
      *
-     * 'target' es el LinkInfo del destino si el destino es FIJO (va como
-     * constante en el codigo) y 'target_pc' su direccion. Con nullptr el salto
-     * es INDIRECTO (BX, LDM con el PC, "mov pc, lr", "ldr pc, [...]"): se lee
-     * Reg[15] y se busca en g_fast, la tabla rapida de TryRun, con su misma
-     * clave; si el hueco es de otro PC, no se enlaza.
+     * Destino FIJO (B, BL, el camino no tomado de un salto condicional): su
+     * LinkInfo va como constante en el codigo.
      *
-     * Las condiciones son EXACTAMENTE las del bucle de TryRun (y las del
-     * despacho del interprete). Si alguna falla, un camino frio repone los
-     * flags, escribe el PC del destino fijo y sale sin volver a volcar la
-     * cache (exit_noflush). Los flags del juego se guardan en kT0 (r10) porque
-     * aqui se usan CMP/SUBS; r0-r3 y r6-r9 estan libres (la cache se vuelca
-     * al empezar).
+     * DESDE 0.2.3.6, SIN TOCAR LOS FLAGS. Ya parcheado (ver PatchSite) son
+     * nueve instrucciones, una de ellas un NOP, y ninguna toca APSR: el
+     * presupuesto se descuenta con SUB y su signo elige el camino con un ADD
+     * al PC, en vez de SUBS + BLO entre un MRS y un MSR. Sin parchear, la
+     * prueba de la entrada si usa los flags, que se guardan en kT0 y se
+     * reponen enseguida.
+     *
+     *   w0  MRS kT0                  (parche: B w7)
+     *   w1  MOVW r0 / w2 MOVT r0     LinkInfo del destino
+     *   w3  LDR r1, [r0, #entry] / w4 CMP r1, #0 / w5 BEQ fallo (con flags en kT0)
+     *   w6  MSR kT0
+     *   w7  LDRD kRn, kRm, presupuesto y enlaces
+     *   w8  LDR r2, [r0, #count]     (parche: SUB kRn, kRn, #cuenta)
+     *   w9  SUB kRn, kRn, r2         (parche: NOP)
+     *   w10 MOV kT1, kRn, ASR #31    0 o -1
+     *   w11 ADD pc, pc, kT1, LSL #2  -1: a w12; 0: a w13
+     *   w12 B fallo (flags intactos)
+     *   w13 ADD kRm, kRm, #1 / w14 STRD
+     *   w15 BX r1                    (parche: B entrada)
      */
-    void EmitLink(const LinkInfo* target, u32 target_pc) {
-        std::vector<u32> fails;
+    void EmitDirectLink(const LinkInfo* target, u32 target_pc) {
+        std::vector<u32> fails_flags;
+        std::vector<u32> fails_plain;
         PendingSite site{};
         site.target = target;
+        FlushCachedRegs();
+        const u32 ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(target));
+        site.word0 = e.Position();
+        e.Mrs(kT0);
+        e.Emit(0xE3000000u | ((ptr & 0xF000u) << 4) | (R0 << 12) | (ptr & 0x0FFFu));
+        e.Emit(0xE3400000u | (((ptr >> 16) & 0xF000u) << 4) | (R0 << 12) |
+               ((ptr >> 16) & 0x0FFFu));
+        e.LdrImm(R1, R0, kLinkEntry);
+        e.CmpImm0(R1);
+        fails_flags.push_back(e.BranchPlaceholder(kCondEq));
+        e.MsrFlags(kT0);
+        site.ldrd = e.Position();
+        e.LdrdImm(kRn, kCpu, g_offsets.link);
+        site.count = e.Position();
+        e.LdrImm(R2, R0, kLinkCount);
+        e.Emit(0xE0400000u | (kRn << 16) | (kRn << 12) | R2);                 // SUB kRn, kRn, r2
+        e.Emit(0xE1A00000u | (kT1 << 12) | (31u << 7) | (2u << 5) | kRn);      // MOV kT1, kRn, ASR #31
+        e.Emit(0xE08FF000u | (2u << 7) | kT1);                                // ADD pc, pc, kT1, LSL #2
+        fails_plain.push_back(e.BranchPlaceholder(kAlways));
+        e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
+        e.StrdImm(kRn, kCpu, g_offsets.link);
+        site.bx = e.Position();
+        e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
+        link_sites.push_back(site);
+        DeferCold(std::move(fails_flags), [this, target_pc] {
+            e.MsrFlags(kT0);
+            e.Mov32(kRd, target_pc);
+            e.StrImm(kRd, kCpu, RegOffset(15));
+            e.BranchTo(kAlways, exit_noflush);
+        });
+        DeferCold(std::move(fails_plain), [this, target_pc] {
+            e.Mov32(kRd, target_pc);
+            e.StrImm(kRd, kCpu, RegOffset(15));
+            e.BranchTo(kAlways, exit_noflush);
+        });
+    }
+
+    /**
+     * Destino INDIRECTO (BX, LDM con el PC, "mov pc, lr", "ldr pc, [...]"): se
+     * lee Reg[15] y se busca en g_fast, la tabla rapida de TryRun, con su misma
+     * clave; si el hueco es de otro PC, no se enlaza. Aqui si se usan CMP y
+     * SUBS: los flags del juego van en kT0 (r10).
+     */
+    void EmitIndirectLink() {
+        std::vector<u32> fails;
         FlushCachedRegs();
         e.Mrs(kT0);
         /**
@@ -3184,44 +3166,33 @@ private:
          * interprete). O sea que dentro de una cadena de enlaces no puede
          * cambiar: la prueba nunca fallaba.
          */
-        if (target == nullptr) {
-            /**
-             * Indirecto, con el PC alineado segun el modo (el despacho
-             * alinearia; aqui simplemente no se enlaza): en ARM los dos bits
-             * de abajo a cero, en Thumb el de abajo. Desde 0.2.1.9 tambien
-             * a Thumb (los "bx lr" y "pop {pc}" de vuelta a codigo Thumb, que
-             * acababan en el despacho): clave = pc | TFlag, como TryRun.
-             */
-            e.LdrImm(R1, kCpu, RegOffset(15));
-            e.LdrImm(R2, kCpu, g_offsets.t);
-            e.Emit(0xE3100001u | (R1 << 16)); // TST r1, #1
-            fails.push_back(e.BranchPlaceholder(kCondNe));
-            // El bit 1 solo cuenta en ARM: r3 = TFlag ^ 1, y TST r1, r3, LSL #1.
-            e.Emit(0xE2200001u | (R2 << 16) | (R3 << 12));             // EOR r3, r2, #1
-            e.Emit(0xE1100080u | (R1 << 16) | R3);                     // TST r1, r3, LSL #1
-            fails.push_back(e.BranchPlaceholder(kCondNe));
-            e.Emit(0xE1800000u | (R1 << 16) | (R1 << 12) | R2); // ORR r1, r1, r2
-            // r3 = &g_fast[(clave >> 1) & (kFastSlots - 1)]
-            e.Ubfx(R2, R1, 1, kFastSlotBits);
-            e.Mov32(R3, static_cast<u32>(reinterpret_cast<uintptr_t>(g_fast.data())));
-            e.Emit(0xE0800000u | (R3 << 16) | (R3 << 12) | (3u << 7) | R2); // ADD r3, r3, r2, LSL #3
-            e.LdrImm(R2, R3, 0);                                           // slot.pc
-            e.Emit(0xE1500000u | (R2 << 16) | R1);                         // CMP r2, r1
-            fails.push_back(e.BranchPlaceholder(kCondNe));
-            e.LdrImm(R0, R3, 4); // slot.block
-            if (g_link_in_block != 0) {
-                e.Mov32(R2, g_link_in_block);
-                e.AddReg(R0, R0, R2);
-            }
-        } else {
-            // Directo: el LinkInfo del destino es fijo (los elementos de
-            // g_blocks no se mueven): MOVW/MOVT, sin literal ni salto (0.1.8.1).
-            // Siempre las dos, para que el parche sepa donde esta todo.
-            const u32 ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(target));
-            site.word0 = e.Position();
-            e.Emit(0xE3000000u | ((ptr & 0xF000u) << 4) | (R0 << 12) | (ptr & 0x0FFFu));
-            e.Emit(0xE3400000u | (((ptr >> 16) & 0xF000u) << 4) | (R0 << 12) |
-                   ((ptr >> 16) & 0x0FFFu));
+        /**
+         * El PC alineado segun el modo (el despacho alinearia; aqui
+         * simplemente no se enlaza): en ARM los dos bits de abajo a cero, en
+         * Thumb el de abajo. Desde 0.2.1.9 tambien a Thumb (los "bx lr" y
+         * "pop {pc}" de vuelta a codigo Thumb, que acababan en el despacho):
+         * clave = pc | TFlag, como TryRun.
+         */
+        e.LdrImm(R1, kCpu, RegOffset(15));
+        e.LdrImm(R2, kCpu, g_offsets.t);
+        e.Emit(0xE3100001u | (R1 << 16)); // TST r1, #1
+        fails.push_back(e.BranchPlaceholder(kCondNe));
+        // El bit 1 solo cuenta en ARM: r3 = TFlag ^ 1, y TST r1, r3, LSL #1.
+        e.Emit(0xE2200001u | (R2 << 16) | (R3 << 12)); // EOR r3, r2, #1
+        e.Emit(0xE1100080u | (R1 << 16) | R3);         // TST r1, r3, LSL #1
+        fails.push_back(e.BranchPlaceholder(kCondNe));
+        e.Emit(0xE1800000u | (R1 << 16) | (R1 << 12) | R2); // ORR r1, r1, r2
+        // r3 = &g_fast[(clave >> 1) & (kFastSlots - 1)]
+        e.Ubfx(R2, R1, 1, kFastSlotBits);
+        e.Mov32(R3, static_cast<u32>(reinterpret_cast<uintptr_t>(g_fast.data())));
+        e.Emit(0xE0800000u | (R3 << 16) | (R3 << 12) | (3u << 7) | R2); // ADD r3, r3, r2, LSL #3
+        e.LdrImm(R2, R3, 0);                                           // slot.pc
+        e.Emit(0xE1500000u | (R2 << 16) | R1);                         // CMP r2, r1
+        fails.push_back(e.BranchPlaceholder(kCondNe));
+        e.LdrImm(R0, R3, 4); // slot.block
+        if (g_link_in_block != 0) {
+            e.Mov32(R2, g_link_in_block);
+            e.AddReg(R0, R0, R2);
         }
         /**
          * r0 = LinkInfo* del destino. Enlazable? (0.1.8.1) entry ya implica que
@@ -3234,44 +3205,20 @@ private:
         e.CmpImm0(R1);
         fails.push_back(e.BranchPlaceholder(kCondEq));
         // Presupuesto y enlaces de una vez: LDRD kRn (budget), kRm (hops).
-        site.ldrd = e.Position();
         e.LdrdImm(kRn, kCpu, g_offsets.link);
-        site.count = e.Position();
         e.LdrImm(R2, R0, kLinkCount);
         e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | R2); // SUBS kRn, kRn, r2
         fails.push_back(e.BranchPlaceholder(kCondLo));
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
         e.StrdImm(kRn, kCpu, g_offsets.link);
         e.MsrFlags(kT0);
-        site.bx = e.Position();
         e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
-        if (target != nullptr) {
-            link_sites.push_back(site);
-        }
-        const bool store_pc = target != nullptr;
-        DeferCold(std::move(fails), [this, store_pc, target_pc] {
+        DeferCold(std::move(fails), [this] {
             e.MsrFlags(kT0);
-            if (store_pc) {
-                e.Mov32(kRd, target_pc);
-                e.StrImm(kRd, kCpu, RegOffset(15));
-            }
             e.BranchTo(kAlways, exit_noflush);
         });
     }
 
-    /**
-     * EL SALTO AL PROPIO BLOQUE (0.2.1.9). Un bucle cuyo salto de vuelta cae
-     * al principio de su bloque ("loop: ... subs r2, r2, #1; bne loop") se
-     * enlazaba consigo mismo como con cualquier otro: volcar la cache, cargar
-     * el LinkInfo, mirar su entrada, saltar por registro al prologo del cuerpo
-     * y volver a cargar la cache, en cada vuelta. Ahora es un salto directo al
-     * cuerpo, despues de la carga de la cache: los registros cacheados ya
-     * tienen sus valores. Se vuelcan antes (los escritos), porque el cuerpo se
-     * emitio suponiendo que la memoria y los huecos coinciden al empezar. El
-     * presupuesto se descuenta igual que en un enlace (mismo LDRD/STRD, mismas
-     * cuentas en RunCompiled), y si no llega, se sale como un enlace fallido.
-     * Sin mirar link.entry: si este codigo corre, el bloque esta publicado.
-     */
 public:
     /// Un enlace directo emitido, en palabras desde el principio del codigo
     /// (ver Block::LinkSite).
@@ -3284,25 +3231,38 @@ public:
     };
     std::vector<PendingSite> link_sites;
 
+    /**
+     * EL SALTO AL PROPIO BLOQUE (0.2.1.9). Un bucle cuyo salto de vuelta cae
+     * al principio de su bloque ("loop: ... subs r2, r2, #1; bne loop") se
+     * enlazaba consigo mismo como con cualquier otro: volcar la cache, cargar
+     * el LinkInfo, mirar su entrada, saltar por registro al prologo del cuerpo
+     * y volver a cargar la cache, en cada vuelta. Ahora es un salto directo al
+     * cuerpo, despues de la carga de la cache: los registros cacheados ya
+     * tienen sus valores. Se vuelcan antes (los escritos), porque el cuerpo se
+     * emitio suponiendo que la memoria y los huecos coinciden al empezar. El
+     * presupuesto se descuenta igual que en un enlace (mismo LDRD/STRD, mismas
+     * cuentas en RunCompiled, y desde 0.2.3.6 tambien sin tocar los flags), y
+     * si no llega, se sale como un enlace fallido. Sin mirar link.entry: si
+     * este codigo corre, el bloque esta publicado.
+     */
     void EmitSelfLink(u32 target_pc) {
         std::vector<u32> fails;
         FlushCachedRegs();
-        e.Mrs(kT0);
         e.LdrdImm(kRn, kCpu, g_offsets.link);
         u32 encoded = 0;
         if (Emitter::EncodeImmediate(block_count_, &encoded)) {
-            e.Emit(0xE2500000u | (kRn << 16) | (kRn << 12) | encoded); // SUBS kRn, kRn, #count
+            e.Emit(0xE2400000u | (kRn << 16) | (kRn << 12) | encoded); // SUB kRn, kRn, #count
         } else {
             e.Mov32(kRs, block_count_);
-            e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | kRs); // SUBS kRn, kRn, kRs
+            e.Emit(0xE0400000u | (kRn << 16) | (kRn << 12) | kRs); // SUB kRn, kRn, kRs
         }
-        fails.push_back(e.BranchPlaceholder(kCondLo));
+        e.Emit(0xE1A00000u | (kT1 << 12) | (31u << 7) | (2u << 5) | kRn); // MOV kT1, kRn, ASR #31
+        e.Emit(0xE08FF000u | (2u << 7) | kT1);                           // ADD pc, pc, kT1, LSL #2
+        fails.push_back(e.BranchPlaceholder(kAlways));
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
         e.StrdImm(kRn, kCpu, g_offsets.link);
-        e.MsrFlags(kT0);
         e.BranchTo(kAlways, body_start_);
         DeferCold(std::move(fails), [this, target_pc] {
-            e.MsrFlags(kT0);
             e.Mov32(kRd, target_pc);
             e.StrImm(kRd, kCpu, RegOffset(15));
             e.BranchTo(kAlways, exit_noflush);
@@ -3833,6 +3793,11 @@ bool Analyze(ARMul_State* cpu, Block& block) {
             break;
         case Kind::LoadStore:
             use(Bits(inst, 16, 19));
+            // 0.2.3.6: con escritura del base son dos accesos (cargarlo y
+            // guardarlo): "ldrb r3, [r1], #1" en un bucle de copia.
+            if (Bits(inst, 24, 24) == 0 || Bits(inst, 21, 21) == 1) {
+                use(Bits(inst, 16, 19));
+            }
             use(Bits(inst, 12, 15));
             if (Bits(inst, 25, 25) == 1) {
                 use(Bits(inst, 0, 3));
@@ -3841,6 +3806,9 @@ bool Analyze(ARMul_State* cpu, Block& block) {
         case Kind::LoadStoreExtra:
         case Kind::LoadStoreDual:
             use(Bits(inst, 16, 19));
+            if (Bits(inst, 24, 24) == 0 || Bits(inst, 21, 21) == 1) {
+                use(Bits(inst, 16, 19));
+            }
             use(Bits(inst, 12, 15));
             if (decoded.kind == Kind::LoadStoreDual) {
                 use(Bits(inst, 12, 15) + 1);
@@ -4216,9 +4184,16 @@ void PatchSite(Block::LinkSite& site, const Block& target) {
         const s32 offset = static_cast<s32>(to - (from + 2));
         return 0xEA000000u | (static_cast<u32>(offset) & 0x00FFFFFFu);
     };
-    const u32 count = target.link.count;
+    // Ver EmitDirectLink: SUB kRn, kRn, #cuenta y un NOP donde iban la carga
+    // de la cuenta y la resta por registro. Una cuenta que no quepa en el
+    // inmediato (no pasa: son 256 como mucho) deja el enlace sin parchear.
+    u32 encoded = 0;
+    if (!Emitter::EncodeImmediate(target.link.count, &encoded)) {
+        return;
+    }
     w[0] = branch(w, w + site.ldrd);
-    w[site.count] = 0xE3000000u | ((count & 0xF000u) << 4) | (2u << 12) | (count & 0x0FFFu);
+    w[site.count] = 0xE2400000u | (kRn << 16) | (kRn << 12) | encoded;
+    w[site.count + 1] = 0xE1A00000u;
     w[site.bx] = branch(w + site.bx, reinterpret_cast<const u32*>(target.link.entry));
     site.patched = true;
 }
@@ -4227,6 +4202,7 @@ void UnpatchSite(Block::LinkSite& site) {
     u32* const w = site.word0;
     w[0] = site.orig0;
     w[site.count] = site.orig_count;
+    w[site.count + 1] = site.orig_count2;
     w[site.bx] = site.orig_bx;
     site.patched = false;
 }
@@ -4327,6 +4303,7 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
             site.bx = static_cast<u8>(pending.bx - pending.word0);
             site.orig0 = site.word0[0];
             site.orig_count = site.word0[site.count];
+            site.orig_count2 = site.word0[site.count + 1];
             site.orig_bx = site.word0[site.bx];
             // Ya publicado: parcheado desde ya (lo sincroniza el Sync de abajo).
             if (target.link.entry != 0 && direct_link_patch.load(std::memory_order_relaxed) != 0) {
@@ -4538,7 +4515,7 @@ Block* Peek(u32 pc) {
 }
 
 /// Toca comprobar esta ejecucion del bloque contra el interprete. La misma
-/// prueba la hace en linea el enlace del codigo generado (EmitLink).
+/// prueba la hace en linea el enlace del codigo generado (EmitDirectLink).
 bool DueForCheck(const Block& block) {
     return block.link.runs < kFullChecks || (block.link.runs & (kSampleEvery - 1)) == 0;
 }
@@ -4551,7 +4528,9 @@ bool DueForCheck(const Block& block) {
  */
 u64 RunCompiled(ARMul_State* cpu, Block& block, u8* const* pages, u64 chain_budget) {
     block.link.runs++;
-    const u32 budget = chain_budget > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<u32>(chain_budget);
+    // Como mucho 2^31 - 1: los enlaces miran el signo de lo que queda (ver
+    // EmitDirectLink).
+    const u32 budget = chain_budget > 0x7FFFFFFFu ? 0x7FFFFFFFu : static_cast<u32>(chain_budget);
     cpu->jit_link_budget = budget;
     cpu->jit_link_hops = 0;
     g_link_withdrawn = 0;
@@ -4614,7 +4593,10 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
     if (block->link.count > budget_left) {
         return 0;
     }
+    // La comprobacion lee con la tabla de verdad; el codigo generado, con la
+    // del JIT (ver MemoryAccess).
     u8* const* pages = table->RawPointers();
+    u8* const* const jit_pages = reinterpret_cast<u8* const*>(table->JitTable());
     if (DueForCheck(*block)) {
         const ScopedMicros timer{g_check_us};
         block->link.runs++;
@@ -4636,9 +4618,9 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
      * salen miles de muestras: el ruido se promedia.
      */
     const SampledMicros timer{g_jit_us, TimeThisCall(++g_jit_entries)};
-    // Los enlazados dentro del codigo generado (EmitLink) ven lo que queda de
+    // Los enlazados dentro del codigo generado (EmitDirectLink...) ven lo que queda de
     // la rodaja DESPUES de este bloque, igual que el bucle de abajo.
-    u64 done = RunCompiled(cpu, *block, pages, budget_left - block->link.count);
+    u64 done = RunCompiled(cpu, *block, jit_pages, budget_left - block->link.count);
 
     /**
      * ENCADENADO (0.1.4.9). Si el bloque siguiente tambien esta compilado, se
@@ -4654,7 +4636,7 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
      * camino de siempre. El resultado es el mismo que sin encadenar.
      *
      * Desde 0.1.5.7 la mayoria de estos saltos los hace el propio codigo
-     * generado (EmitLink); aqui llegan los que el no puede: destino que no
+     * generado (EmitDirectLink, EmitIndirectLink); aqui llegan los que el no puede: destino que no
      * estaba en la tabla rapida, PC sin alinear, etc.
      */
     while (done < budget_left) {
@@ -4696,7 +4678,7 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
          */
         PublishEntry(*next);
         g_local.dispatches++;
-        done += RunCompiled(cpu, *next, pages, budget_left - done - next->link.count);
+        done += RunCompiled(cpu, *next, jit_pages, budget_left - done - next->link.count);
     }
     return static_cast<u32>(done);
 }
@@ -4892,6 +4874,144 @@ void AddSvcTime(u64 microseconds) {
 
 void CountInstructions(u32 instructions) {
     g_local.instructions += instructions;
+}
+
+namespace {
+
+/**
+ * CONTADORES DEL PROCESADOR (0.2.3.6). Pokemon Sol va a ~17 ciclos por
+ * instruccion del juego con unas nueve del anfitrion por cada una: casi la
+ * mitad del tiempo se espera a algo, y desde fuera no se sabe a que -- al
+ * codigo (cache de instrucciones), a los datos o a la TLB --. El Cortex-A9 lo
+ * cuenta, y ScePerf da sus contadores por hilo. Solo durante las rodajas del
+ * ARM y sin las llamadas al sistema (ahi dentro esta la GPU emulada),
+ * alternando dos juegos de seis eventos.
+ */
+constexpr std::array<std::array<u8, kPmuCounters>, 2> kPmuEvents{{
+    {SCE_PERF_ARM_PMON_CYCLE_COUNT, SCE_PERF_ARM_PMON_INST_RENAME, SCE_PERF_ARM_PMON_ICACHE_STALL,
+     SCE_PERF_ARM_PMON_DCACHE_STALL, SCE_PERF_ARM_PMON_MAINTLB_STALL,
+     SCE_PERF_ARM_PMON_BRANCH_MISPREDICT},
+    {SCE_PERF_ARM_PMON_CYCLE_COUNT, SCE_PERF_ARM_PMON_ICACHE_MISS, SCE_PERF_ARM_PMON_DCACHE_MISS,
+     SCE_PERF_ARM_PMON_INST_MAINTLB_STALL, SCE_PERF_ARM_PMON_DATA_MAINTLB_STALL,
+     SCE_PERF_ARM_PMON_WRITE_STALL},
+}};
+/// Rodajas por juego de eventos: cuanto mas, menos lecturas, pero los
+/// contadores son de 32 bits (a 444 MHz dan la vuelta en 9 s).
+constexpr u32 kPmuSlicesPerSet = 1024;
+/// Despues se apagan: son dos llamadas al kernel por rodaja y por llamada al
+/// sistema.
+constexpr u32 kPmuRounds = 600;
+constexpr SceUID kPmuSelf = SCE_PERF_ARM_PMON_THREAD_ID_SELF;
+
+int g_pmu_state = 0; ///< 0 sin probar, 1 contando, -1 apagados
+bool g_pmu_running = false;
+u32 g_pmu_set = 0;
+u32 g_pmu_slices = 0;
+u32 g_pmu_rounds = 0;
+u64 g_pmu_set_instructions = 0;
+std::array<std::atomic<u64>, 2 * kPmuCounters> g_pmu_counts{};
+std::array<std::atomic<u64>, 2> g_pmu_instructions{};
+
+int PmuSelect(u32 set) {
+    for (u32 i = 0; i < kPmuCounters; i++) {
+        const int rc = scePerfArmPmonSelectEvent(kPmuSelf, i, kPmuEvents[set][i]);
+        if (rc < 0) {
+            return rc;
+        }
+        scePerfArmPmonSetCounterValue(kPmuSelf, i, 0);
+    }
+    return 0;
+}
+
+void PmuInit() {
+    const int load = sceSysmoduleLoadModule(SCE_SYSMODULE_PERF);
+    int reset = -1;
+    int select = -1;
+    int start = -1;
+    double pair_us = 0.0;
+    if (load >= 0) {
+        reset = scePerfArmPmonReset(kPmuSelf);
+        if (reset >= 0) {
+            select = PmuSelect(0);
+        }
+        if (select >= 0) {
+            const unsigned long long begin = Common::VitaMicros();
+            for (u32 i = 0; i < 100; i++) {
+                start = scePerfArmPmonStart(kPmuSelf);
+                scePerfArmPmonStop(kPmuSelf);
+            }
+            pair_us = static_cast<double>(Common::VitaMicros() - begin) / 100.0;
+            PmuSelect(0);
+        }
+    }
+    g_pmu_state = start >= 0 ? 1 : -1;
+    Common::VitaNote("cpu pmu",
+                     fmt::format("modulo {:#x} reset {:#x} eventos {:#x} arranque {:#x}: {} "
+                                 "({:.1f} us por arranque y parada)",
+                                 static_cast<u32>(load), static_cast<u32>(reset),
+                                 static_cast<u32>(select), static_cast<u32>(start),
+                                 g_pmu_state > 0 ? "contando" : "no disponible", pair_us)
+                         .c_str());
+}
+
+} // Anonymous namespace
+
+void PmuSliceBegin() {
+    if (g_pmu_state == 0) {
+        PmuInit();
+    }
+    if (g_pmu_state > 0) {
+        scePerfArmPmonStart(kPmuSelf);
+        g_pmu_running = true;
+    }
+}
+
+void PmuSliceEnd(u32 instructions) {
+    if (!g_pmu_running) {
+        return;
+    }
+    scePerfArmPmonStop(kPmuSelf);
+    g_pmu_running = false;
+    g_pmu_set_instructions += instructions;
+    if (++g_pmu_slices < kPmuSlicesPerSet) {
+        return;
+    }
+    g_pmu_slices = 0;
+    for (u32 i = 0; i < kPmuCounters; i++) {
+        SceUInt32 value = 0;
+        if (scePerfArmPmonGetCounterValue(kPmuSelf, i, &value) >= 0) {
+            g_pmu_counts[g_pmu_set * kPmuCounters + i].fetch_add(value, std::memory_order_relaxed);
+        }
+    }
+    g_pmu_instructions[g_pmu_set].fetch_add(g_pmu_set_instructions, std::memory_order_relaxed);
+    g_pmu_set_instructions = 0;
+    if (++g_pmu_rounds >= kPmuRounds) {
+        g_pmu_state = -1;
+        return;
+    }
+    g_pmu_set ^= 1;
+    PmuSelect(g_pmu_set);
+}
+
+void PmuSvcBegin() {
+    if (g_pmu_running) {
+        scePerfArmPmonStop(kPmuSelf);
+    }
+}
+
+void PmuSvcEnd() {
+    if (g_pmu_running) {
+        scePerfArmPmonStart(kPmuSelf);
+    }
+}
+
+void TakePmu(PmuStats& out) {
+    for (u32 i = 0; i < 2 * kPmuCounters; i++) {
+        out.counts[i] = g_pmu_counts[i].exchange(0, std::memory_order_relaxed);
+    }
+    for (u32 i = 0; i < 2; i++) {
+        out.instructions[i] = g_pmu_instructions[i].exchange(0, std::memory_order_relaxed);
+    }
 }
 
 void CodeUsage(u32& bytes, u32& blocks) {
