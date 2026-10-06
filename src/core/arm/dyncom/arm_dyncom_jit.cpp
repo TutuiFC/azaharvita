@@ -340,6 +340,7 @@ struct Offsets {
     u32 vfp = 0;   ///< VFP[0] (FPSCR y demas), 0.1.6.1.
     u32 link = 0;  ///< jit_link_budget (y jit_link_hops detras), 0.2.1.0.
     u32 cp15 = 0;  ///< CP15[0]: el TLS se lee en linea (0.2.1.0).
+    u32 excl_tag = 0, excl_state = 0; ///< El monitor exclusivo (0.3.0.4, ver Exclusive).
 };
 Offsets g_offsets;
 
@@ -565,53 +566,6 @@ enum AccessKind : u32 {
     kSignedHalf = 3,
     kSignedByte = 4,
 };
-
-/**
- * LDREX y STREX (y sus variantes de byte y media palabra), 0.2.1.0: lo mismo
- * que LDREX_INST/STREX_INST del interprete, con el mismo monitor exclusivo del
- * estado. Estaban en todas las rutinas de bloqueo del sistema del 3DS y
- * mandaban sus bloques enteros al interprete ("rech ldrex" en crash.txt).
- */
-u32 JitLoadExclusive(ARMul_State* cpu, u32 address, u32 kind) {
-    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
-    cpu->SetExclusiveMemoryAddress(address);
-    u32 value;
-    switch (kind) {
-    case kByte:
-        value = cpu->ReadMemory8(address);
-        break;
-    case kHalf:
-        value = cpu->ReadMemory16(address);
-        break;
-    default:
-        value = cpu->ReadMemory32(address);
-        break;
-    }
-    StopLinksIfRescheduled(cpu);
-    return value;
-}
-
-/// 0 si guarda, 1 si el monitor ya no es de esa direccion (como STREX).
-u32 JitStoreExclusive(ARMul_State* cpu, u32 address, u32 value, u32 kind) {
-    const SampledMicros timer{g_slow_us, TimeThisCall(++g_slow_calls)};
-    if (!cpu->IsExclusiveMemoryAccess(address)) {
-        return 1;
-    }
-    cpu->UnsetExclusiveMemoryAddress();
-    switch (kind) {
-    case kByte:
-        cpu->WriteMemory8(address, static_cast<u8>(value));
-        break;
-    case kHalf:
-        cpu->WriteMemory16(address, static_cast<u16>(value));
-        break;
-    default:
-        cpu->WriteMemory32(address, value);
-        break;
-    }
-    StopLinksIfRescheduled(cpu);
-    return 0;
-}
 
 /**
  * LDM/STM sin bit S, con las mismas cuentas que el interprete (LdnStM(...) y
@@ -1232,6 +1186,9 @@ bool Init(ARMul_State* cpu) {
     g_offsets.vfp = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->VFP[0]) - base);
     g_offsets.link = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->jit_link_budget) - base);
     g_offsets.cp15 = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->CP15[0]) - base);
+    g_offsets.excl_tag = static_cast<u32>(reinterpret_cast<const u8*>(&cpu->exclusive_tag) - base);
+    g_offsets.excl_state =
+        static_cast<u32>(reinterpret_cast<const u8*>(&cpu->exclusive_state) - base);
     // El enlace lee budget y hops con un LDRD: alineados a 8, seguidos y a
     // menos de 256 bytes del principio del estado.
     if (g_offsets.link > 248 ||
@@ -1254,7 +1211,8 @@ bool Init(ARMul_State* cpu) {
                                   g_offsets.z, g_offsets.c, g_offsets.v, g_offsets.t,
                                   g_offsets.cpsr, g_offsets.nirq,
                                   g_offsets.vfp + VFP_SYSTEM_REGISTER_COUNT * 4 - 4,
-                                  g_offsets.cp15 + CP15_REGISTER_COUNT * 4 - 4});
+                                  g_offsets.cp15 + CP15_REGISTER_COUNT * 4 - 4,
+                                  g_offsets.excl_tag, g_offsets.excl_state});
     if (highest > 4092) {
         Common::VitaNote("jit arm", fmt::format("desplazamientos de ARMul_State fuera de rango "
                                                 "({}): JIT apagado",
@@ -2046,6 +2004,10 @@ public:
         }
         // CLREX tambien lleva 0xF ahi: siempre se ejecuta.
         if (decoded.kind == Kind::Clrex) {
+            if (!check_mode) {
+                EmitClearExclusive();
+                return;
+            }
             e.Mrs(kFlags);
             e.MovReg(kT0, kFlags);
             CallHelper(reinterpret_cast<const void*>(&JitClrex));
@@ -2825,42 +2787,81 @@ private:
     }
 
     /**
-     * LDREX/STREX por JitLoadExclusive/JitStoreExclusive (0.2.1.0). Leen y
-     * escriben el monitor exclusivo y la memoria como el interprete. La
-     * variante de comprobacion no puede tocar ninguno de los dos: se abandona,
-     * como con las escrituras de CP15.
+     * LDREX/STREX (y B y H) EN LINEA (0.3.0.4). Desde 0.2.1.0 iban por dos
+     * funciones de C, y en el arranque de Pokemon Sol, con los cerrojos del
+     * sistema en bucle (los bloques mas calientes del perfil), eran
+     * 62.000-88.000 llamadas por fotograma y 55-75 ms: casi 1 us cada una,
+     * con el banco VFP y el FPSCR guardados y recuperados alrededor. Ahora el
+     * monitor del estado (exclusive_tag y exclusive_state, con las mismas
+     * cuentas que Set/Unset/IsExclusiveMemoryAccess) y la memoria por la tabla
+     * del JIT, como LDR y STR (ver MemoryAccess).
+     *
+     * STREX solo mira la etiqueta: Unset la deja en 0xFFFFFFFF, que no sale de
+     * ninguna direccion con los tres bits de abajo a cero, y Set pone las dos
+     * cosas a la vez; asi que "exclusive_state && etiqueta == direccion & ~7"
+     * es lo mismo que "etiqueta == direccion & ~7".
+     *
+     * La variante de comprobacion no puede tocar el monitor: se abandona, como
+     * con las escrituras de CP15.
      */
     void Exclusive(u32 inst, u32 pc) {
         const u32 op = Bits(inst, 20, 27);
         const bool load = (op & 1) != 0;
         const u32 kind = (op & 0x6) == 0x4 ? kByte : (op & 0x6) == 0x6 ? kHalf : kWord;
-        // A temporales que la llamada conserva ANTES de usar r0-r3: pueden
-        // venir de huecos de la cache.
-        LoadGuest(kRn, Bits(inst, 16, 19), pc);
-        if (!load) {
-            LoadGuest(kRm, Bits(inst, 0, 3), pc);
-        }
-        e.Mrs(kFlags);
-        e.MovReg(kT0, kFlags);
+        const u32 rd = Bits(inst, 12, 15);
         if (check_mode) {
+            e.Mrs(kFlags);
+            e.MovReg(kT0, kFlags);
             FlushForCall();
             e.Call(reinterpret_cast<const void*>(&CheckAbortThunk));
             // kRd y no un hueco: ReloadCachedRegs lo pisaria.
             e.MovReg(kRd, R0);
             ReloadCachedRegs();
-        } else {
-            e.Mov32(kRd, pc);
-            e.StrImm(kRd, kCpu, RegOffset(15));
-            if (load) {
-                e.Mov32(kRm, kind);
-                CallHelper(reinterpret_cast<const void*>(&JitLoadExclusive));
-            } else {
-                e.Mov32(kRs, kind);
-                CallHelper(reinterpret_cast<const void*>(&JitStoreExclusive));
-            }
+            e.MsrFlags(kT0);
+            StoreGuest(kRd, rd);
+            return;
         }
-        e.MsrFlags(kT0);
-        StoreGuest(kRd, Bits(inst, 12, 15));
+        const u32 address = OperandHost(kRn, Bits(inst, 16, 19), pc);
+        if (load) {
+            // SetExclusiveMemoryAddress, sin tocar los flags.
+            e.Emit(0xE3C00007u | (address << 16) | (kT1 << 12)); // BIC kT1, address, #7
+            e.StrImm(kT1, kCpu, g_offsets.excl_tag);
+            e.Emit(0xE3A00001u | (kT1 << 12)); // MOV kT1, #1
+            EmitStrbState(kT1);
+            LoadInto(address, kind, rd);
+            return;
+        }
+        const u32 value = OperandHost(kRm, Bits(inst, 0, 3), pc);
+        const bool keep_flags = flags_live_after;
+        if (keep_flags) {
+            e.Mrs(kFlags);
+        }
+        e.Emit(0xE3C00007u | (address << 16) | (kT0 << 12)); // BIC kT0, address, #7
+        e.LdrImm(kT1, kCpu, g_offsets.excl_tag);
+        e.Emit(0xE1500000u | (kT0 << 16) | kT1); // CMP kT0, kT1
+        e.Emit(0x13A00001u | (kRd << 12));       // MOVNE kRd, #1
+        const u32 failed = e.BranchPlaceholder(kCondNe);
+        EmitClearExclusive();
+        MemoryAccess(address, true, kind, value);
+        e.Emit(0xE3A00000u | (kRd << 12)); // MOV kRd, #0
+        e.PatchBranch(failed, e.Position());
+        if (keep_flags) {
+            e.MsrFlags(kFlags);
+        }
+        StoreGuest(kRd, rd);
+    }
+
+    /// UnsetExclusiveMemoryAddress (ver Exclusive) con kT1, sin tocar los flags.
+    void EmitClearExclusive() {
+        e.Emit(0xE3E00000u | (kT1 << 12)); // MVN kT1, #0
+        e.StrImm(kT1, kCpu, g_offsets.excl_tag);
+        e.Emit(0xE3A00000u | (kT1 << 12)); // MOV kT1, #0
+        EmitStrbState(kT1);
+    }
+
+    /// STRB value, [kCpu, #exclusive_state]
+    void EmitStrbState(u32 value) {
+        e.Emit(0xE5C00000u | (kCpu << 16) | (value << 12) | g_offsets.excl_state);
     }
 
     /**

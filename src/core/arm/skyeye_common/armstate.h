@@ -249,6 +249,16 @@ public:
     alignas(8) u32 jit_link_budget = 0;
     u32 jit_link_hops = 0;
 
+    /**
+     * El monitor exclusivo de LDREX/STREX, aqui y no al final (0.3.0.4): el
+     * JIT de la Vita los hace en linea y los lee y escribe con un LDR/STR
+     * desde el puntero al estado, cuyo inmediato llega a 4 KB; al final
+     * quedaban detras de block_cache, a mas de 64 KB. Solo se tocan por
+     * Set/Unset/IsExclusiveMemoryAccess (y el JIT, con las mismas cuentas).
+     */
+    u32 exclusive_tag = 0xFFFFFFFF; // The address for which the local monitor is in exclusive access mode
+    bool exclusive_state = false;
+
     std::array<u32, 16> Reg{}; // The current register file
     std::array<u32, 2> Reg_usr{};
     std::array<u32, 2> Reg_svc{};   // R13_SVC R14_SVC
@@ -340,9 +350,6 @@ private:
     // tag. This is the smallest granule allowed by the v7 spec, and is coincidentally just large
     // enough to support LDR/STREXD.
     static const u32 RESERVATION_GRANULE_MASK = 0xFFFFFFF8;
-
-    u32 exclusive_tag; // The address for which the local monitor is in exclusive access mode
-    bool exclusive_state;
 
 #ifdef ENABLE_GDBSTUB
     GDBStub::BreakpointAddress last_bkpt{};
