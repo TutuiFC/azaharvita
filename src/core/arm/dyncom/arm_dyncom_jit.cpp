@@ -3074,29 +3074,33 @@ private:
 
         // 0.2.1.0: el inmediato (8 bits por 4) siempre cabe en el ADD/SUB, y con
         // el PC de base (las constantes en coma flotante) es una constante.
+        // Con los VFP fijos y desplazamiento 0, el base tal cual (0.3.1.1): era
+        // un "ADD kRs, base, #0" en cada uno.
+        const bool base_as_is = vfp_regs_ && rn != 15 && imm32 == 0;
         if (rn == 15) {
             e.Mov32(kRs, add ? PcRead(pc) + imm32 : PcRead(pc) - imm32);
-        } else {
+        } else if (!base_as_is) {
             AddImmediate(kRs, OperandHost(kRn, rn, pc), imm32, add);
         }
         // kRs = direccion base+/-imm. Para double, la segunda palabra es +4.
         if (vfp_regs_) {
+            const u32 address = base_as_is ? OperandHost(kRn, rn, pc) : kRs;
             // Del registro a la memoria del juego y al reves, sin pasar por
             // ExtReg. El double, palabra a palabra como el interprete (cada
             // una con su pagina).
-            const auto word = [&](u32 single_index) {
-                e.LsrImm(kT0, kRs, 12);
+            const auto word = [&](u32 at, u32 single_index) {
+                e.LsrImm(kT0, at, 12);
                 e.LdrRegLsl2(kT1, kPages, kT0);
-                e.AddReg(kT1, kT1, kRs);
+                e.AddReg(kT1, kT1, at);
                 e.Emit((load ? 0xED900A00u : 0xED800A00u) | (kT1 << 16) |
                        ((single_index & 1u) << 22) | ((single_index >> 1) << 12));
             };
             if (single) {
-                word(d);
+                word(address, d);
             } else {
-                word(d * 2);
-                e.Emit(0xE2800004u | (kRs << 16) | (kRs << 12)); // ADD kRs, kRs, #4
-                word(d * 2 + 1);
+                word(address, d * 2);
+                e.Emit(0xE2800004u | (address << 16) | (kRs << 12)); // ADD kRs, address, #4
+                word(kRs, d * 2 + 1);
             }
             return;
         }
@@ -4498,6 +4502,33 @@ bool Analyze(ARMul_State* cpu, Block& block) {
             break;
         case Kind::VfpMove:
             use(Bits(inst, 12, 15));
+            break;
+        /**
+         * PUSH/POP, VPUSH/VPOP Y BX (0.3.1.1). No se contaban, y son los que
+         * mas usan la pila: en el perfil de Pokemon Sol (jit_calientes.bin)
+         * los bloques mas pesados recargaban sp de cpu->Reg en cada acceso
+         * con el hueco por bloque libre. El base cuenta dos veces si se
+         * escribe, y cada registro de la lista una.
+         */
+        case Kind::BlockTransfer:
+            use(Bits(inst, 16, 19));
+            if (Bits(inst, 21, 21) == 1) {
+                use(Bits(inst, 16, 19));
+            }
+            for (u32 reg = 0; reg < 15; reg++) {
+                if (((inst >> reg) & 1u) != 0) {
+                    use(reg);
+                }
+            }
+            break;
+        case Kind::VfpTransfer:
+            use(Bits(inst, 16, 19));
+            if (Bits(inst, 21, 21) == 1) {
+                use(Bits(inst, 16, 19));
+            }
+            break;
+        case Kind::BranchExchange:
+            use(Bits(inst, 0, 3));
             break;
         default:
             break;

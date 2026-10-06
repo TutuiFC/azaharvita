@@ -43,10 +43,6 @@ namespace Gxm {
 std::atomic<u32> RasterizerGXM::gpu_triangles{0};
 std::atomic<u32> RasterizerGXM::software_triangles{0};
 std::atomic<u32> RasterizerGXM::gpu_batches{0};
-std::atomic<u32> RasterizerGXM::vertex_reuse_hits{0};
-std::atomic<u32> RasterizerGXM::vertex_reuse_misses{0};
-std::atomic<u64> RasterizerGXM::vertex_reuse_bytes{0};
-std::atomic<u32> RasterizerGXM::vertex_reuse{1};
 std::atomic<u32> RasterizerGXM::gpu_scenes{0};
 std::atomic<u32> RasterizerGXM::gpu_writebacks{0};
 std::atomic<u32> RasterizerGXM::scene_close_full{0};
@@ -2302,9 +2298,6 @@ struct RasterizerGXM::BatchMemo {
         u32 attribute_count = 0;
         u32 stream_count = 0;
         u64 layout_key = 0;
-        /// Clave del programa que se usa (la generica o la del especializado):
-        /// de ella salen las de enlazado, que no se pueden compartir.
-        u64 link_key = 0;
         SceGxmVertexProgram* vertex_program = nullptr;
         bool converted = false;
         u32 converted_stride = 0;
@@ -5791,37 +5784,6 @@ static bool HwVsReject(const char* why) {
     return false;
 }
 
-bool RasterizerGXM::VertexCopyUsable(const VertexCopy& copy) const {
-    if (!vertex_buffer.Valid() || copy.generation != vertex_generation) {
-        return false;
-    }
-    if (copy.lap == vertex_lap) {
-        // Detras de la cabeza: en esta vuelta ya no se escribe ahi.
-        return true;
-    }
-    if (copy.lap + 1 != vertex_lap) {
-        return false;
-    }
-    /**
-     * De la vuelta anterior: solo si esta al menos dos tramos por delante de
-     * la cabeza. Marcarla como leida por la escena abierta en el tramo de al
-     * lado haria que la siguiente reserva que entre ahi cierre la escena y
-     * espere a la GPU entera (ver ReserveVertexSpace); mejor copiarla otra vez.
-     */
-    const u32 segment_bytes = vertex_buffer.Size() / kVertexSegments;
-    const u32 head = vertex_used == 0 ? 0 : (vertex_used - 1) / segment_bytes + 1;
-    return copy.offset / segment_bytes >= head + 1;
-}
-
-void RasterizerGXM::MarkVertexSpanRead(u32 offset, u32 bytes) {
-    const u32 segment_bytes = vertex_buffer.Size() / kVertexSegments;
-    const u32 first = offset / segment_bytes;
-    const u32 last = (offset + std::max(bytes, 1u) - 1) / segment_bytes;
-    for (u32 segment = first; segment <= last && segment < kVertexSegments; segment++) {
-        vertex_segments_pending |= 1u << segment;
-    }
-}
-
 u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
     /**
      * EL ANILLO EN TRAMOS (0.2.1.1). Al llegar al final del anillo se cerraba
@@ -5855,8 +5817,6 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
         vertex_used = 0;
         vertex_segment_fence.fill(fence_sent);
         vertex_segments_pending = 0;
-        vertex_generation++;
-        vertex_lap = 0;
     }
     const u32 size = vertex_buffer.Size();
     const u32 span = std::max(bytes, 1u);
@@ -5864,7 +5824,6 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
     const bool wrapped = offset + span > size;
     if (wrapped) {
         offset = 0;
-        vertex_lap++;
     }
     const u32 segment_bytes = size / kVertexSegments;
     const u32 first = offset / segment_bytes;
@@ -6149,80 +6108,81 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         // GenerateVertexShader): entra en la clave.
         program_key = Common::HashCombine(program_key, (pipeline->lit ? 2u : 0u) |
                                                            (pipeline->proj ? 1u : 0u));
+        if (hw_shaders->unlinkable.count(program_key) != 0) {
+            return HwVsReject("vs enlazar atributos");
+        }
         const char* reason = nullptr;
         const HwShaderCache::Program*& program = layout.program;
-        program = nullptr;
-        u64& link_key = layout.link_key;
-        link_key = program_key;
+        program = hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs,
+                                         pipeline->lit, pipeline->proj, &reason);
         /**
-         * EL ESPECIALIZADO PRIMERO (0.3.1.0). Desde 0.1.7.4 el programa se
-         * traducia con los uniforms booleanos como constantes solo si el
-         * generico no servia. Pero los shaders grandes de los juegos son de
-         * "todo en uno": la piel y cada modo de coordenadas de textura detras
-         * de su booleano (seis en el de Pokemon Sol), y en cada lote solo se
-         * usa un camino. Con los booleanos conocidos solo queda ese camino: la
-         * GPU ejecuta menos por vertice y el compilador de la consola, cuyo
-         * tiempo crece mucho mas que el tamano (4,6 KB 0,75 s; 8-10 KB 7-17 s;
-         * 24 KB 176 s, ver Build), tarda segundos en vez de minutos. Cada
-         * combinacion es un programa (su clave lleva los booleanos que el
-         * codigo lee); pasado el tope por programa, o sin heap, el generico.
+         * PROGRAMA ESPECIALIZADO CON LOS BOOLEANOS DEL LOTE (0.1.7.4).
+         *
+         * crash.txt de 0.1.6.3: el shader de piel de Rubi Omega se queda en la CPU
+         * por "salto en 0x130 -> 0x157" fuera de su tramo, y ese salto es un JMPU
+         * (salta segun un uniform booleano). Con los saltos de escape puestos, el
+         * mismo shader rompe el compilador (cg_error.txt). Pero los booleanos no
+         * cambian dentro de un lote: traducido con sus valores como constantes, el
+         * JMPU es un NOP o un salto fijo, y los IFU/CALLU que no se toman
+         * desaparecen con todo su codigo. El programa queda mucho mas pequeno y
+         * sencillo para el compilador y para la GPU.
+         *
+         * Solo si la traduccion generica no sirve, para no multiplicar programas
+         * que ya funcionan. La clave lleva los booleanos que el codigo lee.
          */
-        bool special_compiling = false;
-        if (specialize_vs.load(std::memory_order_relaxed) != 0) {
+        if (program == nullptr && reason != nullptr &&
+            specialize_vs.load(std::memory_order_relaxed) != 0 &&
+            std::strcmp(reason, "vs tope de programas") != 0 &&
+            std::strcmp(reason, "vs compilador roto") != 0 &&
+            std::strcmp(reason, "vs compilando") != 0 &&
+            std::strcmp(reason, "vs compilando largo") != 0 &&
+            std::strcmp(reason, "vs con geometria") != 0) {
             using namespace Pica::Shader::Generator::GXM;
             auto used = hw_shaders->used_bools.find(program_key);
             if (used == hw_shaders->used_bools.end()) {
                 used = hw_shaders->used_bools.emplace(program_key, UsedBoolUniforms(pica.vs_setup))
                            .first;
             }
-            if (used->second != 0) {
-                u32 bools = 0;
-                for (u32 i = 0; i < 16; i++) {
-                    if (((used->second >> i) & 1u) != 0 && pica.vs_setup.uniforms.b[i]) {
-                        bools |= 1u << i;
-                    }
-                }
-                const u64 special_key =
-                    Common::HashCombine(program_key, 0xB0010000ull | (bools & 0xFFFFu));
-                bool may_build = hw_shaders->unlinkable.count(special_key) == 0;
-                if (may_build && !hw_shaders->Has(special_key)) {
-                    u32& count = hw_shaders->specialized_count[program_key];
-                    if (count >= HwShaderCache::kMaxSpecializedPerProgram || CgHeapLow()) {
-                        may_build = false;
-                    } else {
-                        count++;
-                    }
-                }
-                if (may_build) {
-                    const char* special_reason = nullptr;
-                    g_cg_const_bools.store(kCgBoolsKnown | bools, std::memory_order_relaxed);
-                    program = hw_shaders->GetProgram(special_key, pica.vs_setup, vs_config, inputs,
-                                                     pipeline->lit, pipeline->proj,
-                                                     &special_reason);
-                    g_cg_const_bools.store(0, std::memory_order_relaxed);
-                    if (program != nullptr) {
-                        link_key = special_key;
-                        static u32 special_notes = 0;
-                        if (special_notes < 4) {
-                            special_notes++;
-                            NoteFmt("gxm vs", "especializado con booleanos {:#06x}: a la GPU",
-                                    bools);
-                        }
-                    } else if (special_reason != nullptr &&
-                               (std::strcmp(special_reason, "vs compilando") == 0 ||
-                                std::strcmp(special_reason, "vs compilando largo") == 0)) {
-                        special_compiling = true;
-                        reason = special_reason;
-                    }
+            u32 bools = 0;
+            for (u32 i = 0; i < 16; i++) {
+                if (((used->second >> i) & 1u) != 0 && pica.vs_setup.uniforms.b[i]) {
+                    bools |= 1u << i;
                 }
             }
-        }
-        if (program == nullptr && !special_compiling) {
-            if (hw_shaders->unlinkable.count(program_key) != 0) {
-                return HwVsReject("vs enlazar atributos");
+            const u64 special_key =
+                Common::HashCombine(program_key, 0xB0010000ull | (bools & 0xFFFFu));
+            const char* special_reason = nullptr;
+            // 0.1.7.9: un especializado NUEVO solo si queda hueco en el tope de
+            // ese shader y heap de sobra. Los ya hechos se siguen usando siempre.
+            bool may_build = true;
+            if (!hw_shaders->Has(special_key)) {
+                u32& count = hw_shaders->specialized_count[program_key];
+                if (count >= HwShaderCache::kMaxSpecializedPerProgram) {
+                    special_reason = "vs tope de especializados";
+                    may_build = false;
+                } else if (CgHeapLow()) {
+                    special_reason = "vs sin heap para especializar";
+                    may_build = false;
+                } else {
+                    count++;
+                }
             }
-            program = hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs,
-                                             pipeline->lit, pipeline->proj, &reason);
+            if (may_build) {
+                g_cg_const_bools.store(kCgBoolsKnown | bools, std::memory_order_relaxed);
+                program = hw_shaders->GetProgram(special_key, pica.vs_setup, vs_config, inputs,
+                                                 pipeline->lit, pipeline->proj, &special_reason);
+                g_cg_const_bools.store(0, std::memory_order_relaxed);
+            }
+            if (program != nullptr) {
+                static u32 special_notes = 0;
+                if (special_notes < 4) {
+                    special_notes++;
+                    NoteFmt("gxm vs", "especializado con booleanos {:#06x} ({}): a la GPU", bools,
+                            reason);
+                }
+            } else if (special_reason != nullptr) {
+                reason = special_reason;
+            }
         }
         if (program == nullptr) {
             // Compilandose (el generico o su especializado): el lote se salta.
@@ -6258,7 +6218,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         attribute_sources = {};
         attribute_count = 0;
         stream_count = 0;
-        layout_key = link_key;
+        layout_key = program_key;
         for (u32 reg = 0; reg < 16; reg++) {
             if (inputs[reg].kind != VSInputSource::Array || program->inputs[reg] == nullptr) {
                 continue;
@@ -6338,7 +6298,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         converted = false;
         converted_stride = 0;
         if (vertex_program == nullptr) {
-            u64 converted_key = Common::HashCombine(link_key, 0xF32F32F3ull);
+            u64 converted_key = Common::HashCombine(program_key, 0xF32F32F3ull);
             for (u32 i = 0; i < attribute_count; i++) {
                 SceGxmVertexAttribute& out = gxm_attributes[i];
                 out.streamIndex = 0;
@@ -6373,7 +6333,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             }
         }
         if (vertex_program == nullptr) {
-            hw_shaders->unlinkable.insert(link_key);
+            hw_shaders->unlinkable.insert(program_key);
             NoteSkip(5, "vs enlazar atributos");
             return HwVsReject("vs enlazar atributos");
         }
@@ -6403,7 +6363,6 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     // memoria del invitado.
     std::array<const u8*, 12> stream_source{};
     std::array<u32, 12> stream_bytes{};
-    std::array<PAddr, 12> stream_address{};
     u32 total_bytes = 0;
     for (u32 stream = 0; stream < stream_count; stream++) {
         const auto& loader = attributes.attribute_loaders[loader_of_stream[stream]];
@@ -6416,7 +6375,6 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
         stream_source[stream] = first;
         stream_bytes[stream] = bytes;
-        stream_address[stream] = start;
         total_bytes += (bytes + 15u) & ~15u;
     }
     if (converted) {
@@ -6451,32 +6409,11 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             sequential[i] = static_cast<u16>(i);
         }
     }
-    // Ver VertexCopy: los flujos que ya estan en el anillo no se reservan.
-    std::array<const u8*, 12> stream_data{};
-    std::array<u64, 12> stream_hash{};
-    std::array<VertexCopy*, 12> stream_copy{};
-    std::array<bool, 12> stream_reused{};
-    const bool reuse = !converted && vertex_reuse.load(std::memory_order_relaxed) != 0;
-    u32 reserve_bytes = total_bytes;
-    if (reuse) {
-        if (vertex_copies.size() > 4096) {
-            vertex_copies.clear();
-        }
-        for (u32 stream = 0; stream < stream_count; stream++) {
-            stream_hash[stream] = Common::ComputeHash64(stream_source[stream], stream_bytes[stream]);
-            VertexCopy& copy = vertex_copies[(static_cast<u64>(stream_bytes[stream]) << 32) |
-                                             stream_address[stream]];
-            stream_copy[stream] = &copy;
-            if (copy.hash == stream_hash[stream] && VertexCopyUsable(copy)) {
-                stream_reused[stream] = true;
-                reserve_bytes -= (stream_bytes[stream] + 15u) & ~15u;
-            }
-        }
-    }
-    u8* space = ReserveVertexSpace(reserve_bytes);
+    u8* space = ReserveVertexSpace(total_bytes);
     if (space == nullptr) {
         return HwVsReject("memoria vertices");
     }
+    std::array<const u8*, 12> stream_data{};
     if (converted) {
         // Un float por componente, en el orden de gxm_attributes (ver arriba).
         float* out = reinterpret_cast<float*>(space);
@@ -6519,59 +6456,10 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         space += (converted_stride * vertex_range + 15u) & ~15u;
         stream_count = 1;
     } else {
-        u8* const ring = static_cast<u8*>(vertex_buffer.Data());
-        const auto copy_stream = [&](u32 stream, u8* at) {
-            std::memcpy(at, stream_source[stream], stream_bytes[stream]);
-            stream_data[stream] = at;
-            if (reuse) {
-                VertexCopy& copy = *stream_copy[stream];
-                copy.hash = stream_hash[stream];
-                copy.offset = static_cast<u32>(at - ring);
-                copy.lap = vertex_lap;
-                copy.generation = vertex_generation;
-                vertex_reuse_misses.fetch_add(1, std::memory_order_relaxed);
-            }
-        };
         for (u32 stream = 0; stream < stream_count; stream++) {
-            if (stream_reused[stream]) {
-                continue;
-            }
-            copy_stream(stream, space);
+            std::memcpy(space, stream_source[stream], stream_bytes[stream]);
+            stream_data[stream] = space;
             space += (stream_bytes[stream] + 15u) & ~15u;
-        }
-        // La reserva pudo pisar alguna de las reutilizadas: esas, de nuevo.
-        for (u32 round = 0; round <= stream_count; round++) {
-            u32 again = 0;
-            for (u32 stream = 0; stream < stream_count; stream++) {
-                if (stream_reused[stream] && !VertexCopyUsable(*stream_copy[stream])) {
-                    stream_reused[stream] = false;
-                    again += (stream_bytes[stream] + 15u) & ~15u;
-                    stream_data[stream] = nullptr;
-                }
-            }
-            if (again == 0) {
-                break;
-            }
-            u8* more = ReserveVertexSpace(again);
-            if (more == nullptr) {
-                return HwVsReject("memoria vertices");
-            }
-            for (u32 stream = 0; stream < stream_count; stream++) {
-                if (!stream_reused[stream] && stream_data[stream] == nullptr) {
-                    copy_stream(stream, more);
-                    more += (stream_bytes[stream] + 15u) & ~15u;
-                }
-            }
-        }
-        for (u32 stream = 0; stream < stream_count; stream++) {
-            if (!stream_reused[stream]) {
-                continue;
-            }
-            const VertexCopy& copy = *stream_copy[stream];
-            stream_data[stream] = ring + copy.offset;
-            MarkVertexSpanRead(copy.offset, stream_bytes[stream]);
-            vertex_reuse_hits.fetch_add(1, std::memory_order_relaxed);
-            vertex_reuse_bytes.fetch_add(stream_bytes[stream], std::memory_order_relaxed);
         }
     }
     const u16* draw_indices = static_cast<const u16*>(index_buffer.Data());
@@ -6712,13 +6600,10 @@ std::string RasterizerGXM::TakeBatchProfile() {
     std::string text = fmt::format(
         "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
         "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
-        "muestras) | flujos reutilizados {} copiados {} ({} KB sin copiar)",
+        "muestras)",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
-        avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples,
-        vertex_reuse_hits.exchange(0, std::memory_order_relaxed),
-        vertex_reuse_misses.exchange(0, std::memory_order_relaxed),
-        vertex_reuse_bytes.exchange(0, std::memory_order_relaxed) / 1024);
+        avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples);
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
     state_scene_us = 0;

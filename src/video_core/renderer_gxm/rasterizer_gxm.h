@@ -8,7 +8,6 @@
 #include <atomic>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include <psp2/gxm.h>
 #include "common/common_types.h"
@@ -276,12 +275,6 @@ public:
      * tres triangulos, y lo que hay que optimizar en cada caso es lo contrario.
      */
     static std::atomic<u32> gpu_batches;
-    /// Flujos de vertices reutilizados del anillo y copiados (ver VertexCopy).
-    static std::atomic<u32> vertex_reuse_hits;
-    static std::atomic<u32> vertex_reuse_misses;
-    static std::atomic<u64> vertex_reuse_bytes;
-    /// 0 = copiar siempre, como hasta 0.3.0.8.
-    static std::atomic<u32> vertex_reuse;
     /**
      * Escenas cerradas y volcados de framebuffer en el intervalo.
      *
@@ -527,30 +520,6 @@ private:
     /// si la GPU puede estar leyendo ese tramo (ver el .cpp). nullptr si no
     /// hay memoria.
     u8* ReserveVertexSpace(u32 bytes);
-    /**
-     * VERTICES REUTILIZADOS (0.3.0.9). Cada lote copiaba sus flujos de vertices
-     * de la memoria del juego al anillo, en CDRAM, que la CPU escribe despacio
-     * (ver Pool), aunque fueran los mismos bytes que el fotograma anterior: los
-     * modelos no cambian, solo sus matrices (que van en los uniforms). Ahora se
-     * apunta donde quedo cada flujo (por direccion y tamano) con el hash de sus
-     * bytes; si el hash coincide y el anillo no lo ha pisado, se usa esa copia.
-     * El hash se calcula SIEMPRE: el juego escribe con la CPU sin avisar (las
-     * llamadas de cache de datos son vacias y el JIT escribe directo), asi que
-     * no hay otra forma de saber que no ha cambiado. Leer es mas barato que
-     * escribir en CDRAM.
-     */
-    struct VertexCopy {
-        u64 hash = 0;
-        u32 offset = 0;
-        u32 lap = 0;
-        u32 generation = 0xFFFFFFFFu;
-    };
-    bool VertexCopyUsable(const VertexCopy& copy) const;
-    void MarkVertexSpanRead(u32 offset, u32 bytes);
-    std::unordered_map<u64, VertexCopy> vertex_copies;
-    /// Vueltas del anillo y su version (cambia al reservarlo de nuevo).
-    u32 vertex_lap = 0;
-    u32 vertex_generation = 0;
 
     /// La ablacion activa manda este estado a la CPU (ver Ablation).
     bool AblatedByMode() const;
