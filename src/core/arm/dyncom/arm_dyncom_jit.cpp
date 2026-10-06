@@ -42,6 +42,7 @@ std::atomic<u32> direct_link{1};
 std::atomic<u32> direct_link_patch{1};
 std::atomic<u32> superblocks{1};
 std::atomic<u32> global_regs{1};
+std::atomic<u32> vfp_regs{1};
 std::atomic<u32> vfp_native{1};
 std::atomic<u32> thumb{1};
 
@@ -350,7 +351,8 @@ void EmitEnterHead(Emitter& e) {
 }
 
 /// Salida de los bloques: APSR -> flags del juego y vuelta a C++ (r0-r1 libres).
-void EmitExitTail(Emitter& e) {
+/// Con 'vfp', d8-d15 del que llamo vuelven de la pila (ver EmitEnterHead).
+void EmitExitTail(Emitter& e, bool vfp = false) {
     e.Mrs(R0);
     e.LsrImm(R1, R0, 31);
     e.StrImm(R1, kCpu, g_offsets.n);
@@ -360,7 +362,26 @@ void EmitExitTail(Emitter& e) {
     e.StrImm(R1, kCpu, g_offsets.c);
     e.Ubfx(R1, R0, 28, 1);
     e.StrImm(R1, kCpu, g_offsets.v);
+    if (vfp) {
+        e.Emit(0xECBD8B10u); // VPOP {d8-d15}
+    }
     e.Pop(0x9FF0u); // r4-r12 y pc
+}
+
+/// rd = &cpu->ExtReg[0].
+void EmitExtBase(Emitter& e, u32 rd) {
+    u32 encoded = 0;
+    if (Emitter::EncodeImmediate(g_offsets.ext, &encoded)) {
+        e.Emit(0xE2800000u | (kCpu << 16) | (rd << 12) | encoded); // ADD rd, kCpu, #ext
+    } else {
+        e.Mov32(rd, g_offsets.ext);
+        e.AddReg(rd, kCpu, rd);
+    }
+}
+
+/// VLDMIA/VSTMIA base, {d0-d15}: los 32 singles del juego de una vez.
+void EmitVfpBank(Emitter& e, u32 base, bool load) {
+    e.Emit((load ? 0xEC900B20u : 0xEC800B20u) | (base << 16));
 }
 
 /// Flags del juego -> APSR, con r0-r3.
@@ -945,6 +966,8 @@ struct Block {
     bool uses_cache = false;
     /// r0-r3 del juego fijos en r0-r3 del anfitrion (ver REGISTROS FIJOS).
     bool global_regs = false;
+    /// s0-s31 del juego en s0-s31 del anfitrion (ver REGISTROS VFP FIJOS).
+    bool vfp_regs = false;
     /**
      * ENLACES PARCHEADOS (0.2.2.9). Los enlaces directos de otros bloques que
      * apuntan a este: con la entrada publicada se reescriben para saltar
@@ -986,12 +1009,18 @@ u32 g_cold_start_words = 0;
 u32 g_cold_used_words = 0;
 /// Entrada y salida comunes (0.2.3.8, ver Compiler::SetSharedExit): al
 /// principio de la zona fria, fuera de lo que se vacia.
-constexpr u32 kSharedWords = 64;
-u32* g_shared_enter = nullptr;
-u32* g_shared_exit = nullptr;
-/// Las mismas con r0-r3 del juego cargados al entrar y guardados al salir.
-u32* g_shared_enter_regs = nullptr;
-u32* g_shared_exit_regs = nullptr;
+constexpr u32 kSharedWords = 192;
+/**
+ * Cuatro variantes de cada una, por modo (SharedMode): con r0-r3 del juego
+ * (REGISTROS FIJOS) y con s0-s31 (REGISTROS VFP FIJOS), cargados al entrar y
+ * guardados al salir.
+ */
+std::array<u32*, 4> g_shared_enter{};
+std::array<u32*, 4> g_shared_exit{};
+
+u32 SharedMode(bool global_regs, bool vfp_regs) {
+    return (global_regs ? 1u : 0u) | (vfp_regs ? 2u : 0u);
+}
 u32 g_code_flushes = 0;
 
 /**
@@ -1215,30 +1244,42 @@ bool Init(ARMul_State* cpu) {
         }
         u32* const shared = g_code + g_cold_start_words;
         Emitter e{shared, kSharedWords};
-        // Entrada: r0 = cpu, r1 = paginas, r2 = donde empieza el bloque.
-        EmitEnterHead(e);
-        e.MovReg(kRd, R2);
-        EmitLoadFlags(e);
-        e.Emit(0xE12FFF10u | kRd); // BX kRd
-        const u32 enter_regs_at = e.Position();
-        EmitEnterHead(e);
-        e.MovReg(kRd, R2);
-        EmitLoadFlags(e);
-        for (u32 g = 0; g < 4; g++) {
-            e.LdrImm(g, kCpu, RegOffset(g));
+        for (u32 mode = 0; mode < 4; mode++) {
+            const bool regs = (mode & 1u) != 0;
+            const bool vfp = (mode & 2u) != 0;
+            // Entrada: r0 = cpu, r1 = paginas, r2 = donde empieza el bloque. Con
+            // los VFP del juego en d0-d15, los d8-d15 del que llama (AAPCS) se
+            // guardan en la pila; lr ya esta en ella y sirve de base.
+            g_shared_enter[mode] = e.Address(e.Position());
+            EmitEnterHead(e);
+            if (vfp) {
+                e.Emit(0xED2D8B10u); // VPUSH {d8-d15}
+            }
+            e.MovReg(kRd, R2);
+            EmitLoadFlags(e);
+            if (regs) {
+                for (u32 g = 0; g < 4; g++) {
+                    e.LdrImm(g, kCpu, RegOffset(g));
+                }
+            }
+            if (vfp) {
+                EmitExtBase(e, 14);
+                EmitVfpBank(e, 14, true);
+            }
+            e.Emit(0xE12FFF10u | kRd); // BX kRd
+            // Salida: lr ya lo vuelco el bloque (o es suyo, sin cachear).
+            g_shared_exit[mode] = e.Address(e.Position());
+            if (regs) {
+                for (u32 g = 0; g < 4; g++) {
+                    e.StrImm(g, kCpu, RegOffset(g));
+                }
+            }
+            if (vfp) {
+                EmitExtBase(e, 14);
+                EmitVfpBank(e, 14, false);
+            }
+            EmitExitTail(e, vfp);
         }
-        e.Emit(0xE12FFF10u | kRd); // BX kRd
-        // La salida con r0-r3 los guarda y sigue por la de siempre.
-        const u32 exit_regs_at = e.Position();
-        for (u32 g = 0; g < 4; g++) {
-            e.StrImm(g, kCpu, RegOffset(g));
-        }
-        const u32 exit_at = e.Position();
-        EmitExitTail(e);
-        g_shared_enter = shared;
-        g_shared_exit = shared + exit_at;
-        g_shared_enter_regs = shared + enter_regs_at;
-        g_shared_exit_regs = shared + exit_regs_at;
         sceKernelSyncVMDomain(g_code_block, shared, kSharedWords * 4);
         sceKernelCloseVMDomain();
         if (e.Overflowed()) {
@@ -1716,7 +1757,7 @@ public:
      * REGISTROS FIJOS (0.3.0.0). r0-r3 del juego viven en r0-r3 del
      * anfitrion durante toda una cadena de bloques: no se cargan al entrar en
      * cada bloque ni se guardan en cada enlace, solo al entrar desde C++
-     * (g_shared_enter_regs), al volver (g_shared_exit_regs) y alrededor de
+     * (g_shared_enter con registros), al volver (g_shared_exit) y alrededor de
      * cada llamada a C (FlushForCall/ReloadCachedRegs). En la muestra de
      * bloques de Pokemon Sol (jit_volcado.bin de 0.2.3.9) el 24 % del codigo
      * caliente eran LDR/STR del estado de la CPU, y los de r0 y r1 los que
@@ -1728,6 +1769,24 @@ public:
      */
     void SetGlobalRegs(bool global) {
         global_regs_ = global;
+    }
+
+    /**
+     * REGISTROS VFP FIJOS (0.3.0.1). s0-s31 del juego viven en s0-s31 del
+     * anfitrion (d0-d15, los mismos numeros) durante toda la cadena de
+     * bloques: la aritmetica VFP se ejecuta TAL CUAL (una instruccion), VLDR y
+     * VSTR van de la memoria del juego al registro, VMOV es un VMOV y
+     * VPUSH/VPOP/VLDM/VSTM son un VLDM/VSTM. Hasta 0.3.0.0 cada operacion
+     * cargaba sus operandos de cpu->ExtReg y guardaba el resultado (de tres a
+     * cinco instrucciones mas), VPUSH {d8-d15} eran 32 LDR/STR... En el perfil
+     * de Zafiro Alfa (jit_calientes.txt), las VFP son el 28 % de las
+     * instrucciones de los 96 bloques mas calientes, a 10,6 palabras cada una
+     * contra 5,8 las enteras: el 41 % del codigo que se ejecuta. El banco
+     * entero va a cpu->ExtReg al volver a C++ y alrededor de cada llamada a C
+     * (dos instrucciones), y se recarga despues. Solo la variante normal.
+     */
+    void SetVfpRegs(bool vfp) {
+        vfp_regs_ = vfp;
     }
 
     /// Primeras instrucciones del cuerpo: cache de registros (4.3).
@@ -2073,6 +2132,7 @@ private:
     const u32* shared_exit_ = nullptr;
     u32* profile_counter_ = nullptr;
     bool global_regs_ = false;
+    bool vfp_regs_ = false;
 
     void DeferCold(std::vector<u32> branches, std::function<void()> body) {
         DeferCold(std::move(branches), cache_written, std::move(body));
@@ -2112,7 +2172,7 @@ private:
             return;
         }
         // Con los registros fijos, r0-r3 siguen en sus huecos al enlazar y los
-        // guarda g_shared_exit_regs al volver a C++.
+        // guarda g_shared_exit al volver a C++.
         for (u32 g = global_regs_ ? 4u : 0u; g < 16; g++) {
             const s8 host = cache_map[g];
             if (host >= 0 && cache_written[g]) {
@@ -2124,18 +2184,28 @@ private:
     /// El vuelco antes de una llamada a C: con los registros fijos, r0-r3
     /// siempre (pueden venir escritos de otro bloque).
     void FlushForCall() {
-        if (!global_regs_) {
-            FlushCachedRegs();
-            return;
-        }
-        for (u32 g = 0; g < 4; g++) {
-            e.StrImm(g, kCpu, RegOffset(g));
+        if (global_regs_) {
+            for (u32 g = 0; g < 4; g++) {
+                e.StrImm(g, kCpu, RegOffset(g));
+            }
         }
         FlushCachedRegs();
+        // Con los VFP fijos, el banco a cpu->ExtReg: la llamada destroza
+        // d0-d7 y puede leer ExtReg. kRs esta libre en todas las llamadas (la
+        // direccion de las de memoria va en kT1, ver SaveAccessOperands).
+        if (vfp_regs_) {
+            EmitExtBase(e, kRs);
+            EmitVfpBank(e, kRs, false);
+        }
     }
 
     /// Recarga r0-r2 despues de un helper que pudo escribir cpu->Reg (LDM...).
     void ReloadCachedRegs() {
+        // kRs no lo usa nadie despues de una llamada (ver FlushForCall).
+        if (vfp_regs_) {
+            EmitExtBase(e, kRs);
+            EmitVfpBank(e, kRs, true);
+        }
         if (!cache_dirty) {
             return;
         }
@@ -2695,6 +2765,18 @@ private:
     void VfpMove(u32 inst, u32 pc) {
         const bool to_arm = Bits(inst, 20, 20) == 1;
         const u32 rt = Bits(inst, 12, 15);
+        if (vfp_regs_) {
+            // Los mismos Vn y N: el single del juego es el del anfitrion.
+            const u32 vn = inst & ((0xFu << 16) | (1u << 7));
+            if (to_arm) {
+                e.Emit(0xEE100A10u | vn | (kRd << 12)); // VMOV kRd, sN
+                StoreGuest(kRd, rt);
+            } else {
+                const u32 source = OperandHost(kRd, rt, pc);
+                e.Emit(0xEE000A10u | vn | (source << 12)); // VMOV sN, source
+            }
+            return;
+        }
         // Mismo indice que VMOVBRS: n = Vn<<1 | bit7 (bit 7 = N). ARREGLO
         // 0.1.5.5: antes se ignoraba el bit 7 y s1, s3, s5... iban al single
         // par de al lado.
@@ -2734,6 +2816,26 @@ private:
             AddImmediate(kRs, OperandHost(kRn, rn, pc), imm32, add);
         }
         // kRs = direccion base+/-imm. Para double, la segunda palabra es +4.
+        if (vfp_regs_) {
+            // Del registro a la memoria del juego y al reves, sin pasar por
+            // ExtReg. El double, palabra a palabra como el interprete (cada
+            // una con su pagina).
+            const auto word = [&](u32 single_index) {
+                e.LsrImm(kT0, kRs, 12);
+                e.LdrRegLsl2(kT1, kPages, kT0);
+                e.AddReg(kT1, kT1, kRs);
+                e.Emit((load ? 0xED900A00u : 0xED800A00u) | (kT1 << 16) |
+                       ((single_index & 1u) << 22) | ((single_index >> 1) << 12));
+            };
+            if (single) {
+                word(d);
+            } else {
+                word(d * 2);
+                e.Emit(0xE2800004u | (kRs << 16) | (kRs << 12)); // ADD kRs, kRs, #4
+                word(d * 2 + 1);
+            }
+            return;
+        }
         if (single) {
             if (load) {
                 MemoryAccess(kRs, false, kWord);
@@ -2831,9 +2933,11 @@ public:
         if (keep_flags) {
             e.MsrFlags(kT0);
         }
-        // kT1 = &ExtReg[0]
-        e.Mov32(kT1, g_offsets.ext);
-        e.AddReg(kT1, kCpu, kT1);
+        // kT1 = &ExtReg[0] (con los VFP fijos, los operandos ya estan).
+        if (!vfp_regs_) {
+            e.Mov32(kT1, g_offsets.ext);
+            e.AddReg(kT1, kCpu, kT1);
+        }
         e.Emit(0xEEF10A10u | (kRn << 12)); // VMRS kRn, FPSCR (el del emulador)
         e.Emit(0xEEE10A10u | (kRd << 12)); // VMSR FPSCR, kRd (el del juego)
         for (u32 k = 0; k < count; k++) {
@@ -2880,6 +2984,11 @@ private:
     /// Operandos, operacion y resultado de una aritmetica VFP, con el FPSCR del
     /// juego ya puesto y kT1 = &ExtReg[0] (ver VfpCdpRun).
     void VfpCdpBody(u32 inst) {
+        if (vfp_regs_) {
+            // La del juego tal cual: sus registros son los del anfitrion.
+            e.Emit((inst & 0x0FFFFFFFu) | (kAlways << 28));
+            return;
+        }
         int index = -1;
         DecodeARMInstruction(inst, &index);
         const bool sz = Bits(inst, 8, 8) == 1;
@@ -3072,13 +3181,25 @@ private:
         AddSmall(start, base, first);
         std::vector<u32> slow;
         DirectSpan(start, words, slow);
-        for (u32 k = 0; k < words; k++) {
-            if (load) {
-                e.LdrImm(kRd, kT1, 4 * k);
-                e.StrImm(kRd, kCpu, ExtOffset(first_ext + k));
+        if (vfp_regs_) {
+            // Un VLDMIA/VSTMIA kT1 de los mismos registros (sin escritura del
+            // base: la hace AddSmall abajo, como hasta ahora).
+            u32 copy = (load ? 0xEC900000u : 0xEC800000u) | (kT1 << 16) | words;
+            if (single) {
+                copy |= 0xA00u | ((first_ext & 1u) << 22) | ((first_ext >> 1) << 12);
             } else {
-                e.LdrImm(kRd, kCpu, ExtOffset(first_ext + k));
-                e.StrImm(kRd, kT1, 4 * k);
+                copy |= 0xB00u | ((d & 0x10u) << 18) | ((d & 0xFu) << 12);
+            }
+            e.Emit(copy);
+        } else {
+            for (u32 k = 0; k < words; k++) {
+                if (load) {
+                    e.LdrImm(kRd, kT1, 4 * k);
+                    e.StrImm(kRd, kCpu, ExtOffset(first_ext + k));
+                } else {
+                    e.LdrImm(kRd, kCpu, ExtOffset(first_ext + k));
+                    e.StrImm(kRd, kT1, 4 * k);
+                }
             }
         }
         if (writeback) {
@@ -3949,6 +4070,9 @@ bool Analyze(ARMul_State* cpu, Block& block) {
     block.cache_map.fill(-1);
     block.uses_cache = false;
     block.global_regs = false;
+    // Para todos los bloques por igual (las cadenas los mezclan), como los
+    // registros fijos; al cambiar el ajuste se vacia todo.
+    block.vfp_regs = vfp_regs.load(std::memory_order_relaxed) != 0;
     if (!(block.thumb ? DecodeThumbBlock(cpu, block) : DecodeArmBlock(cpu, block))) {
         return false;
     }
@@ -4223,9 +4347,11 @@ bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* c
     u32 entry_index = 0;
     u32 chain_entry = 0;
     const bool global = block.global_regs && !check_mode;
+    const bool vfp = block.vfp_regs && !check_mode;
     compiler.SetGlobalRegs(global);
+    compiler.SetVfpRegs(vfp);
     if (e.HasColdZone()) {
-        compiler.SetSharedExit(global ? g_shared_exit_regs : g_shared_exit);
+        compiler.SetSharedExit(g_shared_exit[SharedMode(global, vfp)]);
         chain_entry = compiler.ChainEntryPosition();
         entry_index = chain_entry;
         if (g_profile_active) {
@@ -4782,7 +4908,7 @@ u64 RunCompiled(ARMul_State* cpu, Block& block, u8* const* pages, u64 chain_budg
     g_link_refund = 0;
     // block.code es el cuerpo (0.2.3.8): se entra por g_shared_enter.
     using EnterFn = void (*)(ARMul_State*, u8* const*, BlockFn);
-    reinterpret_cast<EnterFn>(block.global_regs ? g_shared_enter_regs : g_shared_enter)(
+    reinterpret_cast<EnterFn>(g_shared_enter[SharedMode(block.global_regs, block.vfp_regs)])(
         cpu, pages, block.code);
     const u32 hops = cpu->jit_link_hops;
     const u64 linked = budget - cpu->jit_link_budget - g_link_withdrawn;

@@ -138,7 +138,12 @@ bool g_compile_over_budget = false;
  * sale a cero, y lo liberado espera en una cola (hasta kQuarantineBytes)
  * antes de volver al heap, para que un acceso tardio lea lo que habia.
  */
-constexpr std::size_t kQuarantineBytes = 8u * 1024u * 1024u;
+// 2 MB desde 0.3.0.1 (eran 8): en el 3D de Zafiro Alfa el heap se quedo sin
+// sitio ("bad_alloc" con el compilador cayendose) y esto eran 6 MB de mas.
+constexpr std::size_t kQuarantineBytes = 2u * 1024u * 1024u;
+/// Reservas de la compilacion en curso: cuantas y cuanto (ver CompileCg).
+u32 g_alloc_calls = 0;
+u64 g_alloc_total = 0;
 std::deque<std::pair<void*, std::size_t>> g_quarantine;
 std::size_t g_quarantine_bytes = 0;
 
@@ -166,6 +171,10 @@ void* CgAlloc(unsigned int size) {
         return nullptr;
     }
     std::memset(pointer, 0, rounded);
+    if (g_tracking) {
+        g_alloc_calls++;
+        g_alloc_total += rounded;
+    }
     try {
         g_compile_allocs.insert(pointer);
     } catch (...) {
@@ -1085,6 +1094,18 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         return nullptr;
     }
     const unsigned long long compile_begin_us = Common::VitaMicros();
+    /**
+     * CPU DE VERDAD FRENTE A RELOJ (0.3.0.1). Los de vertices grandes tardan
+     * 70-120 s en Zafiro Alfa con el compilador ya solo en su nucleo
+     * (0.2.3.8): o le siguen quitando la CPU, o el compilador es asi de lento
+     * con ellos. runClocks del hilo dice cuanto ha corrido de verdad, y las
+     * reservas, si se le va el tiempo en pedir memoria.
+     */
+    SceKernelThreadInfo info_before{};
+    info_before.size = sizeof(info_before);
+    const bool have_info = sceKernelGetThreadInfo(sceKernelGetThreadId(), &info_before) >= 0;
+    g_alloc_calls = 0;
+    g_alloc_total = 0;
     g_source.fileName = name;
     g_source.text = source;
     g_source.size = static_cast<SceUInt32>(std::strlen(source));
@@ -1260,8 +1281,21 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         static u32 time_notes = 0;
         if (time_notes < 60) {
             time_notes++;
+            SceKernelThreadInfo info_after{};
+            info_after.size = sizeof(info_after);
+            std::string cpu = "-";
+            if (have_info && sceKernelGetThreadInfo(sceKernelGetThreadId(), &info_after) >= 0) {
+                cpu = fmt::format("{} ms, nucleo {}, {} expulsiones",
+                                  (info_after.runClocks - info_before.runClocks) / 1000,
+                                  info_after.currentCpuId,
+                                  info_after.threadPreemptCount - info_before.threadPreemptCount);
+            }
             Common::VitaNote("gxm compila",
-                             fmt::format("{}: compilado en {} ms", name, compile_ms).c_str());
+                             fmt::format("{}: compilado en {} ms (CPU {}; {} reservas, {} MB "
+                                         "pedidos)",
+                                         name, compile_ms, cpu, g_alloc_calls,
+                                         g_alloc_total >> 20)
+                                 .c_str());
         }
     }
     StoreCached(key, cache_path, *output);

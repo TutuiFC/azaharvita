@@ -133,6 +133,11 @@ extern std::atomic<u32> superblocks;
 /// vacia la cache de bloques.
 extern std::atomic<u32> global_regs;
 
+/// Registros VFP fijos (0.3.0.1): s0-s31 del juego en s0-s31 del anfitrion
+/// durante las cadenas de bloques (ver REGISTROS VFP FIJOS). 0 = en
+/// cpu->ExtReg, como antes. Al cambiarlo se vacia la cache de bloques.
+extern std::atomic<u32> vfp_regs;
+
 /**
  * Aritmetica VFP en el hardware de la Vita (0.1.7.0), con el FPSCR del juego
  * cargado durante cada instruccion. 0 = por las funciones del interprete
