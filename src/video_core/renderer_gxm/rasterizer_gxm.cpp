@@ -2302,6 +2302,9 @@ struct RasterizerGXM::BatchMemo {
         u32 attribute_count = 0;
         u32 stream_count = 0;
         u64 layout_key = 0;
+        /// Clave del programa que se usa (la generica o la del especializado):
+        /// de ella salen las de enlazado, que no se pueden compartir.
+        u64 link_key = 0;
         SceGxmVertexProgram* vertex_program = nullptr;
         bool converted = false;
         u32 converted_stride = 0;
@@ -6146,81 +6149,80 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         // GenerateVertexShader): entra en la clave.
         program_key = Common::HashCombine(program_key, (pipeline->lit ? 2u : 0u) |
                                                            (pipeline->proj ? 1u : 0u));
-        if (hw_shaders->unlinkable.count(program_key) != 0) {
-            return HwVsReject("vs enlazar atributos");
-        }
         const char* reason = nullptr;
         const HwShaderCache::Program*& program = layout.program;
-        program = hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs,
-                                         pipeline->lit, pipeline->proj, &reason);
+        program = nullptr;
+        u64& link_key = layout.link_key;
+        link_key = program_key;
         /**
-         * PROGRAMA ESPECIALIZADO CON LOS BOOLEANOS DEL LOTE (0.1.7.4).
-         *
-         * crash.txt de 0.1.6.3: el shader de piel de Rubi Omega se queda en la CPU
-         * por "salto en 0x130 -> 0x157" fuera de su tramo, y ese salto es un JMPU
-         * (salta segun un uniform booleano). Con los saltos de escape puestos, el
-         * mismo shader rompe el compilador (cg_error.txt). Pero los booleanos no
-         * cambian dentro de un lote: traducido con sus valores como constantes, el
-         * JMPU es un NOP o un salto fijo, y los IFU/CALLU que no se toman
-         * desaparecen con todo su codigo. El programa queda mucho mas pequeno y
-         * sencillo para el compilador y para la GPU.
-         *
-         * Solo si la traduccion generica no sirve, para no multiplicar programas
-         * que ya funcionan. La clave lleva los booleanos que el codigo lee.
+         * EL ESPECIALIZADO PRIMERO (0.3.1.0). Desde 0.1.7.4 el programa se
+         * traducia con los uniforms booleanos como constantes solo si el
+         * generico no servia. Pero los shaders grandes de los juegos son de
+         * "todo en uno": la piel y cada modo de coordenadas de textura detras
+         * de su booleano (seis en el de Pokemon Sol), y en cada lote solo se
+         * usa un camino. Con los booleanos conocidos solo queda ese camino: la
+         * GPU ejecuta menos por vertice y el compilador de la consola, cuyo
+         * tiempo crece mucho mas que el tamano (4,6 KB 0,75 s; 8-10 KB 7-17 s;
+         * 24 KB 176 s, ver Build), tarda segundos en vez de minutos. Cada
+         * combinacion es un programa (su clave lleva los booleanos que el
+         * codigo lee); pasado el tope por programa, o sin heap, el generico.
          */
-        if (program == nullptr && reason != nullptr &&
-            specialize_vs.load(std::memory_order_relaxed) != 0 &&
-            std::strcmp(reason, "vs tope de programas") != 0 &&
-            std::strcmp(reason, "vs compilador roto") != 0 &&
-            std::strcmp(reason, "vs compilando") != 0 &&
-            std::strcmp(reason, "vs compilando largo") != 0 &&
-            std::strcmp(reason, "vs con geometria") != 0) {
+        bool special_compiling = false;
+        if (specialize_vs.load(std::memory_order_relaxed) != 0) {
             using namespace Pica::Shader::Generator::GXM;
             auto used = hw_shaders->used_bools.find(program_key);
             if (used == hw_shaders->used_bools.end()) {
                 used = hw_shaders->used_bools.emplace(program_key, UsedBoolUniforms(pica.vs_setup))
                            .first;
             }
-            u32 bools = 0;
-            for (u32 i = 0; i < 16; i++) {
-                if (((used->second >> i) & 1u) != 0 && pica.vs_setup.uniforms.b[i]) {
-                    bools |= 1u << i;
+            if (used->second != 0) {
+                u32 bools = 0;
+                for (u32 i = 0; i < 16; i++) {
+                    if (((used->second >> i) & 1u) != 0 && pica.vs_setup.uniforms.b[i]) {
+                        bools |= 1u << i;
+                    }
+                }
+                const u64 special_key =
+                    Common::HashCombine(program_key, 0xB0010000ull | (bools & 0xFFFFu));
+                bool may_build = hw_shaders->unlinkable.count(special_key) == 0;
+                if (may_build && !hw_shaders->Has(special_key)) {
+                    u32& count = hw_shaders->specialized_count[program_key];
+                    if (count >= HwShaderCache::kMaxSpecializedPerProgram || CgHeapLow()) {
+                        may_build = false;
+                    } else {
+                        count++;
+                    }
+                }
+                if (may_build) {
+                    const char* special_reason = nullptr;
+                    g_cg_const_bools.store(kCgBoolsKnown | bools, std::memory_order_relaxed);
+                    program = hw_shaders->GetProgram(special_key, pica.vs_setup, vs_config, inputs,
+                                                     pipeline->lit, pipeline->proj,
+                                                     &special_reason);
+                    g_cg_const_bools.store(0, std::memory_order_relaxed);
+                    if (program != nullptr) {
+                        link_key = special_key;
+                        static u32 special_notes = 0;
+                        if (special_notes < 4) {
+                            special_notes++;
+                            NoteFmt("gxm vs", "especializado con booleanos {:#06x}: a la GPU",
+                                    bools);
+                        }
+                    } else if (special_reason != nullptr &&
+                               (std::strcmp(special_reason, "vs compilando") == 0 ||
+                                std::strcmp(special_reason, "vs compilando largo") == 0)) {
+                        special_compiling = true;
+                        reason = special_reason;
+                    }
                 }
             }
-            const u64 special_key =
-                Common::HashCombine(program_key, 0xB0010000ull | (bools & 0xFFFFu));
-            const char* special_reason = nullptr;
-            // 0.1.7.9: un especializado NUEVO solo si queda hueco en el tope de
-            // ese shader y heap de sobra. Los ya hechos se siguen usando siempre.
-            bool may_build = true;
-            if (!hw_shaders->Has(special_key)) {
-                u32& count = hw_shaders->specialized_count[program_key];
-                if (count >= HwShaderCache::kMaxSpecializedPerProgram) {
-                    special_reason = "vs tope de especializados";
-                    may_build = false;
-                } else if (CgHeapLow()) {
-                    special_reason = "vs sin heap para especializar";
-                    may_build = false;
-                } else {
-                    count++;
-                }
+        }
+        if (program == nullptr && !special_compiling) {
+            if (hw_shaders->unlinkable.count(program_key) != 0) {
+                return HwVsReject("vs enlazar atributos");
             }
-            if (may_build) {
-                g_cg_const_bools.store(kCgBoolsKnown | bools, std::memory_order_relaxed);
-                program = hw_shaders->GetProgram(special_key, pica.vs_setup, vs_config, inputs,
-                                                 pipeline->lit, pipeline->proj, &special_reason);
-                g_cg_const_bools.store(0, std::memory_order_relaxed);
-            }
-            if (program != nullptr) {
-                static u32 special_notes = 0;
-                if (special_notes < 4) {
-                    special_notes++;
-                    NoteFmt("gxm vs", "especializado con booleanos {:#06x} ({}): a la GPU", bools,
-                            reason);
-                }
-            } else if (special_reason != nullptr) {
-                reason = special_reason;
-            }
+            program = hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs,
+                                             pipeline->lit, pipeline->proj, &reason);
         }
         if (program == nullptr) {
             // Compilandose (el generico o su especializado): el lote se salta.
@@ -6256,7 +6258,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         attribute_sources = {};
         attribute_count = 0;
         stream_count = 0;
-        layout_key = program_key;
+        layout_key = link_key;
         for (u32 reg = 0; reg < 16; reg++) {
             if (inputs[reg].kind != VSInputSource::Array || program->inputs[reg] == nullptr) {
                 continue;
@@ -6336,7 +6338,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         converted = false;
         converted_stride = 0;
         if (vertex_program == nullptr) {
-            u64 converted_key = Common::HashCombine(program_key, 0xF32F32F3ull);
+            u64 converted_key = Common::HashCombine(link_key, 0xF32F32F3ull);
             for (u32 i = 0; i < attribute_count; i++) {
                 SceGxmVertexAttribute& out = gxm_attributes[i];
                 out.streamIndex = 0;
@@ -6371,7 +6373,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             }
         }
         if (vertex_program == nullptr) {
-            hw_shaders->unlinkable.insert(program_key);
+            hw_shaders->unlinkable.insert(link_key);
             NoteSkip(5, "vs enlazar atributos");
             return HwVsReject("vs enlazar atributos");
         }
