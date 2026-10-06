@@ -1328,24 +1328,27 @@ std::atomic<u32> g_jobs_queued{0};
 std::atomic<bool> g_worker_boosted{false};
 /// El trabajo en marcha es grande (CgJob::heavy): ese no se sube (0.2.2.7).
 std::atomic<bool> g_worker_heavy{false};
+/// Atado al nucleo 2 (0.2.3.8): no se sube nunca.
+bool g_worker_pinned = false;
 /// Justo por encima de los ayudantes y del hilo de la GPU (159).
 constexpr int kCgBoostedPriority = Common::kVitaPriorityHelper - 1;
 
 void* CgWorkerMain(void*) {
     /**
-     * EN CUALQUIER NUCLEO (0.2.0.5). Atado a uno, con la prioridad mas baja,
-     * los ayudantes del sombreado de vertices de ese nucleo lo dejaban sin CPU
-     * justo cuando mas falta hacia: un shader de vertices pendiente manda sus
-     * lotes a la CPU, que tiene a esos ayudantes ocupados, que no dejan
-     * compilarlo (crash.txt de 0.2.0.4: el 3D de Pokemon Sol entero por la CPU,
-     * "vs compilando" sin acabar nunca). Suelto, el planificador lo pone donde
-     * haya hueco; en el 3D el nucleo 0 pasa la mayor parte esperando a la GPU.
+     * EL NUCLEO 2 PARA EL (0.2.3.8). Suelto en cualquier nucleo (0.2.0.5) la
+     * consola no lo movia al que quedaba libre: en un combate de Pokemon Sol
+     * (crash.txt de 0.2.3.7) un shader de vertices de 18 KB tardo 45 s y otros
+     * hasta 2 minutos, con el nucleo 0 parado el 77 % del tiempo, y mientras
+     * tanto sus lotes por la CPU a 1-3 FPS. Los ayudantes del sombreado de
+     * vertices ya no usan el 2 (ver PicaCore::ParallelShading); el hilo de
+     * emulacion esta en el 0 y el de la GPU en el 1.
      */
     {
         const int rc = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(),
-                                                            SCE_KERNEL_CPU_MASK_USER_ALL);
-        Common::VitaNote("afinidad", rc >= 0 ? "compilador de shaders: cualquier nucleo"
-                                             : "compilador de shaders: no se pudo soltar");
+                                                            SCE_KERNEL_CPU_MASK_USER_2);
+        Common::VitaNote("afinidad", rc >= 0 ? "compilador de shaders: nucleo 2"
+                                             : "compilador de shaders: no se pudo atar");
+        g_worker_pinned = rc >= 0;
     }
     // La mas baja (0.2.0.2): compilar un shader son segundos de CPU sin soltar
     // el nucleo, y comparte nucleo con ayudantes a los que espera el hilo de
@@ -1418,9 +1421,14 @@ void CgMarkStarved() {
      * nucleo entero por delante de la GPU y de los ayudantes (New Super Mario
      * Bros. 2 en 0.2.2.6: 600 ms por fotograma mientras compilaba). Sus lotes
      * van por la CPU como antes de 0.2.2.3; compila con lo que sobre.
+     *
+     * Y desde 0.2.3.8 no se sube ninguno: subido por encima del hilo de
+     * emulacion (160) lo dejaba parado mientras compilaba ("congelado: 6 s sin
+     * avanzar, en 'esperando a la gpu'" en un combate de Pokemon Sol). Con el
+     * nucleo 2 para el solo (ver CgWorkerMain) no le hace falta.
      */
     if (g_worker_boosted.load(std::memory_order_relaxed) ||
-        g_worker_heavy.load(std::memory_order_relaxed)) {
+        g_worker_heavy.load(std::memory_order_relaxed) || g_worker_pinned) {
         return;
     }
     const SceUID thread = g_worker_uid.load(std::memory_order_acquire);

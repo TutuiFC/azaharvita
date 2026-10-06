@@ -171,10 +171,16 @@ public:
         return (index & kColdIndex) != 0 ? cold_base + (index & ~kColdIndex) : base + index;
     }
 
+    /// La zona fria se lleno (y no la caliente): para la nota de vaciado.
+    bool ColdOverflowed() const {
+        return cold_overflow;
+    }
+
     void Emit(u32 word) {
         if (in_cold) {
             if (cold_position >= cold_capacity) {
                 overflow = true;
+                cold_overflow = true;
                 return;
             }
             cold_base[cold_position++] = word;
@@ -270,6 +276,11 @@ public:
     }
 
     /// Salto a una posicion ya emitida: la vuelta de un camino frio (0.2.1.0).
+    /// B a una direccion fija fuera de este bloque (la salida comun).
+    void BranchToAddress(u32 cond, const u32* target) {
+        const s32 offset = static_cast<s32>(target - (Address(Position()) + 2));
+        Emit((cond << 28) | 0x0A000000u | (static_cast<u32>(offset) & 0x00FFFFFFu));
+    }
     void BranchTo(u32 cond, u32 target_index) {
         const s32 offset = static_cast<s32>(Address(target_index) - (Address(Position()) + 2));
         Emit((cond << 28) | 0x0A000000u | (static_cast<u32>(offset) & 0x00FFFFFFu));
@@ -306,6 +317,7 @@ private:
     u32 cold_capacity = 0;
     u32 cold_position = 0;
     bool in_cold = false;
+    bool cold_overflow = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -326,6 +338,41 @@ Offsets g_offsets;
 
 u32 RegOffset(u32 guest_reg) {
     return g_offsets.reg + guest_reg * 4;
+}
+
+/// Entrada de los bloques: pila, kCpu, kPages y flags del juego a APSR.
+void EmitEnterHead(Emitter& e) {
+    // r4-r12 y lr: diez registros, 40 bytes, la pila sigue alineada a 8.
+    e.Push(0x5FF0u);
+    e.MovReg(kCpu, R0);
+    e.MovReg(kPages, R1);
+}
+
+/// Salida de los bloques: APSR -> flags del juego y vuelta a C++ (r0-r1 libres).
+void EmitExitTail(Emitter& e) {
+    e.Mrs(R0);
+    e.LsrImm(R1, R0, 31);
+    e.StrImm(R1, kCpu, g_offsets.n);
+    e.Ubfx(R1, R0, 30, 1);
+    e.StrImm(R1, kCpu, g_offsets.z);
+    e.Ubfx(R1, R0, 29, 1);
+    e.StrImm(R1, kCpu, g_offsets.c);
+    e.Ubfx(R1, R0, 28, 1);
+    e.StrImm(R1, kCpu, g_offsets.v);
+    e.Pop(0x9FF0u); // r4-r12 y pc
+}
+
+/// Flags del juego -> APSR, con r0-r3.
+void EmitLoadFlags(Emitter& e) {
+    e.LdrImm(R0, kCpu, g_offsets.n);
+    e.LdrImm(R1, kCpu, g_offsets.z);
+    e.LdrImm(R2, kCpu, g_offsets.c);
+    e.LdrImm(R3, kCpu, g_offsets.v);
+    e.LslImm(R0, R0, 31);
+    e.OrrLsl(R0, R0, R1, 30);
+    e.OrrLsl(R0, R0, R2, 29);
+    e.OrrLsl(R0, R0, R3, 28);
+    e.MsrFlags(R0);
 }
 
 u32 ExtOffset(u32 vfp_reg) {
@@ -930,6 +977,12 @@ u32 g_code_used_words = 0;
  */
 u32 g_cold_start_words = 0;
 u32 g_cold_used_words = 0;
+/// Entrada y salida comunes (0.2.3.8, ver Compiler::SetSharedExit): al
+/// principio de la zona fria, fuera de lo que se vacia.
+constexpr u32 kSharedWords = 64;
+u32* g_shared_enter = nullptr;
+u32* g_shared_exit = nullptr;
+u32 g_code_flushes = 0;
 u32 g_check_start_words = 0;
 u32 g_check_used_words = 0;
 /// Bloques generados (las dos variantes) desde el ultimo vaciado.
@@ -1104,11 +1157,38 @@ bool Init(ARMul_State* cpu) {
     g_code = static_cast<u32*>(base_address);
     g_code_used_words = 0;
     {
+        // Sin prologos ni epilogos (0.2.3.8) la fria ocupa unas seis decimas
+        // de la caliente (crash.txt de 0.2.3.7 menos lo que ya no va): tres
+        // quintos para la caliente.
         const u32 total_words = g_code_bytes / 4;
         g_check_start_words = total_words - total_words / 10;
-        g_cold_start_words = g_check_start_words / 2;
-        g_cold_used_words = 0;
+        g_cold_start_words = g_check_start_words / 5 * 3;
+        g_cold_used_words = kSharedWords;
         g_check_used_words = 0;
+    }
+    {
+        const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
+        if (sceKernelOpenVMDomain() < 0) {
+            Common::VitaNote("jit arm", "no se puede abrir el dominio VM: JIT apagado");
+            return false;
+        }
+        u32* const shared = g_code + g_cold_start_words;
+        Emitter e{shared, kSharedWords};
+        // Entrada: r0 = cpu, r1 = paginas, r2 = donde empieza el bloque.
+        EmitEnterHead(e);
+        e.MovReg(kRd, R2);
+        EmitLoadFlags(e);
+        e.Emit(0xE12FFF10u | kRd); // BX kRd
+        const u32 exit_at = e.Position();
+        EmitExitTail(e);
+        g_shared_enter = shared;
+        g_shared_exit = shared + exit_at;
+        sceKernelSyncVMDomain(g_code_block, shared, kSharedWords * 4);
+        sceKernelCloseVMDomain();
+        if (e.Overflowed()) {
+            Common::VitaNote("jit arm", "entrada y salida comunes sin sitio: JIT apagado");
+            return false;
+        }
     }
     g_ready = true;
     Common::VitaNote("jit arm",
@@ -1564,20 +1644,8 @@ public:
     }
 
     void Prologue() {
-        // r4-r12 y lr: diez registros, 40 bytes, la pila sigue alineada a 8.
-        e.Push(0x5FF0u);
-        e.MovReg(kCpu, R0);
-        e.MovReg(kPages, R1);
-        // Flags del juego -> APSR.
-        e.LdrImm(R0, kCpu, g_offsets.n);
-        e.LdrImm(R1, kCpu, g_offsets.z);
-        e.LdrImm(R2, kCpu, g_offsets.c);
-        e.LdrImm(R3, kCpu, g_offsets.v);
-        e.LslImm(R0, R0, 31);
-        e.OrrLsl(R0, R0, R1, 30);
-        e.OrrLsl(R0, R0, R2, 29);
-        e.OrrLsl(R0, R0, R3, 28);
-        e.MsrFlags(R0);
+        EmitEnterHead(e);
+        EmitLoadFlags(e);
         // Hasta aqui el prologo de 0.1.5.1 completo. El enlazado directo (4.8)
         // salta a ChainEntryPosition(): pila, kCpu, kPages y flags ya puestos
         // por el bloque origen; solo falta BodyEnter (la cache de este bloque).
@@ -1599,20 +1667,36 @@ public:
         }
         // Vuelca la cache ANTES de usar r0-r1 para los flags.
         FlushCachedRegs();
+        if (shared_exit_ != nullptr) {
+            e.BranchToAddress(kAlways, shared_exit_);
+            return;
+        }
         // Aqui entran los enlaces que fallan (0.2.1.0): ya volcaron la cache, y
         // r0-r3 tienen lo que dejo el enlace, asi que no se puede volcar otra vez.
         exit_noflush = e.Position();
-        // APSR -> flags del juego.
-        e.Mrs(R0);
-        e.LsrImm(R1, R0, 31);
-        e.StrImm(R1, kCpu, g_offsets.n);
-        e.Ubfx(R1, R0, 30, 1);
-        e.StrImm(R1, kCpu, g_offsets.z);
-        e.Ubfx(R1, R0, 29, 1);
-        e.StrImm(R1, kCpu, g_offsets.c);
-        e.Ubfx(R1, R0, 28, 1);
-        e.StrImm(R1, kCpu, g_offsets.v);
-        e.Pop(0x9FF0u); // r4-r12 y pc
+        EmitExitTail(e);
+    }
+
+    /**
+     * ENTRADA Y SALIDA COMUNES (0.2.3.8). Cada bloque llevaba su prologo (14
+     * palabras) y la cola de su epilogo (10), identicos en todos: casi 100
+     * bytes por bloque en la zona fria, que en Pokemon Sol se llenaba antes que
+     * la caliente y vaciaba el JIT entero en mitad de un combate ("compilar"
+     * 1.300 ms por fotograma en crash.txt de 0.2.3.7). Ahora la variante normal
+     * entra por g_shared_enter y sale por g_shared_exit; la de comprobacion,
+     * que va en su anillo, sigue con los suyos.
+     */
+    void SetSharedExit(const u32* shared_exit) {
+        shared_exit_ = shared_exit;
+    }
+
+    /// La salida sin volcar la cache (la de los enlaces que fallan).
+    void BranchExitNoFlush() {
+        if (shared_exit_ != nullptr) {
+            e.BranchToAddress(kAlways, shared_exit_);
+        } else {
+            e.BranchTo(kAlways, exit_noflush);
+        }
     }
 
     /// Los caminos frios, detras del epilogo (ver ColdStub).
@@ -1889,6 +1973,7 @@ private:
     /// Saltos al epilogo (con vuelco) y donde empieza la salida sin vuelco.
     std::vector<u32> to_epilogue;
     u32 exit_noflush = 0;
+    const u32* shared_exit_ = nullptr;
 
     void DeferCold(std::vector<u32> branches, std::function<void()> body) {
         DeferCold(std::move(branches), cache_written, std::move(body));
@@ -3139,12 +3224,12 @@ private:
             e.MsrFlags(kT0);
             e.Mov32(kRd, target_pc);
             e.StrImm(kRd, kCpu, RegOffset(15));
-            e.BranchTo(kAlways, exit_noflush);
+            BranchExitNoFlush();
         });
         DeferCold({no_budget}, [this, target_pc] {
             e.Mov32(kRd, target_pc);
             e.StrImm(kRd, kCpu, RegOffset(15));
-            e.BranchTo(kAlways, exit_noflush);
+            BranchExitNoFlush();
         });
     }
 
@@ -3218,7 +3303,7 @@ private:
         e.Emit(0xE12FFF10u | R1); // BX r1 -> entrada del destino
         DeferCold(std::move(fails), [this] {
             e.MsrFlags(kT0);
-            e.BranchTo(kAlways, exit_noflush);
+            BranchExitNoFlush();
         });
     }
 
@@ -3265,7 +3350,7 @@ public:
         DeferCold(std::move(fails), [this, target_pc] {
             e.Mov32(kRd, target_pc);
             e.StrImm(kRd, kCpu, RegOffset(15));
-            e.BranchTo(kAlways, exit_noflush);
+            BranchExitNoFlush();
         });
     }
 
@@ -3486,7 +3571,7 @@ void ResetAll() {
     g_blocks.clear();
     g_fast.fill(FastSlot{});
     g_code_used_words = 0;
-    g_cold_used_words = 0;
+    g_cold_used_words = kSharedWords;
     g_check_used_words = 0;
     g_code_blocks = 0;
     g_pending.active = false;
@@ -3987,6 +4072,7 @@ struct EmittedVariant {
     u32 hot_words = 0;
     u32 cold_words = 0;
     u32* entry = nullptr;
+    bool cold_full = false;
 };
 
 bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* cold,
@@ -4000,18 +4086,15 @@ bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* c
     compiler.SetCacheMap(block.cache_map);
     compiler.SetThumb(block.thumb);
     compiler.SetBlock(block.pc, block.guest_count);
-    // El prologo solo lo usa la entrada desde TryRun: a la zona fria, y de
-    // ahi un salto al cuerpo, que es tambien la entrada de los enlaces.
+    // La variante normal entra por g_shared_enter, que salta al cuerpo: la
+    // misma entrada que los enlaces (0.2.3.8). La de comprobacion lleva su
+    // prologo.
     u32 entry_index = 0;
     u32 chain_entry = 0;
     if (e.HasColdZone()) {
-        e.ToCold();
-        entry_index = e.Position();
-        compiler.Prologue();
-        const u32 to_body = e.BranchPlaceholder(kAlways);
-        e.ToHot();
+        compiler.SetSharedExit(g_shared_exit);
         chain_entry = compiler.ChainEntryPosition();
-        e.PatchBranch(to_body, chain_entry);
+        entry_index = chain_entry;
     } else {
         compiler.Prologue();
         chain_entry = compiler.ChainEntryPosition();
@@ -4098,6 +4181,7 @@ bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* c
     compiler.Epilogue();
     compiler.EmitColdStubs();
     if (e.Overflowed()) {
+        out.cold_full = e.ColdOverflowed();
         return false;
     }
     if (sites != nullptr) {
@@ -4302,6 +4386,22 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
                          &sites)) {
             sceKernelCloseVMDomain();
             g_flush_requested = true;
+            /**
+             * Cada vaciado son cientos de ms recompilando lo que se usaba
+             * (0.2.3.7: 1,3 s por fotograma en un combate de Pokemon Sol), y
+             * hasta ahora no quedaba constancia. Las primeras veces, a
+             * crash.txt con la zona que se lleno.
+             */
+            g_code_flushes++;
+            if (g_code_flushes <= 12) {
+                Common::VitaNote("jit arm",
+                                 fmt::format("codigo lleno (zona {}): se vacia, vez {} | caliente {} "
+                                             "KB, fria {} KB, {} bloques",
+                                             out.cold_full ? "fria" : "caliente", g_code_flushes,
+                                             g_code_used_words / 256, g_cold_used_words / 256,
+                                             g_code_blocks)
+                                     .c_str());
+            }
             return false;
         }
         code = reinterpret_cast<BlockFn>(out.entry);
@@ -4542,7 +4642,9 @@ u64 RunCompiled(ARMul_State* cpu, Block& block, u8* const* pages, u64 chain_budg
     cpu->jit_link_hops = 0;
     g_link_withdrawn = 0;
     g_link_refund = 0;
-    block.code(cpu, pages);
+    // block.code es el cuerpo (0.2.3.8): se entra por g_shared_enter.
+    using EnterFn = void (*)(ARMul_State*, u8* const*, BlockFn);
+    reinterpret_cast<EnterFn>(g_shared_enter)(cpu, pages, block.code);
     const u32 hops = cpu->jit_link_hops;
     const u64 linked = budget - cpu->jit_link_budget - g_link_withdrawn;
     const u64 executed = block.link.count + linked - g_link_refund;

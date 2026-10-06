@@ -33,9 +33,18 @@ using namespace DebugUtils;
 /// PicaCore, porque unique_ptr necesita el tipo completo para destruirlo. La
 /// explicacion esta en ShadeVerticesParallel.
 struct PicaCore::ParallelShading {
-    /// Dos hilos atados a los nucleos 1 y 2; el 0 es el de emulacion, que hace
-    /// el primer tramo el mismo (mismo reparto que las bandas del rasterizador).
-    Common::StatefulThreadWorker<> workers{2, "VertexShader workers", {}, true, 1};
+    /**
+     * UN AYUDANTE, EN EL NUCLEO 0 (0.2.3.8). Eran dos, en los nucleos 1 y 2,
+     * de cuando el primer tramo lo hacia el hilo de emulacion (nucleo 0). Con
+     * el hilo de la GPU (nucleo 1) haciendolo, el ayudante del 1 y el se
+     * turnaban en el mismo nucleo, el 0 se quedaba parado (el juego esperando
+     * a la GPU: 77 % en un combate de Pokemon Sol) y el 2 lo ocupaba el otro
+     * ayudante, que es donde compila el compilador de shaders: con los
+     * ayudantes por encima, un shader de 18 KB tardaba 45 s, y mientras tanto
+     * sus lotes iban por aqui. Ahora: el tramo 0 en el hilo de la GPU, el 1
+     * en el nucleo 0, y el 2 entero para el compilador (ver CgWorkerMain).
+     */
+    Common::StatefulThreadWorker<> workers{1, "VertexShader workers", {}, true, 0};
     struct Job {
         u32 index;  ///< Posicion en el lote (la que recibe LoadVertex).
         u32 vertex; ///< Vertice a cargar.
@@ -1577,13 +1586,13 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
         if (ps.outputs.size() < jobs) {
             ps.outputs.resize(jobs);
         }
-        const u32 parts = std::clamp<u32>(jobs / kMinJobsPerPart, 1, 3);
+        const u32 parts = std::clamp<u32>(jobs / kMinJobsPerPart, 1, 2);
         const ParallelShading::Job* first_warmup = has_previous ? &previous : nullptr;
         if (parts == 1) {
             shade_range(0, jobs, first_warmup);
         } else {
-            // Los tramos 1.. a los nucleos 1 y 2, encolados ANTES de ponerse
-            // a trabajar para que arranquen cuanto antes.
+            // El tramo 1 al ayudante, encolado ANTES de ponerse a trabajar
+            // para que arranque cuanto antes.
             for (u32 part = 1; part < parts; ++part) {
                 const u32 begin = jobs * part / parts;
                 const u32 end = jobs * (part + 1) / parts;
