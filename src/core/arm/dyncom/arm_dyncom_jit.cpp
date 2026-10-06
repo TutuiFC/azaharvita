@@ -3382,10 +3382,12 @@ private:
         e.LdrImm(kRd, kCpu, g_offsets.t);
         e.Emit(0xE3100001u | (kRs << 16)); // TST kRs, #1
         fails.push_back(e.BranchPlaceholder(kCondNe));
-        // El bit 1 solo cuenta en ARM: kT1 = TFlag ^ 1, y TST kRs, kT1, LSL #1.
-        e.Emit(0xE2200001u | (kRd << 16) | (kT1 << 12)); // EOR kT1, kRd, #1
-        e.Emit(0xE1100080u | (kRs << 16) | kT1);         // TST kRs, kT1, LSL #1
-        fails.push_back(e.BranchPlaceholder(kCondNe));
+        /**
+         * El bit 1 en ARM ya no se mira aparte (0.3.0.0): con el 0 a cero, la
+         * clave de un PC ARM con el bit 1 puesto acaba en 10, y en g_fast solo
+         * hay claves ARM acabadas en 00 y Thumb acabadas en 1, asi que no
+         * coincide con ninguna y el enlace falla igual que con la prueba.
+         */
         e.Emit(0xE1800000u | (kRs << 16) | (kRs << 12) | kRd); // ORR kRs, kRs, kRd
         // kT1 = &g_fast[(clave >> 1) & (kFastSlots - 1)]
         e.Ubfx(kRd, kRs, 1, kFastSlotBits);

@@ -5,6 +5,7 @@
 #include "video_core/renderer_gxm/rasterizer_gxm.h"
 
 #include <algorithm>
+#include <arm_neon.h>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -2116,6 +2117,89 @@ constexpr u16 kMemoIgnoredRegs[] = {
     // Uniforms de coma flotante del shader de vertices.
     0x2C0, 0x2C1, 0x2C2, 0x2C3, 0x2C4, 0x2C5, 0x2C6, 0x2C7, 0x2C8,
 };
+
+/**
+ * LOS INDICES CON NEON (0.3.0.0). Cada lote indexado recorria sus indices dos
+ * veces, uno a uno: para el tramo de vertices (minimo y maximo) y para
+ * rebasarlos a cero al copiarlos. Son cientos o miles por lote y setenta lotes
+ * por fotograma en el 3D de Pokemon Sol, en el hilo de la GPU, que es al que
+ * espera el juego. De ocho en ocho (o de dieciseis, los de un byte) y con el
+ * mismo resultado.
+ */
+void IndexRangeU16(const u16* in, u32 count, u32& min_index, u32& max_index) {
+    uint16x8_t low = vdupq_n_u16(0xFFFF);
+    uint16x8_t high = vdupq_n_u16(0);
+    u32 i = 0;
+    for (; i + 8 <= count; i += 8) {
+        const uint16x8_t v = vld1q_u16(in + i);
+        low = vminq_u16(low, v);
+        high = vmaxq_u16(high, v);
+    }
+    uint16x4_t low4 = vmin_u16(vget_low_u16(low), vget_high_u16(low));
+    uint16x4_t high4 = vmax_u16(vget_low_u16(high), vget_high_u16(high));
+    low4 = vpmin_u16(low4, low4);
+    low4 = vpmin_u16(low4, low4);
+    high4 = vpmax_u16(high4, high4);
+    high4 = vpmax_u16(high4, high4);
+    u32 lo = vget_lane_u16(low4, 0);
+    u32 hi = vget_lane_u16(high4, 0);
+    for (; i < count; i++) {
+        lo = std::min<u32>(lo, in[i]);
+        hi = std::max<u32>(hi, in[i]);
+    }
+    min_index = lo;
+    max_index = hi;
+}
+
+void IndexRangeU8(const u8* in, u32 count, u32& min_index, u32& max_index) {
+    uint8x16_t low = vdupq_n_u8(0xFF);
+    uint8x16_t high = vdupq_n_u8(0);
+    u32 i = 0;
+    for (; i + 16 <= count; i += 16) {
+        const uint8x16_t v = vld1q_u8(in + i);
+        low = vminq_u8(low, v);
+        high = vmaxq_u8(high, v);
+    }
+    uint8x8_t low8 = vmin_u8(vget_low_u8(low), vget_high_u8(low));
+    uint8x8_t high8 = vmax_u8(vget_low_u8(high), vget_high_u8(high));
+    low8 = vpmin_u8(low8, low8);
+    low8 = vpmin_u8(low8, low8);
+    low8 = vpmin_u8(low8, low8);
+    high8 = vpmax_u8(high8, high8);
+    high8 = vpmax_u8(high8, high8);
+    high8 = vpmax_u8(high8, high8);
+    u32 lo = vget_lane_u8(low8, 0);
+    u32 hi = vget_lane_u8(high8, 0);
+    for (; i < count; i++) {
+        lo = std::min<u32>(lo, in[i]);
+        hi = std::max<u32>(hi, in[i]);
+    }
+    min_index = lo;
+    max_index = hi;
+}
+
+/// out[i] = in[i] - base, en 16 bits (como static_cast<u16>).
+void RebaseIndicesU16(const u16* in, u32 count, u16 base, u16* out) {
+    const uint16x8_t sub = vdupq_n_u16(base);
+    u32 i = 0;
+    for (; i + 8 <= count; i += 8) {
+        vst1q_u16(out + i, vsubq_u16(vld1q_u16(in + i), sub));
+    }
+    for (; i < count; i++) {
+        out[i] = static_cast<u16>(in[i] - base);
+    }
+}
+
+void RebaseIndicesU8(const u8* in, u32 count, u16 base, u16* out) {
+    const uint16x8_t sub = vdupq_n_u16(base);
+    u32 i = 0;
+    for (; i + 8 <= count; i += 8) {
+        vst1q_u16(out + i, vsubq_u16(vmovl_u8(vld1_u8(in + i)), sub));
+    }
+    for (; i < count; i++) {
+        out[i] = static_cast<u16>(in[i] - base);
+    }
+}
 
 constexpr std::array<u64, 12> MemoMask(u32 first, u32 end) {
     std::array<u64, 12> mask{};
@@ -5928,18 +6012,11 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         if (index_data == nullptr) {
             return HwVsReject("indices");
         }
-        min_index = 0xFFFFFFFFu;
         if (index_u16) {
-            const auto* indices = reinterpret_cast<const u16*>(index_data);
-            for (u32 i = 0; i < num_vertices; i++) {
-                min_index = std::min<u32>(min_index, indices[i]);
-                max_index = std::max<u32>(max_index, indices[i]);
-            }
+            IndexRangeU16(reinterpret_cast<const u16*>(index_data), num_vertices, min_index,
+                          max_index);
         } else {
-            for (u32 i = 0; i < num_vertices; i++) {
-                min_index = std::min<u32>(min_index, index_data[i]);
-                max_index = std::max<u32>(max_index, index_data[i]);
-            }
+            IndexRangeU8(index_data, num_vertices, min_index, max_index);
         }
     } else {
         // Sin indices se usa el buffer de indices secuenciales, que tiene
@@ -6390,14 +6467,10 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         // Rebasados a 0: los flujos empiezan en min_index.
         auto* out = reinterpret_cast<u16*>(space);
         if (index_u16) {
-            const auto* in = reinterpret_cast<const u16*>(index_data);
-            for (u32 i = 0; i < num_vertices; i++) {
-                out[i] = static_cast<u16>(in[i] - min_index);
-            }
+            RebaseIndicesU16(reinterpret_cast<const u16*>(index_data), num_vertices,
+                             static_cast<u16>(min_index), out);
         } else {
-            for (u32 i = 0; i < num_vertices; i++) {
-                out[i] = static_cast<u16>(index_data[i] - min_index);
-            }
+            RebaseIndicesU8(index_data, num_vertices, static_cast<u16>(min_index), out);
         }
         draw_indices = out;
     }
