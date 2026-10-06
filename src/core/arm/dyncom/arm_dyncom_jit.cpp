@@ -136,6 +136,9 @@ constexpr std::array<u32, 5> kCacheHosts{0, 1, 2, 3, 14};
 
 class Emitter {
 public:
+    /// Marca de las posiciones de la zona fria (ver SetColdZone).
+    static constexpr u32 kColdIndex = 0x80000000u;
+
     Emitter(u32* base_, u32 capacity_words_) : base{base_}, capacity{capacity_words_} {}
 
     /**
@@ -176,6 +179,15 @@ public:
     /// La zona fria se lleno (y no la caliente): para la nota de vaciado.
     bool ColdOverflowed() const {
         return cold_overflow;
+    }
+
+    /// Quita las ultimas 'words' palabras de la zona en curso (ver PredicateBody).
+    void Rewind(u32 words) {
+        if (in_cold) {
+            cold_position -= words;
+        } else {
+            position -= words;
+        }
     }
 
     void Emit(u32 word) {
@@ -315,7 +327,6 @@ public:
     }
 
 private:
-    static constexpr u32 kColdIndex = 0x80000000u;
     u32* base;
     u32 capacity;
     u32 position = 0;
@@ -2078,8 +2089,100 @@ public:
         default:
             break;
         }
-        if (cond != kAlways) {
+        if (cond != kAlways && !PredicateBody(skip, cond)) {
             e.PatchBranch(skip, e.Position());
+        }
+    }
+
+    /**
+     * CONDICIONALES SIN SALTO (0.3.0.5). Una instruccion condicional del juego
+     * ("moveq r0, #1", "ldrne r5, [r5, #56]", "addeq r0, r0, #3") se saltaba
+     * entera con un B de la condicion contraria. Si lo emitido es corto y cada
+     * instruccion se puede ejecutar con la condicion del juego -- sin saltos,
+     * sin llamadas, sin MRS/MSR y sin poner flags salvo la ultima --, se le
+     * pone esa condicion a cada una y se quita el salto: los flags del juego
+     * estan en APSR y nada de en medio los cambia, asi que se ejecutan todas o
+     * ninguna, igual que con el salto. Mas largo, el salto sale mejor.
+     */
+    bool PredicateBody(u32 skip, u32 cond) {
+        constexpr u32 kMaxPredicated = 5;
+        const u32 begin = skip + 1;
+        const u32 end = e.Position();
+        if (cond >= kAlways || e.Overflowed() ||
+            (begin & Emitter::kColdIndex) != (end & Emitter::kColdIndex) ||
+            end - begin > kMaxPredicated) {
+            return false;
+        }
+        const u32 count = end - begin;
+        const u32* const body = e.Address(begin);
+        for (u32 k = 0; k < count; k++) {
+            if (!Predicable(body[k], k + 1 == count)) {
+                return false;
+            }
+        }
+        u32* const at = e.Address(skip);
+        for (u32 k = 0; k < count; k++) {
+            at[k] = (at[k + 1] & 0x0FFFFFFFu) | (cond << 28);
+        }
+        e.Rewind(1);
+        return true;
+    }
+
+    /// Ver PredicateBody. 'last': la ultima del cuerpo, que si puede poner flags.
+    static bool Predicable(u32 word, bool last) {
+        if ((word >> 28) != kAlways) {
+            return false; // ya condicional, o del espacio sin condicion (NEON, PLD)
+        }
+        const bool sets_flags = Bits(word, 20, 20) == 1;
+        switch (Bits(word, 25, 27)) {
+        case 0:
+            if ((word & 0x90u) == 0x90u) {
+                if ((word & 0x0F0000F0u) == 0x00000090u) {
+                    return last || !sets_flags; // MUL, MLA, UMULL...
+                }
+                if ((word & 0x0F0000F0u) == 0x01000090u) {
+                    return false; // SWP, LDREX, STREX
+                }
+                return true; // LDRH, STRH, LDRSB, LDRSH, LDRD, STRD
+            }
+            [[fallthrough]];
+        case 1: {
+            const u32 opcode = Bits(word, 21, 24);
+            if (opcode >= 8 && opcode <= 11 && !sets_flags) {
+                // MOVW y MOVT; del resto (MRS, MSR, BX, BLX...) solo CLZ.
+                if (Bits(word, 25, 27) == 1) {
+                    return opcode == 8 || opcode == 10;
+                }
+                return (word & 0x0FFF0FF0u) == 0x016F0F10u;
+            }
+            const bool compare = opcode >= 8 && opcode <= 11;
+            if (!compare && Bits(word, 12, 15) == 15) {
+                return false; // al PC
+            }
+            return last || !sets_flags;
+        }
+        case 2:
+        case 3:
+            if (Bits(word, 25, 27) == 3 && (word & 0x10u) != 0) {
+                return true; // UBFX, BFI, REV, SXTB... (sin N, Z, C ni V)
+            }
+            return !(sets_flags && Bits(word, 12, 15) == 15); // LDR/STR, no al PC
+        case 6:
+        case 7: {
+            if (Bits(word, 24, 27) == 0xF) {
+                return false; // SVC
+            }
+            const u32 coprocessor = Bits(word, 8, 11);
+            if (coprocessor != 10 && coprocessor != 11) {
+                return false;
+            }
+            if ((word & 0x0FFF0F10u) == 0x0EF10A10u) {
+                return last || Bits(word, 12, 15) != 15; // VMRS (APSR_nzcv pone flags)
+            }
+            return (word & 0x0FF00F10u) != 0x0EE00A10u; // VMSR no
+        }
+        default:
+            return false; // LDM/STM, B/BL
         }
     }
 
@@ -2657,13 +2760,13 @@ private:
         const u32 kind = byte ? kByte : kWord;
         if (load && rd == 15) {
             // LDR al PC (fin de bloque): como LDR_INST con Rd = 15, pasa a Thumb
-            // si el bit 0 viene puesto y deja el PC sin ese bit.
-            // kT0 en vez de R2: R2 es un hueco de la cache de registros.
-            MemoryAccess(address, false, kind);
-            e.Ubfx(kT0, kRd, 0, 1);
-            e.StrImm(kT0, kCpu, g_offsets.t);
-            e.Emit(0xE3C00001u | (kRd << 16) | (kRd << 12)); // BIC kRd, kRd, #1
-            StoreGuest(kRd, 15);
+            // si el bit 0 viene puesto y deja el PC sin ese bit. El PC queda
+            // en kRs y el TFlag en kRd para el enlace (ver EmitIndirectLink).
+            MemoryAccess(address, false, kind, kRs);
+            e.Ubfx(kRd, kRs, 0, 1);
+            e.StrImm(kRd, kCpu, g_offsets.t);
+            e.Emit(0xE3C00001u | (kRs << 16) | (kRs << 12)); // BIC kRs, kRs, #1
+            StoreGuest(kRs, 15);
         } else if (load) {
             LoadInto(address, kind, rd);
         } else {
@@ -3088,14 +3191,11 @@ public:
              * esten puestos. Ni comprobacion ni camino frio (con su llamada a
              * C por operacion, el trozo frio mas grande de 0.3.0.2).
              */
+            // Y con su propia condicion (0.3.0.5): la instruccion del juego
+            // tal cual, sin el salto por encima.
             for (u32 k = 0; k < count; k++) {
-                const u32 cond = insts[k] >> 28;
-                const bool conditional = conditions && cond != kAlways;
-                const u32 skip = conditional ? e.BranchPlaceholder(cond ^ 1u) : 0;
-                VfpCdpBody(insts[k]);
-                if (conditional) {
-                    e.PatchBranch(skip, e.Position());
-                }
+                const u32 cond = conditions ? insts[k] >> 28 : kAlways;
+                e.Emit((insts[k] & 0x0FFFFFFFu) | (cond << 28));
             }
             return;
         }
@@ -3491,11 +3591,13 @@ private:
             slot++;
             if (load) {
                 if (i == 15) {
-                    e.LdrImm(kRd, kT1, offset);
-                    e.Ubfx(kRm, kRd, 0, 1);
-                    e.StrImm(kRm, kCpu, g_offsets.t);
-                    e.Emit(0xE3C00001u | (kRd << 16) | (kRd << 12)); // BIC kRd, kRd, #1
-                    e.StrImm(kRd, kCpu, RegOffset(15));
+                    // El PC en kRs y el TFlag en kRd para el enlace (ver
+                    // EmitIndirectLink): es el ultimo de la lista.
+                    e.LdrImm(kRs, kT1, offset);
+                    e.Ubfx(kRd, kRs, 0, 1);
+                    e.StrImm(kRd, kCpu, g_offsets.t);
+                    e.Emit(0xE3C00001u | (kRs << 16) | (kRs << 12)); // BIC kRs, kRs, #1
+                    e.StrImm(kRs, kCpu, RegOffset(15));
                     continue;
                 }
                 const s8 cached = CacheHost(i);
@@ -3521,7 +3623,8 @@ private:
         if (keep_flags) {
             e.MsrFlags(kFlags);
         }
-        DeferCold(std::move(slow), written_before, [this, inst, pc, keep_flags, back] {
+        const bool loads_pc = load && ((list >> 15) & 1) != 0;
+        DeferCold(std::move(slow), written_before, [this, inst, pc, keep_flags, back, loads_pc] {
             if (keep_flags) {
                 e.MovReg(kT0, kFlags);
             }
@@ -3529,6 +3632,11 @@ private:
             e.StrImm(kRd, kCpu, RegOffset(15));
             e.Mov32(kRn, inst);
             CallHelper(reinterpret_cast<const void*>(&HelperBlockTransfer));
+            if (loads_pc) {
+                // Como el camino rapido (ver EmitIndirectLink).
+                e.LdrImm(kRs, kCpu, RegOffset(15));
+                e.LdrImm(kRd, kCpu, g_offsets.t);
+            }
             if (keep_flags) {
                 e.MovReg(kFlags, kT0);
             }
@@ -3563,10 +3671,14 @@ private:
         to_epilogue.push_back(e.BranchPlaceholder(kAlways));
     }
 
-    /// Salida con Reg[15] (y TFlag) ya escritos (BX, LDM con el PC...).
-    void ExitIndirect() {
+    /**
+     * Salida con Reg[15] (y TFlag) ya escritos (BX, LDM con el PC...).
+     * 'in_regs': ademas kRs = PC con el bit 0 a cero y kRd = TFlag (ver
+     * EmitIndirectLink).
+     */
+    void ExitIndirect(bool in_regs = false) {
         if (Linking()) {
-            EmitIndirectLink();
+            EmitIndirectLink(in_regs);
             return;
         }
         to_epilogue.push_back(e.BranchPlaceholder(kAlways));
@@ -3668,7 +3780,7 @@ private:
      * clave; si el hueco es de otro PC, no se enlaza. Aqui si se usan CMP y
      * SUBS: los flags del juego van en kT0 (r10).
      */
-    void EmitIndirectLink() {
+    void EmitIndirectLink(bool in_regs) {
         std::vector<u32> fails;
         FlushCachedRegs();
         e.Mrs(kT0);
@@ -3692,10 +3804,22 @@ private:
          */
         // Sin r0-r3 (0.3.0.0, ver REGISTROS FIJOS): kRs = clave, kRd y kT1
         // temporales.
-        e.LdrImm(kRs, kCpu, RegOffset(15));
-        e.LdrImm(kRd, kCpu, g_offsets.t);
-        e.Emit(0xE3100001u | (kRs << 16)); // TST kRs, #1
-        fails.push_back(e.BranchPlaceholder(kCondNe));
+        /**
+         * LAS VUELTAS SIN RECARGAR (0.3.0.4). BX, LDM y LDR con el PC y BLX
+         * dejan el PC (con el bit 0 ya a cero) en kRs y el TFlag en kRd, y
+         * aqui se volvian a leer de memoria justo despues de escribirlos, con
+         * la prueba del bit 0 que ya no puede fallar: cuatro instrucciones y
+         * dos cargas de lo recien guardado en cada vuelta de funcion, que en
+         * los perfiles son mas de un tercio del codigo caliente ("bx lr" y
+         * "pop {..., pc}"). Solo "mov pc, ..." y compania (que no alinean ni
+         * tocan el TFlag) pasan por la carga.
+         */
+        if (!in_regs) {
+            e.LdrImm(kRs, kCpu, RegOffset(15));
+            e.LdrImm(kRd, kCpu, g_offsets.t);
+            e.Emit(0xE3100001u | (kRs << 16)); // TST kRs, #1
+            fails.push_back(e.BranchPlaceholder(kCondNe));
+        }
         /**
          * El bit 1 en ARM ya no se mira aparte (0.3.0.0): con el 0 a cero, la
          * clave de un PC ARM con el bit 1 puesto acaba en 10, y en g_fast solo
@@ -3874,11 +3998,11 @@ public:
             if (thumb_) {
                 // BLX_1_THUMB: LR = siguiente | 1, destino alineado, a ARM.
                 StoreGuestConst(14, LinkValue(pc));
-                e.Mov32(kT1, 0);
-                e.StrImm(kT1, kCpu, g_offsets.t);
-                e.Mov32(kT0, branch_target_);
-                StoreGuest(kT0, 15);
-                ExitIndirect();
+                e.Mov32(kRd, 0);
+                e.StrImm(kRd, kCpu, g_offsets.t);
+                e.Mov32(kRs, branch_target_);
+                StoreGuest(kRs, 15);
+                ExitIndirect(true);
                 break;
             }
             // Como BLX_INST: LR = pc + 4 (desde ARM, sin bit 0), Thumb, y el
@@ -3887,33 +4011,34 @@ public:
             const s32 offset = static_cast<s32>(offset24 << 8) >> 6;
             const u32 target = pc + 8 + static_cast<u32>(offset) + (Bits(inst, 24, 24) << 1);
             StoreGuestConst(14, pc + 4);
-            e.Mov32(kT1, 1);
-            e.StrImm(kT1, kCpu, g_offsets.t);
-            e.Mov32(kT0, target);
-            StoreGuest(kT0, 15);
-            ExitIndirect();
+            e.Mov32(kRd, 1);
+            e.StrImm(kRd, kCpu, g_offsets.t);
+            e.Mov32(kRs, target);
+            StoreGuest(kRs, 15);
+            ExitIndirect(true);
             break;
         }
         case Kind::BranchExchange: {
             const u32 rm = Bits(inst, 0, 3);
             const bool link = Bits(inst, 5, 5) == 1;
-            LoadGuest(kT0, rm, pc);
+            LoadGuest(kRs, rm, pc);
             if (link) {
                 e.Mov32(kT1, LinkValue(pc));
                 StoreGuest(kT1, 14);
             }
             // TFlag = destino & 1; PC = destino & ~1 (igual que BX_INST).
-            e.Ubfx(kT1, kT0, 0, 1);
-            e.StrImm(kT1, kCpu, g_offsets.t);
-            e.Emit(0xE3C00001u | (kT0 << 16) | (kT0 << 12)); // BIC kT0, kT0, #1
-            StoreGuest(kT0, 15);
-            ExitIndirect();
+            e.Ubfx(kRd, kRs, 0, 1);
+            e.StrImm(kRd, kCpu, g_offsets.t);
+            e.Emit(0xE3C00001u | (kRs << 16) | (kRs << 12)); // BIC kRs, kRs, #1
+            StoreGuest(kRs, 15);
+            ExitIndirect(true);
             break;
         }
         case Kind::BlockTransfer:
-            // LDM con el PC: pone Reg[15] y TFlag.
+            // LDM con el PC: pone Reg[15] y TFlag (y, sin comprobacion, kRs y
+            // kRd, ver BlockTransferFast).
             BlockTransferCall(inst, pc);
-            ExitIndirect();
+            ExitIndirect(!check_mode);
             break;
         case Kind::DataProcessing:
             // "mov pc, lr" y compania: el resultado va a Reg[15] (Rd = 15), sin
@@ -3923,9 +4048,9 @@ public:
             ExitIndirect();
             break;
         case Kind::LoadStore:
-            // "ldr pc, [...]": LoadStore pone Reg[15] y TFlag.
+            // "ldr pc, [...]": LoadStore pone Reg[15] y TFlag, y kRs y kRd.
             LoadStore(inst, pc);
-            ExitIndirect();
+            ExitIndirect(true);
             break;
         default:
             to_epilogue.push_back(e.BranchPlaceholder(kAlways));
@@ -5693,6 +5818,30 @@ void WriteProfile() {
     if (fd >= 0) {
         sceIoWrite(fd, text.data(), static_cast<SceSize>(text.size()));
         sceIoClose(fd);
+    }
+    /**
+     * Y lo generado para ellos (0.3.0.5), con el formato de jit_volcado.bin y
+     * sin la zona fria: aquel coge bloques al azar al compilar, y esto dice
+     * que hay de verdad en lo que mas se ejecuta. Los bloques siguen vivos:
+     * el vaciado que quita los contadores viene despues.
+     */
+    const SceUID bin = sceIoOpen("ux0:/data/azahar/jit_calientes.bin",
+                                 SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (bin >= 0) {
+        for (std::size_t i = 0; i < order.size() && i < kProfileTop; i++) {
+            const auto it = g_blocks.find(order[i].second);
+            if (it == g_blocks.end() || it->second.code == nullptr) {
+                continue;
+            }
+            const Block& block = it->second;
+            const u32 header[6] = {0x4254494Au, block.pc, block.thumb ? 1u : 0u,
+                                   static_cast<u32>(block.words.size()), block.hot_words, 0};
+            sceIoWrite(bin, header, sizeof(header));
+            sceIoWrite(bin, block.cache_map.data(), sizeof(block.cache_map));
+            sceIoWrite(bin, block.words.data(), static_cast<SceSize>(block.words.size() * 4));
+            sceIoWrite(bin, reinterpret_cast<const u32*>(block.code), block.hot_words * 4);
+        }
+        sceIoClose(bin);
     }
     Common::VitaNote("jit perfil",
                      fmt::format("{} bloques, los {} primeros son el {:.1f}% de las instrucciones; "
