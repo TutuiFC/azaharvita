@@ -43,6 +43,10 @@ namespace Gxm {
 std::atomic<u32> RasterizerGXM::gpu_triangles{0};
 std::atomic<u32> RasterizerGXM::software_triangles{0};
 std::atomic<u32> RasterizerGXM::gpu_batches{0};
+std::atomic<u32> RasterizerGXM::vertex_reuse_hits{0};
+std::atomic<u32> RasterizerGXM::vertex_reuse_misses{0};
+std::atomic<u64> RasterizerGXM::vertex_reuse_bytes{0};
+std::atomic<u32> RasterizerGXM::vertex_reuse{1};
 std::atomic<u32> RasterizerGXM::gpu_scenes{0};
 std::atomic<u32> RasterizerGXM::gpu_writebacks{0};
 std::atomic<u32> RasterizerGXM::scene_close_full{0};
@@ -5784,6 +5788,37 @@ static bool HwVsReject(const char* why) {
     return false;
 }
 
+bool RasterizerGXM::VertexCopyUsable(const VertexCopy& copy) const {
+    if (!vertex_buffer.Valid() || copy.generation != vertex_generation) {
+        return false;
+    }
+    if (copy.lap == vertex_lap) {
+        // Detras de la cabeza: en esta vuelta ya no se escribe ahi.
+        return true;
+    }
+    if (copy.lap + 1 != vertex_lap) {
+        return false;
+    }
+    /**
+     * De la vuelta anterior: solo si esta al menos dos tramos por delante de
+     * la cabeza. Marcarla como leida por la escena abierta en el tramo de al
+     * lado haria que la siguiente reserva que entre ahi cierre la escena y
+     * espere a la GPU entera (ver ReserveVertexSpace); mejor copiarla otra vez.
+     */
+    const u32 segment_bytes = vertex_buffer.Size() / kVertexSegments;
+    const u32 head = vertex_used == 0 ? 0 : (vertex_used - 1) / segment_bytes + 1;
+    return copy.offset / segment_bytes >= head + 1;
+}
+
+void RasterizerGXM::MarkVertexSpanRead(u32 offset, u32 bytes) {
+    const u32 segment_bytes = vertex_buffer.Size() / kVertexSegments;
+    const u32 first = offset / segment_bytes;
+    const u32 last = (offset + std::max(bytes, 1u) - 1) / segment_bytes;
+    for (u32 segment = first; segment <= last && segment < kVertexSegments; segment++) {
+        vertex_segments_pending |= 1u << segment;
+    }
+}
+
 u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
     /**
      * EL ANILLO EN TRAMOS (0.2.1.1). Al llegar al final del anillo se cerraba
@@ -5817,6 +5852,8 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
         vertex_used = 0;
         vertex_segment_fence.fill(fence_sent);
         vertex_segments_pending = 0;
+        vertex_generation++;
+        vertex_lap = 0;
     }
     const u32 size = vertex_buffer.Size();
     const u32 span = std::max(bytes, 1u);
@@ -5824,6 +5861,7 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
     const bool wrapped = offset + span > size;
     if (wrapped) {
         offset = 0;
+        vertex_lap++;
     }
     const u32 segment_bytes = size / kVertexSegments;
     const u32 first = offset / segment_bytes;
@@ -6363,6 +6401,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     // memoria del invitado.
     std::array<const u8*, 12> stream_source{};
     std::array<u32, 12> stream_bytes{};
+    std::array<PAddr, 12> stream_address{};
     u32 total_bytes = 0;
     for (u32 stream = 0; stream < stream_count; stream++) {
         const auto& loader = attributes.attribute_loaders[loader_of_stream[stream]];
@@ -6375,6 +6414,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
         stream_source[stream] = first;
         stream_bytes[stream] = bytes;
+        stream_address[stream] = start;
         total_bytes += (bytes + 15u) & ~15u;
     }
     if (converted) {
@@ -6409,11 +6449,32 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             sequential[i] = static_cast<u16>(i);
         }
     }
-    u8* space = ReserveVertexSpace(total_bytes);
+    // Ver VertexCopy: los flujos que ya estan en el anillo no se reservan.
+    std::array<const u8*, 12> stream_data{};
+    std::array<u64, 12> stream_hash{};
+    std::array<VertexCopy*, 12> stream_copy{};
+    std::array<bool, 12> stream_reused{};
+    const bool reuse = !converted && vertex_reuse.load(std::memory_order_relaxed) != 0;
+    u32 reserve_bytes = total_bytes;
+    if (reuse) {
+        if (vertex_copies.size() > 4096) {
+            vertex_copies.clear();
+        }
+        for (u32 stream = 0; stream < stream_count; stream++) {
+            stream_hash[stream] = Common::ComputeHash64(stream_source[stream], stream_bytes[stream]);
+            VertexCopy& copy = vertex_copies[(static_cast<u64>(stream_bytes[stream]) << 32) |
+                                             stream_address[stream]];
+            stream_copy[stream] = &copy;
+            if (copy.hash == stream_hash[stream] && VertexCopyUsable(copy)) {
+                stream_reused[stream] = true;
+                reserve_bytes -= (stream_bytes[stream] + 15u) & ~15u;
+            }
+        }
+    }
+    u8* space = ReserveVertexSpace(reserve_bytes);
     if (space == nullptr) {
         return HwVsReject("memoria vertices");
     }
-    std::array<const u8*, 12> stream_data{};
     if (converted) {
         // Un float por componente, en el orden de gxm_attributes (ver arriba).
         float* out = reinterpret_cast<float*>(space);
@@ -6456,10 +6517,59 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         space += (converted_stride * vertex_range + 15u) & ~15u;
         stream_count = 1;
     } else {
+        u8* const ring = static_cast<u8*>(vertex_buffer.Data());
+        const auto copy_stream = [&](u32 stream, u8* at) {
+            std::memcpy(at, stream_source[stream], stream_bytes[stream]);
+            stream_data[stream] = at;
+            if (reuse) {
+                VertexCopy& copy = *stream_copy[stream];
+                copy.hash = stream_hash[stream];
+                copy.offset = static_cast<u32>(at - ring);
+                copy.lap = vertex_lap;
+                copy.generation = vertex_generation;
+                vertex_reuse_misses.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
         for (u32 stream = 0; stream < stream_count; stream++) {
-            std::memcpy(space, stream_source[stream], stream_bytes[stream]);
-            stream_data[stream] = space;
+            if (stream_reused[stream]) {
+                continue;
+            }
+            copy_stream(stream, space);
             space += (stream_bytes[stream] + 15u) & ~15u;
+        }
+        // La reserva pudo pisar alguna de las reutilizadas: esas, de nuevo.
+        for (u32 round = 0; round <= stream_count; round++) {
+            u32 again = 0;
+            for (u32 stream = 0; stream < stream_count; stream++) {
+                if (stream_reused[stream] && !VertexCopyUsable(*stream_copy[stream])) {
+                    stream_reused[stream] = false;
+                    again += (stream_bytes[stream] + 15u) & ~15u;
+                    stream_data[stream] = nullptr;
+                }
+            }
+            if (again == 0) {
+                break;
+            }
+            u8* more = ReserveVertexSpace(again);
+            if (more == nullptr) {
+                return HwVsReject("memoria vertices");
+            }
+            for (u32 stream = 0; stream < stream_count; stream++) {
+                if (!stream_reused[stream] && stream_data[stream] == nullptr) {
+                    copy_stream(stream, more);
+                    more += (stream_bytes[stream] + 15u) & ~15u;
+                }
+            }
+        }
+        for (u32 stream = 0; stream < stream_count; stream++) {
+            if (!stream_reused[stream]) {
+                continue;
+            }
+            const VertexCopy& copy = *stream_copy[stream];
+            stream_data[stream] = ring + copy.offset;
+            MarkVertexSpanRead(copy.offset, stream_bytes[stream]);
+            vertex_reuse_hits.fetch_add(1, std::memory_order_relaxed);
+            vertex_reuse_bytes.fetch_add(stream_bytes[stream], std::memory_order_relaxed);
         }
     }
     const u16* draw_indices = static_cast<const u16*>(index_buffer.Data());
@@ -6600,10 +6710,13 @@ std::string RasterizerGXM::TakeBatchProfile() {
     std::string text = fmt::format(
         "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
         "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
-        "muestras)",
+        "muestras) | flujos reutilizados {} copiados {} ({} KB sin copiar)",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
-        avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples);
+        avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples,
+        vertex_reuse_hits.exchange(0, std::memory_order_relaxed),
+        vertex_reuse_misses.exchange(0, std::memory_order_relaxed),
+        vertex_reuse_bytes.exchange(0, std::memory_order_relaxed) / 1024);
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
     state_scene_us = 0;
