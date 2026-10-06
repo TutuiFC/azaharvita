@@ -617,7 +617,7 @@ void EmuWindow_Vita::PresentScreens() {
                                  cg.queued, (now_us - cg.busy_since_us) / 1000000ull);
             if (notice_texture == nullptr && BuildGlyphSheet()) {
                 notice_texture = vita2d_create_empty_texture_rendertarget(
-                    512, 32, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+                    512, GlyphSheet::kCellH, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
                 if (notice_texture != nullptr) {
                     std::memset(vita2d_texture_get_datap(notice_texture), 0,
                                 vita2d_texture_get_stride(notice_texture) *
@@ -777,11 +777,12 @@ bool EmuWindow_Vita::BuildGlyphSheet() {
     if (glyph_sheet_failed || stats_font == nullptr) {
         return false;
     }
-    constexpr int kCell = GlyphSheet::kCell;
+    constexpr int kCellW = GlyphSheet::kCellW;
+    constexpr int kCellH = GlyphSheet::kCellH;
     constexpr int kColumns = 16;
     constexpr int kRows = 6;
     vita2d_texture* const sheet = vita2d_create_empty_texture_rendertarget(
-        kCell * kColumns, kCell * kRows, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+        kCellW * kColumns, kCellH * kRows, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
     if (sheet == nullptr) {
         glyph_sheet_failed = true;
         return false;
@@ -791,32 +792,35 @@ bool EmuWindow_Vita::BuildGlyphSheet() {
     vita2d_start_drawing_advanced(sheet, 0);
     vita2d_set_clear_color(RGBA8(0, 0, 0, 0));
     vita2d_clear_screen();
-    char text[2] = {0, 0};
     for (int c = 0; c < 95; c++) {
-        text[0] = static_cast<char>(32 + c);
-        vita2d_pgf_draw_text(stats_font, (c % kColumns) * kCell + GlyphSheet::kPenX,
-                             (c / kColumns) * kCell + GlyphSheet::kBaseline, 0xFFFFFFFF, 0.8f,
-                             text);
+        const char one[2] = {static_cast<char>(32 + c), 0};
+        vita2d_pgf_draw_text(stats_font, (c % kColumns) * kCellW + GlyphSheet::kPenX,
+                             (c / kColumns) * kCellH + GlyphSheet::kBaseline, 0xFFFFFFFF, 0.8f,
+                             one);
     }
     vita2d_end_drawing();
     vita2d_set_clear_color(clear_color);
     vita2d_wait_rendering_done();
 
     auto result = std::make_unique<GlyphSheet>();
-    result->coverage.assign(static_cast<std::size_t>(95) * kCell * kCell, 0);
+    result->coverage.assign(static_cast<std::size_t>(95) * kCellW * kCellH, 0);
     const u8* const pixels = static_cast<const u8*>(vita2d_texture_get_datap(sheet));
     const unsigned int stride = vita2d_texture_get_stride(sheet);
     for (int c = 0; c < 95; c++) {
-        text[0] = static_cast<char>(32 + c);
-        // Lo mismo que avanza la pluma de vita2d con cada letra (entera).
-        result->advance[c] =
-            static_cast<u8>(std::clamp(vita2d_pgf_text_width(stats_font, 0.8f, text), 0, 255));
-        const int cell_x = (c % kColumns) * kCell;
-        const int cell_y = (c / kColumns) * kCell;
-        for (int y = 0; y < kCell; y++) {
+        // El avance de la pluma: dos letras menos una, que no depende de como
+        // mida vita2d la ultima.
+        const char one[2] = {static_cast<char>(32 + c), 0};
+        const char two[3] = {static_cast<char>(32 + c), static_cast<char>(32 + c), 0};
+        const int advance = vita2d_pgf_text_width(stats_font, 0.8f, two) -
+                            vita2d_pgf_text_width(stats_font, 0.8f, one);
+        result->advance[c] = static_cast<u8>(std::clamp(advance, 0, 255));
+        const int cell_x = (c % kColumns) * kCellW;
+        const int cell_y = (c / kColumns) * kCellH;
+        for (int y = 0; y < kCellH; y++) {
             const u8* in = pixels + (cell_y + y) * stride + cell_x * 4;
-            u8* out = result->coverage.data() + (static_cast<std::size_t>(c) * kCell + y) * kCell;
-            for (int x = 0; x < kCell; x++) {
+            u8* out =
+                result->coverage.data() + (static_cast<std::size_t>(c) * kCellH + y) * kCellW;
+            for (int x = 0; x < kCellW; x++) {
                 out[x] = in[x * 4];
             }
         }
@@ -836,30 +840,32 @@ void EmuWindow_Vita::OverlayText(int x, int y, unsigned int color, const char* t
 
 void EmuWindow_Vita::CpuText(vita2d_texture* texture, std::vector<TextRect>& rects, int x, int y,
                              unsigned int color, const char* text) {
-    constexpr int kCell = GlyphSheet::kCell;
+    constexpr int kCellW = GlyphSheet::kCellW;
+    constexpr int kCellH = GlyphSheet::kCellH;
     const GlyphSheet& sheet = *glyph_sheet;
     // La linea entera en coberturas (el maximo donde se tocan dos letras) y
     // despues a la textura, que es memoria de video sin cache: cada pixel se
     // escribe una vez y solo si tiene tinta.
-    int line_width = kCell;
-    for (const char* p = text; *p != ' '; p++) {
+    int line_width = kCellW;
+    for (const char* p = text; *p != '\0'; p++) {
         const int c = static_cast<unsigned char>(*p) - 32;
         if (c >= 0 && c < 95) {
             line_width += sheet.advance[c];
         }
     }
-    std::vector<u8> line(static_cast<std::size_t>(line_width) * kCell, 0);
+    std::vector<u8> line(static_cast<std::size_t>(line_width) * kCellH, 0);
     int pen = 0;
-    for (const char* p = text; *p != ' '; p++) {
+    for (const char* p = text; *p != '\0'; p++) {
         const int c = static_cast<unsigned char>(*p) - 32;
         if (c < 0 || c >= 95) {
             continue;
         }
-        const u8* const cell = sheet.coverage.data() + static_cast<std::size_t>(c) * kCell * kCell;
-        for (int gy = 0; gy < kCell; gy++) {
+        const u8* const cell =
+            sheet.coverage.data() + static_cast<std::size_t>(c) * kCellW * kCellH;
+        for (int gy = 0; gy < kCellH; gy++) {
             u8* out = line.data() + gy * line_width + pen;
-            const u8* in = cell + gy * kCell;
-            for (int gx = 0; gx < kCell; gx++) {
+            const u8* in = cell + gy * kCellW;
+            for (int gx = 0; gx < kCellW; gx++) {
                 out[gx] = std::max(out[gx], in[gx]);
             }
         }
@@ -873,7 +879,7 @@ void EmuWindow_Vita::CpuText(vita2d_texture* texture, std::vector<TextRect>& rec
     const int top = y - GlyphSheet::kBaseline;
     const u32 rgb = color & 0x00FFFFFFu;
     const u32 alpha = color >> 24;
-    for (int gy = 0; gy < kCell; gy++) {
+    for (int gy = 0; gy < kCellH; gy++) {
         const int py = top + gy;
         if (py < 0 || py >= height) {
             continue;
@@ -888,7 +894,7 @@ void EmuWindow_Vita::CpuText(vita2d_texture* texture, std::vector<TextRect>& rec
             row[px] = rgb | ((in[gx] * alpha / 255u) << 24);
         }
     }
-    rects.push_back({left, top, line_width, kCell});
+    rects.push_back({left, top, line_width, kCellH});
 }
 
 void EmuWindow_Vita::ClearTextRects(vita2d_texture* texture, std::vector<TextRect>& rects) {

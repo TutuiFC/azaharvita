@@ -138,10 +138,13 @@ private:
      * letra, sin una llamada por caracter.
      */
     struct GlyphSheet {
-        static constexpr int kCell = 24;     ///< celda de cada caracter, en px
-        static constexpr int kPenX = 4;      ///< la pluma, dentro de la celda
-        static constexpr int kBaseline = 18; ///< la linea base, dentro de la celda
-        std::vector<u8> coverage;            ///< 95 celdas de kCell x kCell
+        /// Celdas holgadas con la pluma en medio (0.3.0.7): con 24 x 24 y la
+        /// linea base a 18 las letras salian cortadas y montadas.
+        static constexpr int kCellW = 32;
+        static constexpr int kCellH = 48;
+        static constexpr int kPenX = 8;      ///< la pluma, dentro de la celda
+        static constexpr int kBaseline = 24; ///< la y que se le pasa a vita2d, en la celda
+        std::vector<u8> coverage;            ///< 95 celdas de kCellW x kCellH
         std::array<u8, 95> advance{};
     };
     struct TextRect {
