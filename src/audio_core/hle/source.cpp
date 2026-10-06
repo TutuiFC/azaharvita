@@ -37,6 +37,33 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
     const std::array<float, 4>& ramp_start = state.gain_ramp_start.at(intermediate_mix_id);
     constexpr float ramp_scale = 1.0f / static_cast<float>(samples_per_frame - 1);
 
+    /**
+     * SIN RAMPA, SOLO LOS CANALES QUE SUENAN (0.2.3.8). Cada fuente activa se
+     * mezclaba en las tres mezclas, 160 muestras y cuatro canales, aunque su
+     * ganancia ahi fuera cero, que es lo normal en las auxiliares y en los
+     * canales de atras. Con ganancia 0 el producto es 0 (o -0) y la suma no
+     * cambia nada, asi que saltarse esos canales da exactamente lo mismo.
+     */
+    if (!ramp_active) {
+        const float g0 = gains[0];
+        const float g1 = gains[1];
+        const float g2 = gains[2];
+        const float g3 = gains[3];
+        if (g0 != 0.0f || g1 != 0.0f) {
+            for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
+                dest[samplei][0] += static_cast<s32>(g0 * current_frame[samplei][0]);
+                dest[samplei][1] += static_cast<s32>(g1 * current_frame[samplei][1]);
+            }
+        }
+        if (g2 != 0.0f || g3 != 0.0f) {
+            for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
+                dest[samplei][2] += static_cast<s32>(g2 * current_frame[samplei][0]);
+                dest[samplei][3] += static_cast<s32>(g3 * current_frame[samplei][1]);
+            }
+        }
+        return;
+    }
+
     for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
         const float progress = static_cast<float>(samplei) * ramp_scale;
         const float gain0 =

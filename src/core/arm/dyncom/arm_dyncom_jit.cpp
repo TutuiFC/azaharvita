@@ -928,6 +928,10 @@ struct Block {
     /// Bytes del juego que cubre e instrucciones que cuenta el interprete.
     u32 guest_bytes = 0;
     u32 guest_count = 0;
+    /// Entradas mientras dura el perfil (ver PERFIL DE BLOQUES) y palabras del
+    /// anfitrion en la zona caliente.
+    u32 hits = 0;
+    u32 hot_words = 0;
     /**
      * Cache de registros (0.1.5.2, 4.3): guest -> host (r0-r3 o lr desde
      * 0.1.5.7, ver kCacheHosts) o -1.
@@ -983,6 +987,36 @@ constexpr u32 kSharedWords = 64;
 u32* g_shared_enter = nullptr;
 u32* g_shared_exit = nullptr;
 u32 g_code_flushes = 0;
+
+/**
+ * PERFIL DE BLOQUES (0.2.3.8). Sin los contadores del procesador (libperf no
+ * se carga en una consola normal: "cpu pmu: modulo 0x805a1000"), lo siguiente
+ * mejor es saber QUE codigo del juego se lleva el tiempo. Durante kProfileUs,
+ * pasado kProfileStartUs de partida, cada bloque compilado cuenta sus
+ * entradas (cinco instrucciones al principio del cuerpo y en el salto al
+ * propio bloque). Al acabar, los bloques que mas instrucciones han ejecutado
+ * van a jit_calientes.txt con sus instrucciones, y se vacia el JIT para
+ * quitar los contadores.
+ */
+constexpr unsigned long long kProfileStartUs = 90ull * 1000000ull;
+constexpr unsigned long long kProfileUs = 120ull * 1000000ull;
+constexpr std::size_t kProfileTop = 96;
+bool g_profile_active = false;
+bool g_profile_done = false;
+unsigned long long g_profile_clock_us = 0;
+struct ProfileEntry {
+    u64 hits = 0;
+    u32 guest_count = 0;
+    u32 hot_words = 0;
+    bool thumb = false;
+    std::vector<u32> words;
+};
+std::unordered_map<u32, ProfileEntry> g_profile;
+
+/// Suma las entradas de los bloques vivos al perfil (antes de tirarlos).
+void FoldProfile();
+/// Abre y cierra la ventana del perfil; la llama cada rodaja.
+void TickProfile(u64 slice_us);
 u32 g_check_start_words = 0;
 u32 g_check_used_words = 0;
 /// Bloques generados (las dos variantes) desde el ultimo vaciado.
@@ -1690,6 +1724,20 @@ public:
         shared_exit_ = shared_exit;
     }
 
+    /// Ver PERFIL DE BLOQUES. Con kT0/kT1 libres y sin tocar los flags.
+    void SetProfileCounter(u32* counter) {
+        profile_counter_ = counter;
+    }
+    void EmitProfileCount() {
+        if (profile_counter_ == nullptr) {
+            return;
+        }
+        e.Mov32(kT0, static_cast<u32>(reinterpret_cast<uintptr_t>(profile_counter_)));
+        e.LdrImm(kT1, kT0, 0);
+        e.Emit(0xE2800001u | (kT1 << 16) | (kT1 << 12)); // ADD kT1, kT1, #1
+        e.StrImm(kT1, kT0, 0);
+    }
+
     /// La salida sin volcar la cache (la de los enlaces que fallan).
     void BranchExitNoFlush() {
         if (shared_exit_ != nullptr) {
@@ -1974,6 +2022,7 @@ private:
     std::vector<u32> to_epilogue;
     u32 exit_noflush = 0;
     const u32* shared_exit_ = nullptr;
+    u32* profile_counter_ = nullptr;
 
     void DeferCold(std::vector<u32> branches, std::function<void()> body) {
         DeferCold(std::move(branches), cache_written, std::move(body));
@@ -3346,6 +3395,7 @@ public:
         fails.push_back(e.BranchPlaceholder(kAlways));
         e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
         e.StrdImm(kRn, kCpu, g_offsets.link);
+        EmitProfileCount();
         e.BranchTo(kAlways, body_start_);
         DeferCold(std::move(fails), [this, target_pc] {
             e.Mov32(kRd, target_pc);
@@ -3567,6 +3617,7 @@ u64 BlockHash(const Block& block) {
 }
 
 void ResetAll() {
+    FoldProfile();
     g_invalid_ranges.clear();
     g_blocks.clear();
     g_fast.fill(FastSlot{});
@@ -4095,6 +4146,10 @@ bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* c
         compiler.SetSharedExit(g_shared_exit);
         chain_entry = compiler.ChainEntryPosition();
         entry_index = chain_entry;
+        if (g_profile_active) {
+            compiler.SetProfileCounter(&block.hits);
+            compiler.EmitProfileCount();
+        }
     } else {
         compiler.Prologue();
         chain_entry = compiler.ChainEntryPosition();
@@ -4184,6 +4239,7 @@ bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* c
         out.cold_full = e.ColdOverflowed();
         return false;
     }
+    block.hot_words = e.HotUsed();
     if (sites != nullptr) {
         *sites = std::move(compiler.link_sites);
     }
@@ -4975,6 +5031,7 @@ const char* RejectName(u32 reason) {
 void AddSliceTime(u64 microseconds) {
     g_local.arm_us += microseconds;
     g_local.slices++;
+    TickProfile(microseconds);
 }
 
 void AddSvcTime(u64 microseconds) {
@@ -5156,6 +5213,111 @@ void Reset() {
     g_verified.clear();
     ResetAll();
 }
+
+namespace {
+
+void FoldProfile() {
+    for (auto& [key, block] : g_blocks) {
+        if (block.hits == 0) {
+            continue;
+        }
+        ProfileEntry& entry = g_profile[key];
+        entry.hits += block.hits;
+        entry.guest_count = block.guest_count;
+        entry.hot_words = block.hot_words;
+        entry.thumb = block.thumb;
+        if (entry.words.empty()) {
+            entry.words = block.words;
+        }
+        block.hits = 0;
+    }
+}
+
+/// Fin del perfil: los bloques que mas instrucciones han ejecutado, a la tarjeta.
+void WriteProfile() {
+    FoldProfile();
+    std::vector<std::pair<u64, u32>> order;
+    order.reserve(g_profile.size());
+    u64 total = 0;
+    u64 total_entries = 0;
+    u64 total_host = 0;
+    for (const auto& [key, entry] : g_profile) {
+        const u64 executed = entry.hits * entry.guest_count;
+        total += executed;
+        total_entries += entry.hits;
+        total_host += entry.hits * entry.hot_words;
+        order.emplace_back(executed, key);
+    }
+    std::sort(order.begin(), order.end(), std::greater<>());
+    std::string text = fmt::format("perfil de bloques: {} bloques, {} entradas, {} instrucciones "
+                                   "del juego, {:.2f} palabras calientes por instruccion\n",
+                                   g_profile.size(), total_entries, total,
+                                   total > 0 ? static_cast<double>(total_host) /
+                                                   static_cast<double>(total)
+                                             : 0.0);
+    u64 top_sum = 0;
+    for (std::size_t i = 0; i < order.size() && i < kProfileTop; i++) {
+        const ProfileEntry& entry = g_profile[order[i].second];
+        top_sum += order[i].first;
+        text += fmt::format("bloque {:#010x}{} entradas {} instrucciones {} ({:.2f}%, acumulado "
+                            "{:.1f}%) palabras {}\n",
+                            order[i].second & ~1u, entry.thumb ? " thumb" : "", entry.hits,
+                            entry.guest_count,
+                            total > 0 ? 100.0 * static_cast<double>(order[i].first) /
+                                            static_cast<double>(total)
+                                      : 0.0,
+                            total > 0 ? 100.0 * static_cast<double>(top_sum) /
+                                            static_cast<double>(total)
+                                      : 0.0,
+                            entry.hot_words);
+        for (std::size_t w = 0; w < entry.words.size(); w++) {
+            text += fmt::format("{}{:08x}", w % 8 == 0 ? "  " : " ", entry.words[w]);
+            if (w % 8 == 7 || w + 1 == entry.words.size()) {
+                text += '\n';
+            }
+        }
+    }
+    const SceUID fd = sceIoOpen("ux0:/data/azahar/jit_calientes.txt",
+                                SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, text.data(), static_cast<SceSize>(text.size()));
+        sceIoClose(fd);
+    }
+    Common::VitaNote("jit perfil",
+                     fmt::format("{} bloques, los {} primeros son el {:.1f}% de las instrucciones; "
+                                 "detalle en jit_calientes.txt",
+                                 g_profile.size(), std::min(order.size(), kProfileTop),
+                                 total > 0 ? 100.0 * static_cast<double>(top_sum) /
+                                                 static_cast<double>(total)
+                                           : 0.0)
+                         .c_str());
+    g_profile.clear();
+}
+
+void TickProfile(u64 slice_us) {
+    if (g_profile_done || !g_ready) {
+        return;
+    }
+    g_profile_clock_us += slice_us;
+    if (!g_profile_active) {
+        if (g_profile_clock_us >= kProfileStartUs) {
+            // Los bloques ya compilados no tienen contador: se tiran y se
+            // recompilan con el.
+            g_profile_active = true;
+            g_flush_requested = true;
+            Common::VitaNote("jit perfil", "empieza (2 minutos)");
+        }
+        return;
+    }
+    if (g_profile_clock_us >= kProfileStartUs + kProfileUs) {
+        g_profile_active = false;
+        g_profile_done = true;
+        WriteProfile();
+        g_flush_requested = true;
+    }
+}
+
+} // Anonymous namespace
 
 void InvalidateRange(u32 start, u32 size) {
     if (!g_ready || size == 0) {
