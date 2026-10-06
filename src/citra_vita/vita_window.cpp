@@ -87,9 +87,6 @@ EmuWindow_Vita::~EmuWindow_Vita() {
     if (overlay_texture != nullptr) {
         vita2d_free_texture(overlay_texture);
     }
-    if (notice_texture != nullptr) {
-        vita2d_free_texture(notice_texture);
-    }
 }
 
 EmuWindow_Vita::ScreenRects EmuWindow_Vita::RectsFor(int layout) {
@@ -568,23 +565,10 @@ void EmuWindow_Vita::PresentScreens() {
             overlay_texture = vita2d_create_empty_texture_rendertarget(
                 kVitaScreenWidth, kVitaScreenHeight, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
             stats_next_update_us = 0;
-            if (overlay_texture != nullptr) {
-                // Entera a cero: por la CPU solo se borra lo escrito (CpuText).
-                std::memset(vita2d_texture_get_datap(overlay_texture), 0,
-                            vita2d_texture_get_stride(overlay_texture) *
-                                vita2d_texture_get_height(overlay_texture));
-            }
         }
         if (stats_overlay_visible && overlay_texture != nullptr) {
             overlay_from_texture = true;
-            if (sceKernelGetProcessTimeWide() >= stats_next_update_us && BuildGlyphSheet()) {
-                // La GPU puede estar leyendola aun para el fotograma anterior.
-                vita2d_wait_rendering_done();
-                ClearTextRects(overlay_texture, overlay_text_rects);
-                overlay_cpu_text = true;
-                DrawStatsOverlay();
-                overlay_cpu_text = false;
-            } else if (sceKernelGetProcessTimeWide() >= stats_next_update_us) {
+            if (sceKernelGetProcessTimeWide() >= stats_next_update_us) {
                 const unsigned int clear_color = vita2d_get_clear_color();
                 vita2d_start_drawing_advanced(overlay_texture, 0);
                 vita2d_set_clear_color(RGBA8(0, 0, 0, 0));
@@ -599,42 +583,6 @@ void EmuWindow_Vita::PresentScreens() {
         }
         Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
     }
-    /**
-     * AVISO DE COMPILACION (0.2.1.6). Hay shaders de vertices de Pokemon
-     * Sol que tardan 25-30 s en compilarse, y mientras tanto el juego va a
-     * 1 FPS: parece colgado y se cierra, y la compilacion se pierde (antes
-     * ademas iba a la lista negra). Solo si lleva mas de un segundo. Desde
-     * 0.3.0.6 su texto va a notice_texture cuando cambia (una vez por
-     * segundo), fuera de la escena.
-     */
-    std::string notice;
-    {
-        const Gxm::CgActivity cg = Gxm::GetCgActivity();
-        const unsigned long long now_us = Common::VitaMicros();
-        if (stats_font != nullptr && cg.busy_since_us != 0 && now_us > cg.busy_since_us &&
-            now_us - cg.busy_since_us > 1000000ull) {
-            notice = fmt::format("Compilando shaders ({} en cola, {} s): no cierres el juego",
-                                 cg.queued, (now_us - cg.busy_since_us) / 1000000ull);
-            if (notice_texture == nullptr && BuildGlyphSheet()) {
-                notice_texture = vita2d_create_empty_texture_rendertarget(
-                    512, GlyphSheet::kCellH, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
-                if (notice_texture != nullptr) {
-                    std::memset(vita2d_texture_get_datap(notice_texture), 0,
-                                vita2d_texture_get_stride(notice_texture) *
-                                    vita2d_texture_get_height(notice_texture));
-                    notice_text.clear();
-                }
-            }
-            if (notice_texture != nullptr && notice != notice_text) {
-                vita2d_wait_rendering_done();
-                ClearTextRects(notice_texture, notice_text_rects);
-                CpuText(notice_texture, notice_text_rects, 8, GlyphSheet::kBaseline,
-                        RGBA8(255, 210, 90, 255), notice.c_str());
-                notice_text = notice;
-            }
-        }
-    }
-
     vita2d_start_drawing_advanced(nullptr, 0);
     vita2d_clear_screen();
     if (use_gxm) {
@@ -668,18 +616,23 @@ void EmuWindow_Vita::PresentScreens() {
         } else if (stats_overlay_visible) {
             DrawStatsOverlay();
         }
-        if (!notice.empty()) {
+        /**
+         * AVISO DE COMPILACION (0.2.1.6). Hay shaders de vertices de Pokemon
+         * Sol que tardan 25-30 s en compilarse, y mientras tanto el juego va a
+         * 1 FPS: parece colgado y se cierra, y la compilacion se pierde (antes
+         * ademas iba a la lista negra). Solo si lleva mas de un segundo.
+         */
+        const Gxm::CgActivity cg = Gxm::GetCgActivity();
+        const unsigned long long now_us = Common::VitaMicros();
+        if (stats_font != nullptr && cg.busy_since_us != 0 && now_us > cg.busy_since_us &&
+            now_us - cg.busy_since_us > 1000000ull) {
+            const std::string notice = fmt::format(
+                "Compilando shaders ({} en cola, {} s): no cierres el juego", cg.queued,
+                (now_us - cg.busy_since_us) / 1000000ull);
             vita2d_draw_rectangle(0.0f, static_cast<float>(kVitaScreenHeight) - 24.0f, 470.0f,
                                   24.0f, RGBA8(0, 0, 0, 170));
-            if (notice_texture != nullptr) {
-                // Linea base a 7 px del borde, como la de vita2d.
-                vita2d_draw_texture(notice_texture, 0.0f,
-                                    static_cast<float>(kVitaScreenHeight - 7 -
-                                                       GlyphSheet::kBaseline));
-            } else {
-                vita2d_pgf_draw_text(stats_font, 8, static_cast<int>(kVitaScreenHeight) - 7,
-                                     RGBA8(255, 210, 90, 255), 0.85f, notice.c_str());
-            }
+            vita2d_pgf_draw_text(stats_font, 8, static_cast<int>(kVitaScreenHeight) - 7,
+                                 RGBA8(255, 210, 90, 255), 0.85f, notice.c_str());
         }
         Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
     }
@@ -769,153 +722,6 @@ void AppendMillis(char* out, std::size_t& n, double value) {
 // Estaba duplicado a mano y se habia quedado desfasado respecto al de main.cpp
 // -- que es exactamente el fallo que ese cartel existe para evitar.
 } // Anonymous namespace
-
-bool EmuWindow_Vita::BuildGlyphSheet() {
-    if (glyph_sheet != nullptr) {
-        return true;
-    }
-    if (glyph_sheet_failed || stats_font == nullptr) {
-        return false;
-    }
-    constexpr int kCellW = GlyphSheet::kCellW;
-    constexpr int kCellH = GlyphSheet::kCellH;
-    constexpr int kColumns = 16;
-    constexpr int kRows = 6;
-    vita2d_texture* const sheet = vita2d_create_empty_texture_rendertarget(
-        kCellW * kColumns, kCellH * kRows, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
-    if (sheet == nullptr) {
-        glyph_sheet_failed = true;
-        return false;
-    }
-    // En blanco sobre transparente: el rojo de cada pixel es la cobertura.
-    const unsigned int clear_color = vita2d_get_clear_color();
-    vita2d_start_drawing_advanced(sheet, 0);
-    vita2d_set_clear_color(RGBA8(0, 0, 0, 0));
-    vita2d_clear_screen();
-    for (int c = 0; c < 95; c++) {
-        const char one[2] = {static_cast<char>(32 + c), 0};
-        vita2d_pgf_draw_text(stats_font, (c % kColumns) * kCellW + GlyphSheet::kPenX,
-                             (c / kColumns) * kCellH + GlyphSheet::kBaseline, 0xFFFFFFFF, 0.8f,
-                             one);
-    }
-    vita2d_end_drawing();
-    vita2d_set_clear_color(clear_color);
-    vita2d_wait_rendering_done();
-
-    auto result = std::make_unique<GlyphSheet>();
-    result->coverage.assign(static_cast<std::size_t>(95) * kCellW * kCellH, 0);
-    const u8* const pixels = static_cast<const u8*>(vita2d_texture_get_datap(sheet));
-    const unsigned int stride = vita2d_texture_get_stride(sheet);
-    for (int c = 0; c < 95; c++) {
-        // El avance de la pluma: dos letras menos una, que no depende de como
-        // mida vita2d la ultima.
-        const char one[2] = {static_cast<char>(32 + c), 0};
-        const char two[3] = {static_cast<char>(32 + c), static_cast<char>(32 + c), 0};
-        const int advance = vita2d_pgf_text_width(stats_font, 0.8f, two) -
-                            vita2d_pgf_text_width(stats_font, 0.8f, one);
-        result->advance[c] = static_cast<u8>(std::clamp(advance, 0, 255));
-        const int cell_x = (c % kColumns) * kCellW;
-        const int cell_y = (c / kColumns) * kCellH;
-        for (int y = 0; y < kCellH; y++) {
-            const u8* in = pixels + (cell_y + y) * stride + cell_x * 4;
-            u8* out =
-                result->coverage.data() + (static_cast<std::size_t>(c) * kCellH + y) * kCellW;
-            for (int x = 0; x < kCellW; x++) {
-                out[x] = in[x * 4];
-            }
-        }
-    }
-    vita2d_free_texture(sheet);
-    glyph_sheet = std::move(result);
-    return true;
-}
-
-void EmuWindow_Vita::OverlayText(int x, int y, unsigned int color, const char* text) {
-    if (overlay_cpu_text) {
-        CpuText(overlay_texture, overlay_text_rects, x, y, color, text);
-        return;
-    }
-    vita2d_pgf_draw_text(stats_font, x, y, color, 0.8f, text);
-}
-
-void EmuWindow_Vita::CpuText(vita2d_texture* texture, std::vector<TextRect>& rects, int x, int y,
-                             unsigned int color, const char* text) {
-    constexpr int kCellW = GlyphSheet::kCellW;
-    constexpr int kCellH = GlyphSheet::kCellH;
-    const GlyphSheet& sheet = *glyph_sheet;
-    // La linea entera en coberturas (el maximo donde se tocan dos letras) y
-    // despues a la textura, que es memoria de video sin cache: cada pixel se
-    // escribe una vez y solo si tiene tinta.
-    int line_width = kCellW;
-    for (const char* p = text; *p != '\0'; p++) {
-        const int c = static_cast<unsigned char>(*p) - 32;
-        if (c >= 0 && c < 95) {
-            line_width += sheet.advance[c];
-        }
-    }
-    std::vector<u8> line(static_cast<std::size_t>(line_width) * kCellH, 0);
-    int pen = 0;
-    for (const char* p = text; *p != '\0'; p++) {
-        const int c = static_cast<unsigned char>(*p) - 32;
-        if (c < 0 || c >= 95) {
-            continue;
-        }
-        const u8* const cell =
-            sheet.coverage.data() + static_cast<std::size_t>(c) * kCellW * kCellH;
-        for (int gy = 0; gy < kCellH; gy++) {
-            u8* out = line.data() + gy * line_width + pen;
-            const u8* in = cell + gy * kCellW;
-            for (int gx = 0; gx < kCellW; gx++) {
-                out[gx] = std::max(out[gx], in[gx]);
-            }
-        }
-        pen += sheet.advance[c];
-    }
-    u32* const pixels = static_cast<u32*>(vita2d_texture_get_datap(texture));
-    const int stride = static_cast<int>(vita2d_texture_get_stride(texture) / 4);
-    const int width = static_cast<int>(vita2d_texture_get_width(texture));
-    const int height = static_cast<int>(vita2d_texture_get_height(texture));
-    const int left = x - GlyphSheet::kPenX;
-    const int top = y - GlyphSheet::kBaseline;
-    const u32 rgb = color & 0x00FFFFFFu;
-    const u32 alpha = color >> 24;
-    for (int gy = 0; gy < kCellH; gy++) {
-        const int py = top + gy;
-        if (py < 0 || py >= height) {
-            continue;
-        }
-        u32* const row = pixels + py * stride;
-        const u8* const in = line.data() + gy * line_width;
-        for (int gx = 0; gx < line_width; gx++) {
-            const int px = left + gx;
-            if (in[gx] == 0 || px < 0 || px >= width) {
-                continue;
-            }
-            row[px] = rgb | ((in[gx] * alpha / 255u) << 24);
-        }
-    }
-    rects.push_back({left, top, line_width, kCellH});
-}
-
-void EmuWindow_Vita::ClearTextRects(vita2d_texture* texture, std::vector<TextRect>& rects) {
-    u32* const pixels = static_cast<u32*>(vita2d_texture_get_datap(texture));
-    const int stride = static_cast<int>(vita2d_texture_get_stride(texture) / 4);
-    const int width = static_cast<int>(vita2d_texture_get_width(texture));
-    const int height = static_cast<int>(vita2d_texture_get_height(texture));
-    for (const TextRect& rect : rects) {
-        const int x0 = std::max(rect.x, 0);
-        const int x1 = std::min(rect.x + rect.w, width);
-        const int y0 = std::max(rect.y, 0);
-        const int y1 = std::min(rect.y + rect.h, height);
-        if (x0 >= x1) {
-            continue;
-        }
-        for (int y = y0; y < y1; y++) {
-            std::memset(pixels + y * stride + x0, 0, static_cast<std::size_t>(x1 - x0) * 4);
-        }
-    }
-    rects.clear();
-}
 
 void EmuWindow_Vita::DrawStatsOverlay() {
     if (stats_font == nullptr) {
@@ -1684,7 +1490,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         put("  ms ");
         AppendMillis(compact, c, stats_frame_ms);
         compact[c] = '\0';
-        OverlayText(static_cast<int>(kOverlayX), 20, 0xFF60C0FF, compact);
+        vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 20, 0xFF60C0FF, 0.8f,
+                             compact);
         return;
     }
 
@@ -1771,13 +1578,13 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         }
         version_line[vn] = '\0';
     }
-    OverlayText(static_cast<int>(kOverlayX), 20, 0xFF60C0FF, version_line);
-    OverlayText(static_cast<int>(kOverlayX), 38, 0xFFA0A0A0, line1);
-    OverlayText(static_cast<int>(kOverlayX), 56, 0xFFA0A0A0, line2);
-    OverlayText(static_cast<int>(kOverlayX), 80, 0xFFA0A0A0, line_cpu);
-    OverlayText(static_cast<int>(kOverlayX), 98, 0xFFA0A0A0, line_gpu);
-    OverlayText(static_cast<int>(kOverlayX), 116, 0xFFA0A0A0, line_svc);
-    OverlayText(static_cast<int>(kOverlayX), 140, 0xFFA0A0A0, line3);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 20, 0xFF60C0FF, 0.8f, version_line);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 38, 0xFFA0A0A0, 0.8f, line1);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 56, 0xFFA0A0A0, 0.8f, line2);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 80, 0xFFA0A0A0, 0.8f, line_cpu);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 98, 0xFFA0A0A0, 0.8f, line_gpu);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 116, 0xFFA0A0A0, 0.8f, line_svc);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 140, 0xFFA0A0A0, 0.8f, line3);
 
     // Diagnostico del rasterizador: por que cuesta el 95% del fotograma.
     char line_tri[24];
@@ -1808,11 +1615,11 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         line_zk[nzk] = '\0';
     }
 
-    OverlayText(static_cast<int>(kOverlayX), 164, 0xFFFFC060, line_tri);
-    OverlayText(static_cast<int>(kOverlayX), 182, 0xFFFFC060, line_over);
-    OverlayText(static_cast<int>(kOverlayX), 200, 0xFFFFC060, line_test);
-    OverlayText(static_cast<int>(kOverlayX), 218, 0xFFFFC060, line_cov);
-    OverlayText(static_cast<int>(kOverlayX), 236, 0xFFFFC060, line_zk);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 164, 0xFFFFC060, 0.8f, line_tri);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 182, 0xFFFFC060, 0.8f, line_over);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 200, 0xFFFFC060, 0.8f, line_test);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 218, 0xFFFFC060, 0.8f, line_cov);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 236, 0xFFFFC060, 0.8f, line_zk);
 
     // Salto de fotogramas, con el recordatorio de como se cambia. Va aparte y
     // en otro color porque no es una medida: es un ajuste que se toca en vivo.
@@ -1833,7 +1640,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     }
     AppendOneDecimal(line_gx, ng, stats_gx_transfer);
     line_gx[ng] = '\0';
-    OverlayText(static_cast<int>(kOverlayX), 284, 0xFF60FFFF, line_gx);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 284, 0xFF60FFFF, 0.8f, line_gx);
 
     // Las dos hipotesis para los ~7.600 ciclos por pixel, en una linea:
     // 'luz' = % de pixeles que pasan por iluminacion por fragmento.
@@ -1891,7 +1698,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         line_hw[nh++] = '%';
     }
     line_hw[nh] = '\0';
-    OverlayText(static_cast<int>(kOverlayX), 332, 0xFF80FF80, line_hw);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 332, 0xFF80FF80, 0.8f, line_hw);
 
     char line_why[64] = "luz ";
     std::size_t nw = 4;
@@ -1909,7 +1716,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     AppendOneDecimal(line_why, nw, stats_etc1_percent);
     line_why[nw++] = 0x25;
     line_why[nw] = '\0';
-    OverlayText(static_cast<int>(kOverlayX), 308, 0xFFFF80FF, line_why);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 308, 0xFFFF80FF, 0.8f, line_why);
 
     char line_skip[32] = "salto 1/";
     std::size_t ns = 8;
@@ -1920,14 +1727,15 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         line_skip[ns++] = hint[i];
     }
     line_skip[ns] = '\0';
-    OverlayText(static_cast<int>(kOverlayX), 260, 0xFF80FF80, line_skip);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 260, 0xFF80FF80, 0.8f, line_skip);
 
     // Marcador de la resolucion: verde en 1x, naranja en 0.5x. Es una perdida
     // de calidad y conviene que se note que el modo esta puesto, no que pase
     // desapercibido.
     const bool half_on = SwRenderer::FrameSkip::half_resolution.load(std::memory_order_relaxed);
-    OverlayText(static_cast<int>(kOverlayX), 356,
-                         half_on ? 0xFF40C0FF : 0xFF80FF80, half_on ? "res 0.5x  L+R" : "res 1x  L+R");
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 356,
+                         half_on ? 0xFF40C0FF : 0xFF80FF80, 0.8f,
+                         half_on ? "res 0.5x  L+R" : "res 1x  L+R");
     {
         /**
          * Desglose del ARM por fotograma (0.1.6.3), a la derecha de "res":
@@ -1940,8 +1748,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         std::snprintf(line_arm, sizeof(line_arm), "rod %.0f desp %.0f enl %.0f lent %.0f vfp %.0f int %.1fk",
                       stats_arm_slices, stats_arm_dispatches, stats_arm_links, stats_arm_slow,
                       stats_arm_vfp, stats_arm_interp_k);
-        OverlayText(static_cast<int>(kOverlayX) + 110, 356, 0xFF80FF80,
-                             line_arm);
+        vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX) + 110, 356, 0xFF80FF80,
+                             0.8f, line_arm);
     }
 
     // De los pixeles cubiertos, los que mueren en la prueba de alfa y los que
@@ -1962,7 +1770,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     line_fail[nfail] = '\0';
 
     // Formatos de textura que se usan de verdad, por unidades y triangulo.
-    OverlayText(static_cast<int>(kOverlayX), 380, 0xFFFFA0A0, line_fail);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 380, 0xFFFFA0A0, 0.8f, line_fail);
     {
         /**
          * El reparto de 'arm' en ms por fotograma (0.1.7.5):
@@ -1976,10 +1784,11 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                       "jit %.1f (lento %.1f vfp %.1f) chk %.1f cmp %.1f rst %.1f",
                       stats_arm_jit_ms, stats_arm_slow_ms, stats_arm_vfp_ms, stats_arm_check_ms,
                       stats_arm_compile_ms, stats_arm_rest_ms);
-        OverlayText(static_cast<int>(kOverlayX) + 130, 380, 0xFF80FF80,
-                             line_armt);
+        vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX) + 130, 380, 0xFF80FF80,
+                             0.8f, line_armt);
     }
-    OverlayText(static_cast<int>(kOverlayX), 398, 0xFFFFA0A0, stats_format_line);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 398, 0xFFFFA0A0, 0.8f,
+                         stats_format_line);
 
     // Desglose del rasterizador por triangulo:
     //   hil = % de triangulos repartidos entre los tres hilos
@@ -2002,7 +1811,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
     append_labeled_percent(line_threads, nth, " esp ", stats_wait_percent);
     append_labeled_percent(line_threads, nth, " un ", stats_single_percent);
     line_threads[nth] = '\0';
-    OverlayText(static_cast<int>(kOverlayX), 416, 0xFF80D0FF, line_threads);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 416, 0xFF80D0FF, 0.8f,
+                         line_threads);
 
     // Las dos medidas que faltaban para dejar de suponer:
     //   ocu = ocupacion de los tres nucleos dentro del tramo paralelo. Separa
@@ -2075,7 +1885,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         noc += AppendUInt(line_occ + noc, stats_gpu_writebacks);
     }
     line_occ[noc] = '\0';
-    OverlayText(static_cast<int>(kOverlayX), 452, 0xFF80D0FF, line_occ);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 452, 0xFF80D0FF, 0.8f, line_occ);
 
     /**
      * EL REPARTO DEL FOTOGRAMA EN MILISEGUNDOS. La linea base del proyecto.
@@ -2164,14 +1974,14 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         line_pres[n] = '\0';
     }
 
-    OverlayText(static_cast<int>(kOverlayX), 470, 0xFF60FFC0, line_ms);
-    OverlayText(static_cast<int>(kOverlayX), 488, 0xFF60FFC0, line_pres);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 470, 0xFF60FFC0, 0.8f, line_ms);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 488, 0xFF60FFC0, 0.8f, line_pres);
 
     // Con que se ha presentado el fotograma: verde cuando lo ha dibujado el
     // chip con GXM, gris cuando es el camino de vita2d. Sin esto, "¿y esto va
     // por el backend nuevo?" solo se responde mirando la fecha del VPK.
-    OverlayText(static_cast<int>(kOverlayX), 506,
-                         presenter_uses_gxm ? 0xFF60FFC0 : 0xFFA0A0A0, presenter_line);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 506,
+                         presenter_uses_gxm ? 0xFF60FFC0 : 0xFFA0A0A0, 0.8f, presenter_line);
 
     /**
      * sh  = sombrear vertices (tiempo de pared, ya repartido en tres nucleos)
@@ -2222,7 +2032,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         n += AppendUInt(line_sh + n, stats_fast_mismatches);
         line_sh[n] = '\0';
     }
-    OverlayText(static_cast<int>(kOverlayX), 524, 0xFF60FFC0, line_sh);
+    vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 524, 0xFF60FFC0, 0.8f, line_sh);
 }
 
 } // namespace VitaFrontend
