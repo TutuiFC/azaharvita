@@ -1256,10 +1256,12 @@ bool Init(ARMul_State* cpu) {
         // ocho decimas de la caliente, con los saltos laterales enteros alli).
         // Desde 0.3.0.0 la caliente adelgaza un poco mas (registros fijos) y
         // desde 0.3.0.3 la fria mucho (rutinas comunes de llamada y de
-        // enlace): 65 % para la caliente.
+        // enlace). En Pokemon Sol con 0.3.0.5 se lleno antes la caliente
+        // (6588 KB, con la fria en 2731 KB de 3548: 0,41 de la caliente):
+        // 70 % para la caliente.
         const u32 total_words = g_code_bytes / 4;
         g_check_start_words = total_words - total_words / 10;
-        g_cold_start_words = g_check_start_words / 20 * 13;
+        g_cold_start_words = g_check_start_words / 20 * 14;
         g_cold_used_words = kSharedWords;
         g_check_used_words = 0;
     }

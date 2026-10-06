@@ -4,9 +4,11 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 #include <psp2/kernel/processmgr.h>
 #include <vita2d.h>
 #include "core/frontend/emu_window.h"
@@ -123,6 +125,43 @@ private:
     /// El overlay ya dibujado (0.1.9.6): se rehace cuando cambian las cifras
     /// (una vez por segundo) y en cada fotograma se pinta con un solo quad.
     vita2d_texture* overlay_texture = nullptr;
+
+    /**
+     * EL TEXTO DEL OVERLAY, POR LA CPU (0.3.0.6). vita2d_pgf_draw_text hace una
+     * llamada de dibujo de GXM por letra, con su estado: el overlay completo
+     * (unos 2.000 caracteres) costaba ~150 ms en cada actualizacion, una por
+     * segundo, en el hilo que presenta. En crash.txt de 0.3.0.5, entre 5 y 20
+     * ms por fotograma de media ("ovl") y un tiron cada segundo, justo
+     * mientras se miraban los FPS: se comia lo que habia ganado el JIT. Ahora
+     * vita2d pinta UNA vez los 95 caracteres ASCII en una hoja, se guarda su
+     * cobertura, y el texto se compone con la CPU en la textura: la misma
+     * letra, sin una llamada por caracter.
+     */
+    struct GlyphSheet {
+        static constexpr int kCell = 24;     ///< celda de cada caracter, en px
+        static constexpr int kPenX = 4;      ///< la pluma, dentro de la celda
+        static constexpr int kBaseline = 18; ///< la linea base, dentro de la celda
+        std::vector<u8> coverage;            ///< 95 celdas de kCell x kCell
+        std::array<u8, 95> advance{};
+    };
+    struct TextRect {
+        int x, y, w, h;
+    };
+    bool BuildGlyphSheet();
+    /// Como vita2d_pgf_draw_text con escala 0.8; por la CPU si overlay_cpu_text.
+    void OverlayText(int x, int y, unsigned int color, const char* text);
+    void CpuText(vita2d_texture* texture, std::vector<TextRect>& rects, int x, int y,
+                 unsigned int color, const char* text);
+    static void ClearTextRects(vita2d_texture* texture, std::vector<TextRect>& rects);
+    std::unique_ptr<GlyphSheet> glyph_sheet;
+    bool glyph_sheet_failed = false;
+    bool overlay_cpu_text = false;
+    std::vector<TextRect> overlay_text_rects;
+    /// El aviso de compilacion de shaders, en su propia textura (se pintaba
+    /// letra a letra en CADA fotograma mientras durase la compilacion).
+    vita2d_texture* notice_texture = nullptr;
+    std::vector<TextRect> notice_text_rects;
+    std::string notice_text;
 
     /**
      * Presentacion con el chip grafico (sceGxm).
