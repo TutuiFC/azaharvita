@@ -1445,7 +1445,14 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                         .c_str());
             }
         }
-        stats_next_update_us = now_us + 1'000'000;
+        /**
+         * El completo cada 3 s (0.3.1.2): sus ~2.000 letras cuestan ~150 ms de
+         * vita2d en cada actualizacion (entre 5 y 20 ms por fotograma de media
+         * con una por segundo). El compacto y las notas de crash.txt, cada
+         * segundo como siempre.
+         */
+        stats_next_update_us =
+            now_us + (stats_overlay_visible && stats_overlay_full ? 3'000'000 : 1'000'000);
     }
 
     // 4.10 (0.1.5.2): SELECT+TRIANGULO apaga solo el DIBUJADO del overlay

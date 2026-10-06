@@ -286,8 +286,9 @@ void TextureCache::Clear() {
     }
 }
 
-void TextureCache::InvalidateRange(PAddr addr, u32 size) {
+u32 TextureCache::InvalidateRange(PAddr addr, u32 size) {
     const PAddr end = addr + size;
+    u32 marked = 0;
     /**
      * SE MARCAN, NO SE TIRAN (0.1.0.43).
      *
@@ -312,9 +313,11 @@ void TextureCache::InvalidateRange(PAddr addr, u32 size) {
      */
     for (auto& entry : entries) {
         if (entry.valid && entry.address < end && addr < entry.address + entry.span) {
+            marked += entry.stale ? 0u : 1u;
             entry.stale = true;
         }
     }
+    return marked;
 }
 
 TextureCache::Entry& TextureCache::MakeRoom(u32 needed) {

@@ -113,7 +113,8 @@ public:
                                           Memory::MemorySystem& memory);
 
     /// Tira las texturas que solapen el rango.
-    void InvalidateRange(PAddr addr, u32 size);
+    /// Devuelve cuantas entradas pasan a sospechosas (para crash.txt).
+    u32 InvalidateRange(PAddr addr, u32 size);
 
     /// El filtro y el repetido de la unidad en una textura que no es de la
     /// cache (0.2.2.4, ver RasterizerGXM::TextureFromCopy). false si GXM no

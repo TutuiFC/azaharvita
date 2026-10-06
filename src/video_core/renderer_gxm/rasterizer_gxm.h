@@ -368,6 +368,16 @@ public:
      * (gxm_cg.cpp: kMinFreeToCompileVs). Se guarda en ajustes.txt.
      */
     static std::atomic<u32> specialize_vs;
+    /**
+     * El anillo de vertices en memoria normal (0.3.1.2, ajuste vertices_ram).
+     * Cada lote copia ahi sus vertices con la CPU ("datos", 40-55 us por lote
+     * en crash.txt), y la CPU escribe en CDRAM por el bus del chip grafico,
+     * sin cache (ver Pool); en memoria normal sin cachear, casi a velocidad
+     * normal. Si no hay sitio, CDRAM como antes. 0 = CDRAM primero.
+     */
+    static std::atomic<u32> vertex_ring_host;
+    /// Texturas que pasan a sospechosas, por quien avisa (ver TakeBatchProfile).
+    static std::array<std::atomic<u32>, 5> texture_marks;
 
     /**
      * SHADERS DE VERTICES ASINCRONOS (0.2.1.1). Mientras el shader de vertices

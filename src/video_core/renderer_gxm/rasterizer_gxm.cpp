@@ -57,6 +57,8 @@ std::atomic<u32> RasterizerGXM::Ablation::mode{0};
 std::atomic<u32> RasterizerGXM::no_finish_wait{1};
 std::atomic<u32> RasterizerGXM::present_direct{1};
 std::atomic<u32> RasterizerGXM::specialize_vs{1};
+std::atomic<u32> RasterizerGXM::vertex_ring_host{1};
+std::array<std::atomic<u32>, 5> RasterizerGXM::texture_marks{};
 std::atomic<u32> RasterizerGXM::async_vs{1};
 std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
@@ -2116,6 +2118,14 @@ constexpr u16 kMemoIgnoredRegs[] = {
     0x23C, 0x23D, 0x245, 0x25E, 0x25F,
     // Uniforms de coma flotante del shader de vertices.
     0x2C0, 0x2C1, 0x2C2, 0x2C3, 0x2C4, 0x2C5, 0x2C6, 0x2C7, 0x2C8,
+    /**
+     * Y los booleanos y enteros (0.3.1.2). Se suben en cada lote igual, y ni
+     * la disposicion de los atributos ni el programa generico dependen de
+     * ellos (PicaVSConfig no los lee): Pokemon cambia booleanos en cada
+     * material, y cada cambio rehacia todo ("vs", ~25 us por lote). Solo el
+     * programa especializado depende de los booleanos: ver kVsBoolMask.
+     */
+    0x2B0, 0x2B1, 0x2B2, 0x2B3, 0x2B4,
 };
 
 /**
@@ -2230,6 +2240,10 @@ constexpr std::array<u64, 12> RegListMask(std::initializer_list<u16> regs) {
     return mask;
 }
 
+/// Los uniforms booleanos: solo cuentan si el programa es un especializado
+/// (0.3.1.2; MemoMask no sirve, estan entre los ignorados).
+constexpr std::array<u64, 12> kVsBoolMask = RegListMask({0x2B0});
+
 constexpr std::array<u64, 12> RegRangeMask(u32 first, u32 end) {
     std::array<u64, 12> mask{};
     for (u32 reg = first; reg < end; reg++) {
@@ -2301,6 +2315,8 @@ struct RasterizerGXM::BatchMemo {
         SceGxmVertexProgram* vertex_program = nullptr;
         bool converted = false;
         u32 converted_stride = 0;
+        /// El programa es un especializado: su clave depende de los booleanos.
+        bool specialized = false;
     };
     const PipelineCache::Entry* pipeline = nullptr;
     bool vs_valid = false;
@@ -3110,8 +3126,10 @@ const SceGxmTexture* RasterizerGXM::TextureFromCopy(u32 unit) {
         WriteBack(*surface);
         texture_source_writebacks.fetch_add(1, std::memory_order_relaxed);
         if (textures != nullptr) {
-            textures->InvalidateRange(surface->guest_address,
-                                      surface->guest_stride * surface->height);
+            texture_marks[4].fetch_add(
+                textures->InvalidateRange(surface->guest_address,
+                                          surface->guest_stride * surface->height),
+                std::memory_order_relaxed);
         }
     }
     for (auto& copy : screen_copies) {
@@ -3257,7 +3275,8 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
     transfer_materialized.fetch_add(1, std::memory_order_relaxed);
     // Lo que se hubiera quedado con la memoria vieja de esa pantalla.
     if (textures != nullptr) {
-        textures->InvalidateRange(copy.dst, copy.dst_size);
+        texture_marks[4].fetch_add(textures->InvalidateRange(copy.dst, copy.dst_size),
+                                   std::memory_order_relaxed);
     }
     software.InvalidateRegion(copy.dst, copy.dst_size);
 }
@@ -4083,7 +4102,8 @@ bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
     // Lo demas que pudiera tener esa memoria, como en el relleno por software.
     DropCopies(start, end - start);
     if (textures != nullptr) {
-        textures->InvalidateRange(start, end - start);
+        texture_marks[3].fetch_add(textures->InvalidateRange(start, end - start),
+                                   std::memory_order_relaxed);
     }
     software.InvalidateRegion(start, end - start);
     gpu_fills.fetch_add(1, std::memory_order_relaxed);
@@ -5657,7 +5677,8 @@ void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
     // desde el arranque del juego, mucho antes: sin la comprobacion esto era
     // una desreferencia de puntero nulo (la caida de 0.1.0.2 a 0.1.0.4).
     if (textures != nullptr) {
-        textures->InvalidateRange(addr, size);
+        texture_marks[0].fetch_add(textures->InvalidateRange(addr, size),
+                                   std::memory_order_relaxed);
     }
     software.FlushRegion(addr, size);
 }
@@ -5710,7 +5731,8 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
         }
     }
     if (textures != nullptr) {
-        textures->InvalidateRange(addr, size);
+        texture_marks[1].fetch_add(textures->InvalidateRange(addr, size),
+                                   std::memory_order_relaxed);
     }
     software.InvalidateRegion(addr, size);
 }
@@ -5746,7 +5768,8 @@ void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
         }
     }
     if (textures != nullptr) {
-        textures->InvalidateRange(addr, size);
+        texture_marks[2].fetch_add(textures->InvalidateRange(addr, size),
+                                   std::memory_order_relaxed);
     }
     software.FlushAndInvalidateRegion(addr, size);
 }
@@ -5804,14 +5827,27 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
         WaitGpu(GpuWait::VertexRing);
         const u32 size = std::max(kVertexBufferBytes, (bytes + 0xFFFFFu) & ~0xFFFFFu);
         Allocation buffer;
-        if (size == kVertexBufferBytes) {
+        const bool host_first = vertex_ring_host.load(std::memory_order_relaxed) != 0;
+        bool in_host = false;
+        if (host_first) {
+            buffer = Allocate(Pool::Host, size);
+            in_host = buffer.Valid();
+        }
+        if (!buffer.Valid() && size == kVertexBufferBytes) {
             buffer = Allocate(Pool::Cdram, size);
         }
-        if (!buffer.Valid()) {
+        if (!buffer.Valid() && !host_first) {
             buffer = Allocate(Pool::Host, size);
+            in_host = buffer.Valid();
         }
         if (!buffer.Valid()) {
             return nullptr;
+        }
+        static u32 ring_notes = 0;
+        if (ring_notes < 2) {
+            ring_notes++;
+            NoteFmt("gxm vertices", "anillo de {} KB en {}", size / 1024,
+                    in_host ? "memoria normal" : "CDRAM");
         }
         vertex_buffer = std::move(buffer);
         vertex_used = 0;
@@ -5968,6 +6004,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         if (fs_dirty) {
             memo.pipeline = nullptr;
         }
+        if (memo.layout.specialized && AnyDirty(pica.dirty_regs, kVsBoolMask)) {
+            vs_dirty = true;
+        }
         if (fs_dirty || vs_dirty) {
             memo.vs_valid = false;
         }
@@ -6115,6 +6154,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         const HwShaderCache::Program*& program = layout.program;
         program = hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs,
                                          pipeline->lit, pipeline->proj, &reason);
+        layout.specialized = false;
         /**
          * PROGRAMA ESPECIALIZADO CON LOS BOOLEANOS DEL LOTE (0.1.7.4).
          *
@@ -6174,6 +6214,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 g_cg_const_bools.store(0, std::memory_order_relaxed);
             }
             if (program != nullptr) {
+                layout.specialized = true;
                 static u32 special_notes = 0;
                 if (special_notes < 4) {
                     special_notes++;
@@ -6600,10 +6641,16 @@ std::string RasterizerGXM::TakeBatchProfile() {
     std::string text = fmt::format(
         "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
         "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
-        "muestras)",
+        "muestras) | texturas a revisar por: vaciado {} invalidar {} ambos {} relleno {} "
+        "copia {}",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
-        avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples);
+        avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples,
+        texture_marks[0].exchange(0, std::memory_order_relaxed),
+        texture_marks[1].exchange(0, std::memory_order_relaxed),
+        texture_marks[2].exchange(0, std::memory_order_relaxed),
+        texture_marks[3].exchange(0, std::memory_order_relaxed),
+        texture_marks[4].exchange(0, std::memory_order_relaxed));
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
     state_scene_us = 0;
