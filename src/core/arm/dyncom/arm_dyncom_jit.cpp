@@ -283,6 +283,11 @@ public:
         const s32 offset = static_cast<s32>(target - (Address(Position()) + 2));
         Emit((cond << 28) | 0x0A000000u | (static_cast<u32>(offset) & 0x00FFFFFFu));
     }
+    /// BL a una direccion fija (las rutinas comunes de 0.3.0.3).
+    void BranchLinkToAddress(const u32* target) {
+        const s32 offset = static_cast<s32>(target - (Address(Position()) + 2));
+        Emit(0xEB000000u | (static_cast<u32>(offset) & 0x00FFFFFFu));
+    }
     void BranchTo(u32 cond, u32 target_index) {
         const s32 offset = static_cast<s32>(Address(target_index) - (Address(Position()) + 2));
         Emit((cond << 28) | 0x0A000000u | (static_cast<u32>(offset) & 0x00FFFFFFu));
@@ -1044,7 +1049,7 @@ u32 g_cold_start_words = 0;
 u32 g_cold_used_words = 0;
 /// Entrada y salida comunes (0.2.3.8, ver Compiler::SetSharedExit): al
 /// principio de la zona fria, fuera de lo que se vacia.
-constexpr u32 kSharedWords = 192;
+constexpr u32 kSharedWords = 512;
 /**
  * Cuatro variantes de cada una, por modo (SharedMode): con r0-r3 del juego
  * (REGISTROS FIJOS) y con s0-s31 (REGISTROS VFP FIJOS), cargados al entrar y
@@ -1052,6 +1057,23 @@ constexpr u32 kSharedWords = 192;
  */
 std::array<u32*, 4> g_shared_enter{};
 std::array<u32*, 4> g_shared_exit{};
+/**
+ * RUTINAS COMUNES DE LLAMADA Y DE ENLACE (0.3.0.3). Con los registros y los
+ * VFP fijos, cada llamada a C llevaba en su sitio el guardado de r0-r3, del
+ * banco VFP y del FPSCR, y su recuperacion: unas 33 palabras por sitio, y
+ * hay dos por bloque (los caminos lentos de LDM/STM y VPUSH/VPOP, LDREX...).
+ * Y cada enlace directo, su prueba de la entrada (15 palabras). Todo eso en
+ * la zona fria, que en 0.3.0.2 crecio a 9,3 palabras por instruccion del
+ * juego (1,6 veces la caliente) y vaciaba el JIT entero cada pocos minutos
+ * (7 veces en una partida de Zafiro Alfa). Ahora:
+ *   g_call_tramp: argumentos 1-3 en kRn, kRm y kRs (el 0 es cpu), la
+ *     funcion en ip y el resultado en kRd. Guarda y recupera lo del modo.
+ *   g_link_check: la prueba de la entrada; el sitio es "BL; .word LinkInfo;
+ *     .word pc; B de vuelta; BL g_link_fail" (cinco palabras).
+ */
+std::array<u32*, 4> g_call_tramp{};
+std::array<u32*, 4> g_link_check{};
+std::array<u32*, 4> g_link_fail{};
 
 u32 SharedMode(bool global_regs, bool vfp_regs) {
     return (global_regs ? 1u : 0u) | (vfp_regs ? 2u : 0u);
@@ -1264,10 +1286,11 @@ bool Init(ARMul_State* cpu) {
         // En 0.2.3.9 la fria se lleno antes (caliente 5064 KB, fria 4054 KB:
         // ocho decimas de la caliente, con los saltos laterales enteros alli).
         // Desde 0.3.0.0 la caliente adelgaza un poco mas (registros fijos) y
-        // la fria tambien (una salida por enlace): 55 % para la caliente.
+        // desde 0.3.0.3 la fria mucho (rutinas comunes de llamada y de
+        // enlace): 65 % para la caliente.
         const u32 total_words = g_code_bytes / 4;
         g_check_start_words = total_words - total_words / 10;
-        g_cold_start_words = g_check_start_words / 20 * 11;
+        g_cold_start_words = g_check_start_words / 20 * 13;
         g_cold_used_words = kSharedWords;
         g_check_used_words = 0;
     }
@@ -1316,6 +1339,63 @@ bool Init(ARMul_State* cpu) {
                 EmitGuestFpscrOut(e, kT0);
             }
             EmitExitTail(e, vfp);
+
+            // La llamada a C: ver g_call_tramp.
+            g_call_tramp[mode] = e.Address(e.Position());
+            e.Push((1u << kT1) | (1u << 14));
+            if (regs) {
+                for (u32 g = 0; g < 4; g++) {
+                    e.StrImm(g, kCpu, RegOffset(g));
+                }
+            }
+            if (vfp) {
+                EmitExtBase(e, kT1);
+                EmitVfpBank(e, kT1, false);
+                EmitGuestFpscrOut(e, kT1);
+            }
+            e.MovReg(R0, kCpu);
+            e.MovReg(R1, kRn);
+            e.MovReg(R2, kRm);
+            e.MovReg(R3, kRs);
+            e.Blx(12);
+            e.MovReg(kRd, R0);
+            if (vfp) {
+                EmitExtBase(e, kT1);
+                EmitVfpBank(e, kT1, true);
+                e.LdrImm(kT1, kCpu, FpscrOffset());
+                e.Emit(0xEEE10A10u | (kT1 << 12)); // VMSR FPSCR, kT1
+            }
+            if (regs) {
+                for (u32 g = 0; g < 4; g++) {
+                    e.LdrImm(g, kCpu, RegOffset(g));
+                }
+            }
+            e.Pop((1u << kT1) | (1u << 15));
+
+            // La prueba de la entrada de un enlace directo (lr = sitio + 4,
+            // ver EmitDirectLink). Vuelve a sitio + 12.
+            g_link_check[mode] = e.Address(e.Position());
+            e.Mrs(kT0);
+            e.LdrImm(kRs, 14, 0);         // LinkInfo
+            e.LdrImm(kRd, kRs, kLinkEntry);
+            e.CmpImm0(kRd);
+            const u32 no_entry = e.BranchPlaceholder(kCondEq);
+            e.MsrFlags(kT0);
+            e.LdrdImm(kRn, kCpu, g_offsets.link);
+            e.LdrImm(kT1, kRs, kLinkCount);
+            e.Emit(0xE28EF008u);          // ADD pc, lr, #8
+            e.PatchBranch(no_entry, e.Position());
+            e.MsrFlags(kT0);
+            e.LdrImm(kRd, 14, 4);         // pc del destino
+            e.StrImm(kRd, kCpu, RegOffset(15));
+            e.BranchToAddress(kAlways, g_shared_exit[mode]);
+
+            // Sin presupuesto (lr = sitio + 20): el pc del destino esta en
+            // sitio + 8, y los flags intactos.
+            g_link_fail[mode] = e.Address(e.Position());
+            e.Emit(0xE5100000u | (14u << 16) | (kRd << 12) | 12u); // LDR kRd, [lr, #-12]
+            e.StrImm(kRd, kCpu, RegOffset(15));
+            e.BranchToAddress(kAlways, g_shared_exit[mode]);
         }
         sceKernelSyncVMDomain(g_code_block, shared, kSharedWords * 4);
         sceKernelCloseVMDomain();
@@ -1826,6 +1906,51 @@ public:
         vfp_regs_ = vfp;
     }
 
+    /// Ver RUTINAS COMUNES DE LLAMADA Y DE ENLACE (variante normal).
+    void SetSharedRoutines(const u32* call_tramp, const u32* link_check, const u32* link_fail) {
+        call_tramp_ = call_tramp;
+        link_check_ = link_check;
+        link_fail_ = link_fail;
+    }
+
+    /**
+     * Una funcion de C con cpu de primer argumento y los otros en kRn, kRm y
+     * kRs; el resultado queda en kRd. Los flags del juego, como siempre, los
+     * guarda quien llama en kT0 (la rutina comun no toca r10).
+     */
+    void CallHelper(const void* function) {
+        if (call_tramp_ != nullptr) {
+            // Lo de este bloque (el hueco propio, o todos sin registros fijos)
+            // lo vuelca y recarga el sitio; lo comun, la rutina.
+            FlushCachedRegs();
+            e.Mov32(12, static_cast<u32>(reinterpret_cast<uintptr_t>(function)));
+            e.BranchLinkToAddress(call_tramp_);
+            ReloadBlockRegs();
+            return;
+        }
+        FlushForCall();
+        e.MovReg(R0, kCpu);
+        e.MovReg(R1, kRn);
+        e.MovReg(R2, kRm);
+        e.MovReg(R3, kRs);
+        e.Call(function);
+        e.MovReg(kRd, R0);
+        ReloadCachedRegs();
+    }
+
+    /// Despues de g_call_tramp: lo que la rutina no recarga.
+    void ReloadBlockRegs() {
+        if (!cache_dirty) {
+            return;
+        }
+        for (u32 g = global_regs_ ? 4u : 0u; g < 16; g++) {
+            const s8 host = cache_map[g];
+            if (host >= 0) {
+                e.LdrImm(static_cast<u32>(host), kCpu, RegOffset(g));
+            }
+        }
+    }
+
     /// Primeras instrucciones del cuerpo: cache de registros (4.3).
     void BodyEnter() {
         if (!global_regs_) {
@@ -1921,13 +2046,10 @@ public:
         }
         // CLREX tambien lleva 0xF ahi: siempre se ejecuta.
         if (decoded.kind == Kind::Clrex) {
-            FlushForCall();
             e.Mrs(kFlags);
             e.MovReg(kT0, kFlags);
-            e.MovReg(R0, kCpu);
-            e.Call(reinterpret_cast<const void*>(&JitClrex));
+            CallHelper(reinterpret_cast<const void*>(&JitClrex));
             e.MsrFlags(kT0);
-            ReloadCachedRegs();
             return;
         }
         // Condicion: se salta el cuerpo entero con la condicion contraria,
@@ -2170,6 +2292,9 @@ private:
     u32* profile_counter_ = nullptr;
     bool global_regs_ = false;
     bool vfp_regs_ = false;
+    const u32* call_tramp_ = nullptr;
+    const u32* link_check_ = nullptr;
+    const u32* link_fail_ = nullptr;
 
     void DeferCold(std::vector<u32> branches, std::function<void()> body) {
         DeferCold(std::move(branches), cache_written, std::move(body));
@@ -2715,29 +2840,26 @@ private:
         if (!load) {
             LoadGuest(kRm, Bits(inst, 0, 3), pc);
         }
-        FlushForCall();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
         if (check_mode) {
+            FlushForCall();
             e.Call(reinterpret_cast<const void*>(&CheckAbortThunk));
+            // kRd y no un hueco: ReloadCachedRegs lo pisaria.
+            e.MovReg(kRd, R0);
+            ReloadCachedRegs();
         } else {
-            e.Mov32(R0, pc);
-            e.StrImm(R0, kCpu, RegOffset(15));
-            e.MovReg(R0, kCpu);
-            e.MovReg(R1, kRn);
+            e.Mov32(kRd, pc);
+            e.StrImm(kRd, kCpu, RegOffset(15));
             if (load) {
-                e.Mov32(R2, kind);
-                e.Call(reinterpret_cast<const void*>(&JitLoadExclusive));
+                e.Mov32(kRm, kind);
+                CallHelper(reinterpret_cast<const void*>(&JitLoadExclusive));
             } else {
-                e.MovReg(R2, kRm);
-                e.Mov32(R3, kind);
-                e.Call(reinterpret_cast<const void*>(&JitStoreExclusive));
+                e.Mov32(kRs, kind);
+                CallHelper(reinterpret_cast<const void*>(&JitStoreExclusive));
             }
         }
-        // kRd y no un hueco: ReloadCachedRegs lo pisaria.
-        e.MovReg(kRd, R0);
         e.MsrFlags(kT0);
-        ReloadCachedRegs();
         StoreGuest(kRd, Bits(inst, 12, 15));
     }
 
@@ -2770,27 +2892,23 @@ private:
             }
             return;
         }
-        FlushForCall();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
         if (read) {
-            e.MovReg(R0, kCpu);
-            e.Mov32(R1, inst);
-            e.Call(reinterpret_cast<const void*>(&JitCp15Read));
-            // kRd guarda el resultado: StoreGuest despues de ReloadCachedRegs,
-            // porque ReloadCachedRegs recarga R0-R2 desde memoria y pisaria el
-            // resultado del MRC si estuviera en un hueco de la cache.
-            e.MovReg(kRd, R0);
+            // El resultado del MRC queda en kRd (no en un hueco de la cache,
+            // que la recarga pisaria) y va a su registro despues.
+            e.Mov32(kRn, inst);
+            CallHelper(reinterpret_cast<const void*>(&JitCp15Read));
         } else if (check_mode) {
+            FlushForCall();
             e.Call(reinterpret_cast<const void*>(&CheckAbortThunk));
+            ReloadCachedRegs();
         } else {
-            LoadGuest(R2, Bits(inst, 12, 15), pc);
-            e.MovReg(R0, kCpu);
-            e.Mov32(R1, inst);
-            e.Call(reinterpret_cast<const void*>(&JitCp15Write));
+            LoadGuest(kRm, Bits(inst, 12, 15), pc);
+            e.Mov32(kRn, inst);
+            CallHelper(reinterpret_cast<const void*>(&JitCp15Write));
         }
         e.MsrFlags(kT0);
-        ReloadCachedRegs();
         if (read) {
             StoreGuest(kRd, Bits(inst, 12, 15));
         }
@@ -2961,6 +3079,25 @@ public:
      * Instruction ya puso la de una sola).
      */
     void VfpCdpRun(const u32* insts, u32 count, bool keep_flags, bool conditions) {
+        if (vfp_regs_) {
+            /**
+             * Con los VFP fijos, sin mirar LEN y STRIDE en cada racha
+             * (0.3.0.3): solo los cambia un VMSR, que va al interprete y corta
+             * la cadena, y TryRun no entra en el codigo generado mientras
+             * esten puestos. Ni comprobacion ni camino frio (con su llamada a
+             * C por operacion, el trozo frio mas grande de 0.3.0.2).
+             */
+            for (u32 k = 0; k < count; k++) {
+                const u32 cond = insts[k] >> 28;
+                const bool conditional = conditions && cond != kAlways;
+                const u32 skip = conditional ? e.BranchPlaceholder(cond ^ 1u) : 0;
+                VfpCdpBody(insts[k]);
+                if (conditional) {
+                    e.PatchBranch(skip, e.Position());
+                }
+            }
+            return;
+        }
         const u32 fpscr_offset = g_offsets.vfp + VFP_FPSCR * 4;
         // Los flags del juego: el TST los pisa.
         if (keep_flags) {
@@ -3008,11 +3145,8 @@ public:
                 const u32 cond = inst >> 28;
                 const bool conditional = conditions && cond != kAlways;
                 const u32 skip = conditional ? e.BranchPlaceholder(cond ^ 1u) : 0;
-                FlushForCall();
-                e.MovReg(R0, kCpu);
-                e.Mov32(R1, inst);
-                e.Call(reinterpret_cast<const void*>(&HelperVfpCdp));
-                ReloadCachedRegs();
+                e.Mov32(kRn, inst);
+                CallHelper(reinterpret_cast<const void*>(&HelperVfpCdp));
                 if (keep_flags) {
                     e.MsrFlags(kT0);
                 }
@@ -3097,13 +3231,10 @@ private:
 
     /// La aritmetica VFP por la funcion del interprete (lo de 0.1.6.1).
     void VfpCdpHelper(u32 inst) {
-        FlushForCall();
         e.Mrs(kT0);
-        e.MovReg(R0, kCpu);
-        e.Mov32(R1, inst);
-        e.Call(reinterpret_cast<const void*>(&HelperVfpCdp));
+        e.Mov32(kRn, inst);
+        CallHelper(reinterpret_cast<const void*>(&HelperVfpCdp));
         e.MsrFlags(kT0);
-        ReloadCachedRegs();
     }
 
     /**
@@ -3152,18 +3283,15 @@ private:
             VfpTransferFast(inst, pc, index);
             return;
         }
-        FlushForCall();
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
-        e.Mov32(R0, pc);
-        e.StrImm(R0, kCpu, RegOffset(15));
-        e.MovReg(R0, kCpu);
-        e.Mov32(R1, inst);
-        e.Mov32(R2, static_cast<u32>(index));
-        e.Call(check_mode ? reinterpret_cast<const void*>(&CheckVfpTransfer)
-                          : reinterpret_cast<const void*>(&HelperVfpTransfer));
+        e.Mov32(kRd, pc);
+        e.StrImm(kRd, kCpu, RegOffset(15));
+        e.Mov32(kRn, inst);
+        e.Mov32(kRm, static_cast<u32>(index));
+        CallHelper(check_mode ? reinterpret_cast<const void*>(&CheckVfpTransfer)
+                              : reinterpret_cast<const void*>(&HelperVfpTransfer));
         e.MsrFlags(kT0);
-        ReloadCachedRegs();
     }
 
     /// El base no es el PC (ese lee Reg[15] + 8) y hay algo que copiar.
@@ -3266,20 +3394,17 @@ private:
             e.MsrFlags(kFlags);
         }
         DeferCold(std::move(slow), written_before, [this, inst, pc, index, keep_flags, back] {
-            FlushForCall();
             if (keep_flags) {
                 e.MovReg(kT0, kFlags);
             }
-            e.Mov32(R0, pc);
-            e.StrImm(R0, kCpu, RegOffset(15));
-            e.MovReg(R0, kCpu);
-            e.Mov32(R1, inst);
-            e.Mov32(R2, static_cast<u32>(index));
-            e.Call(reinterpret_cast<const void*>(&HelperVfpTransfer));
+            e.Mov32(kRd, pc);
+            e.StrImm(kRd, kCpu, RegOffset(15));
+            e.Mov32(kRn, inst);
+            e.Mov32(kRm, static_cast<u32>(index));
+            CallHelper(reinterpret_cast<const void*>(&HelperVfpTransfer));
             if (keep_flags) {
                 e.MovReg(kFlags, kT0);
             }
-            ReloadCachedRegs();
             e.BranchTo(kAlways, back);
         });
     }
@@ -3396,19 +3521,16 @@ private:
             e.MsrFlags(kFlags);
         }
         DeferCold(std::move(slow), written_before, [this, inst, pc, keep_flags, back] {
-            FlushForCall();
             if (keep_flags) {
                 e.MovReg(kT0, kFlags);
             }
-            e.Mov32(R0, pc);
-            e.StrImm(R0, kCpu, RegOffset(15));
-            e.MovReg(R0, kCpu);
-            e.Mov32(R1, inst);
-            e.Call(reinterpret_cast<const void*>(&HelperBlockTransfer));
+            e.Mov32(kRd, pc);
+            e.StrImm(kRd, kCpu, RegOffset(15));
+            e.Mov32(kRn, inst);
+            CallHelper(reinterpret_cast<const void*>(&HelperBlockTransfer));
             if (keep_flags) {
                 e.MovReg(kFlags, kT0);
             }
-            ReloadCachedRegs();
             e.BranchTo(kAlways, back);
         });
     }
@@ -3485,6 +3607,11 @@ private:
      * Sin r0-r3 desde 0.3.0.0: con los registros fijos son del juego. Y el
      * fallo por presupuesto salta a la cola del de la entrada (una salida en
      * la zona fria por enlace, no dos).
+     *
+     * Desde 0.3.0.3 la prueba y los dos fallos son comunes (g_link_check y
+     * g_link_fail) y en la zona fria de cada enlace quedan cinco palabras: BL
+     * prueba; LinkInfo; pc del destino; B w1; BL fallo. Con lr como hueco de
+     * la cache no pasa nada: el vuelco de arriba ya lo ha guardado.
      */
     void EmitDirectLink(const LinkInfo* target, u32 target_pc) {
         FlushCachedRegs();
@@ -3503,6 +3630,16 @@ private:
         link_sites.push_back(site);
         const u32 ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(target));
         DeferCold({to_check}, [this, ptr, checked, target_pc, no_budget] {
+            if (link_check_ != nullptr) {
+                // Ver RUTINAS COMUNES DE LLAMADA Y DE ENLACE.
+                e.BranchLinkToAddress(link_check_);
+                e.Emit(ptr);
+                e.Emit(target_pc);
+                e.BranchTo(kAlways, checked);
+                e.PatchBranch(no_budget, e.Position());
+                e.BranchLinkToAddress(link_fail_);
+                return;
+            }
             e.Mrs(kT0);
             e.Emit(0xE3000000u | ((ptr & 0xF000u) << 4) | (kRs << 12) | (ptr & 0x0FFFu));
             e.Emit(0xE3400000u | (((ptr >> 16) & 0xF000u) << 4) | (kRs << 12) |
@@ -4406,7 +4543,10 @@ bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* c
     compiler.SetGlobalRegs(global);
     compiler.SetVfpRegs(vfp);
     if (e.HasColdZone()) {
-        compiler.SetSharedExit(g_shared_exit[SharedMode(global, vfp)]);
+        const u32 shared_mode = SharedMode(global, vfp);
+        compiler.SetSharedExit(g_shared_exit[shared_mode]);
+        compiler.SetSharedRoutines(g_call_tramp[shared_mode], g_link_check[shared_mode],
+                                   g_link_fail[shared_mode]);
         chain_entry = compiler.ChainEntryPosition();
         entry_index = chain_entry;
         if (g_profile_active) {
@@ -5009,6 +5149,12 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
     }
     Memory::PageTable* table = cpu->memory.fast_page_table;
     if (table == nullptr) {
+        return 0;
+    }
+    // Vectores cortos del VFP (LEN o STRIDE): con los VFP fijos el codigo
+    // generado no los mira (ver VfpCdpRun); se queda en el interprete.
+    if (vfp_regs.load(std::memory_order_relaxed) != 0 &&
+        (cpu->VFP[VFP_FPSCR] & 0x370000u) != 0) {
         return 0;
     }
     // El PC ya viene alineado segun el modo (DISPATCH); en Thumb, clave con el bit 0.
