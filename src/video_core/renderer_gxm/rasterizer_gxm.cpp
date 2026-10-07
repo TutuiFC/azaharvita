@@ -1147,7 +1147,21 @@ void CopyTiledGuest(u8* guest, u8* linear, u32 width, u32 height, u32 linear_str
  * dibujado.
  */
 struct RasterizerGXM::PipelineCache {
-    static constexpr unsigned long long kAsyncFsWindowUs = 2000000;
+    /**
+     * SALTAR EL LOTE, NO PINTARLO POR SOFTWARE (0.3.1.3). Pasados 2 s desde
+     * que se encolaba su shader, el lote se dibujaba con el rasterizador de
+     * software. Pero los de fragmentos tardan 1-5 s cada uno y llegan de
+     * decenas (117 en una partida de Kirby: Triple Deluxe con la cache vacia),
+     * asi que casi todos pasaban los 2 s esperando su turno: 1.200 lotes por
+     * segundo por software y el juego a 0,4 FPS (crash.txt de 0.3.1.2; en
+     * Pokemon Sol, los combates nuevos a 3 FPS). Ahora el lote se salta
+     * mientras su shader espera o se compila, y solo va por software si el
+     * compilador lleva con el mas de kAsyncFsStuckUs (atascado) o si lleva en
+     * la cola mas de kAsyncFsQueuedUs (detras de un shader de vertices de
+     * minutos): un rato sin ese objeto en vez de una partida a cámara lenta.
+     */
+    static constexpr unsigned long long kAsyncFsStuckUs = 10000000;
+    static constexpr unsigned long long kAsyncFsQueuedUs = 60000000;
 
     struct Entry {
         /**
@@ -1400,9 +1414,13 @@ struct RasterizerGXM::PipelineCache {
         if (it != entries.end() && it->second->job != nullptr) {
             Entry& pending = *it->second;
             if (!pending.job->done.load(std::memory_order_acquire)) {
-                // Como con los de vertices (0.2.1.2): si el compilador lleva
-                // demasiado con el, por software, que se vea.
-                if (Common::VitaMicros() - pending.job->submitted_us > kAsyncFsWindowUs) {
+                // Ver kAsyncFsStuckUs: por software solo si el compilador se ha
+                // atascado con el o lleva demasiado en la cola.
+                const unsigned long long now = Common::VitaMicros();
+                const unsigned long long started =
+                    pending.job->started_us.load(std::memory_order_relaxed);
+                if ((started != 0 && now - started > kAsyncFsStuckUs) ||
+                    (started == 0 && now - pending.job->submitted_us > kAsyncFsQueuedUs)) {
                     CgMarkStarved();
                     return fail("fs compilando largo");
                 }
@@ -3212,6 +3230,10 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
     const u32 out_bpp = Pica::BytesPerPixel(copy.output_format);
     const bool rgba_to_rgb = copy.input_format == Pica::PixelFormat::RGBA8 &&
                              copy.output_format == Pica::PixelFormat::RGB8;
+    // De RGBA8 a 16 bits (0.3.1.3, ver AccelerateDisplayTransfer): los bytes de
+    // la superficie son A, B, G, R, y cada formato como Common::Color::Encode*.
+    const bool rgba_to_16 = copy.input_format == Pica::PixelFormat::RGBA8 && out_bpp == 2;
+    const Pica::PixelFormat out_format16 = copy.output_format;
     alignas(16) u8 row[2048 * 4];
     alignas(16) u8 scaled[2048 * 4];
     if (copy.tiled) {
@@ -3255,7 +3277,23 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
                 }
             }
             u8* out = dst + static_cast<std::size_t>(y) * copy.width * out_bpp;
-            if (rgba_to_rgb) {
+            if (rgba_to_16) {
+                for (u32 x = 0; x < copy.width; x++) {
+                    const u8* p = row + x * 4;
+                    const u32 a = p[0], b = p[1], g = p[2], r = p[3];
+                    u16 value;
+                    if (out_format16 == Pica::PixelFormat::RGB565) {
+                        value = static_cast<u16>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+                    } else if (out_format16 == Pica::PixelFormat::RGB5A1) {
+                        value = static_cast<u16>(((r >> 3) << 11) | ((g >> 3) << 6) |
+                                                 ((b >> 3) << 1) | (a >> 7));
+                    } else {
+                        value = static_cast<u16>(((r >> 4) << 12) | ((g >> 4) << 8) |
+                                                 ((b >> 4) << 4) | (a >> 4));
+                    }
+                    std::memcpy(out + x * 2, &value, sizeof(value));
+                }
+            } else if (rgba_to_rgb) {
                 for (u32 x = 0; x < copy.width; x++) {
                     out[x * 3 + 0] = row[x * 4 + 1];
                     out[x * 3 + 1] = row[x * 4 + 2];
@@ -3661,11 +3699,21 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
      * del shader, y el de una textura RGB8 es 1.
      */
     const bool tiled = config.dont_swizzle != 0;
-    // El mismo formato, o RGBA8 a RGB8. Los de 16 bits desde 0.1.9.8
-    // (New Super Mario Bros. 2 dibuja en RGB565).
-    if (in_format != out_format &&
-        (tiled ||
-         !(in_format == Pica::PixelFormat::RGBA8 && out_format == Pica::PixelFormat::RGB8))) {
+    /**
+     * El mismo formato, o de RGBA8 a otro: la copia se queda en RGBA8 (es la
+     * que se presenta) y solo se convierte al formato de la pantalla si el
+     * invitado llega a leerla (MaterializeCopy). Los de 16 bits desde 0.3.1.3:
+     * Super Mario 3D Land copia en cada fotograma su 3D RGBA8 a una pantalla
+     * RGB565, y por software era volcar la superficie esperando a la GPU (16 ms
+     * por fotograma, "volcado" en crash.txt de 0.3.1.2) y convertirla con la
+     * CPU.
+     */
+    const bool from_rgba8 = in_format == Pica::PixelFormat::RGBA8 &&
+                            (out_format == Pica::PixelFormat::RGB8 ||
+                             out_format == Pica::PixelFormat::RGB565 ||
+                             out_format == Pica::PixelFormat::RGB5A1 ||
+                             out_format == Pica::PixelFormat::RGBA4);
+    if (in_format != out_format && (tiled || !from_rgba8)) {
         return reject("formato");
     }
     if (tiled && (out_format == Pica::PixelFormat::RGB8 || width % 8 != 0 || height % 8 != 0 ||

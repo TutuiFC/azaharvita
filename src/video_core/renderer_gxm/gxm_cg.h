@@ -110,6 +110,8 @@ struct CgJob {
     std::atomic<bool> done{false};
     /// Cuando se encolo (VitaMicros), para saber cuanto lleva esperando.
     unsigned long long submitted_us = 0;
+    /// Cuando lo cogio el hilo de compilacion (0 = aun en la cola), 0.3.1.3.
+    std::atomic<unsigned long long> started_us{0};
     /// Minutos de compilador (0.2.2.3): se coge cuando no queda otro en la cola.
     bool heavy = false;
 };

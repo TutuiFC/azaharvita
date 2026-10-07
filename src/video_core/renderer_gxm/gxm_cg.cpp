@@ -1414,6 +1414,7 @@ void* CgWorkerMain(void*) {
         }
         g_worker_heavy.store(job->heavy, std::memory_order_relaxed);
         g_worker_busy_since.store(Common::VitaMicros(), std::memory_order_relaxed);
+        job->started_us.store(Common::VitaMicros(), std::memory_order_relaxed);
         for (std::size_t i = 0; i < job->sources.size(); i++) {
             // Los de vertices dejan de pedirse con el compilador roto; los de
             // fragmentos no (ver RecoverFromInternalError).
