@@ -964,49 +964,32 @@ std::string MemorySystem::ReadCString(VAddr vaddr, std::size_t max_length) {
 }
 
 MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address) {
-    if (address >= phys_mem_region_info_cache.region_start &&
-        address < phys_mem_region_info_cache.region_end) {
-        return phys_mem_region_info_cache;
+    /**
+     * SIN LA ULTIMA REGION GUARDADA (0.3.1.7). Se devolvia
+     * phys_mem_region_info_cache si la direccion caia dentro, y se reescribia
+     * en cada fallo; pero esto lo llaman a la vez el hilo de la GPU, el de
+     * emulacion y el de la mezcla del DSP. Entre la comprobacion y la copia
+     * otro hilo podia cambiarla: el puntero de la VRAM para una direccion de la
+     * FCRAM, a 128 MB de donde tocaba, para leer o para escribir. Son cuatro
+     * comparaciones; sin estado no hay carrera. Fin inclusivo: el llamador
+     * puede pasar el limite derecho abierto de un rango.
+     */
+    if (address >= VRAM_PADDR && address <= VRAM_PADDR + VRAM_SIZE) {
+        return {&impl->vram_mem, VRAM_PADDR, VRAM_SIZE};
     }
-
-    constexpr std::array memory_areas = {
-        std::make_pair(VRAM_PADDR, VRAM_SIZE),
-        std::make_pair(DSP_RAM_PADDR, DSP_RAM_SIZE),
-        std::make_pair(FCRAM_PADDR, FCRAM_N3DS_SIZE),
-        std::make_pair(N3DS_EXTRA_RAM_PADDR, N3DS_EXTRA_RAM_SIZE),
-    };
-
-    const auto area = std::find_if(memory_areas.begin(), memory_areas.end(), [&](const auto& area) {
-        // Note: the region end check is inclusive because the user can pass in an address that
-        // represents an open right bound
-        return address >= area.first && address <= area.first + area.second;
-    });
-
-    if (area == memory_areas.end()) [[unlikely]] {
-        LOG_ERROR(HW_Memory, "Unknown GetPhysMemRegionInfo @ {:#08X} at PC {:#08X}", address,
-                  impl->GetPC());
-        phys_mem_region_info_cache = PhysMemRegionInfo();
-        return phys_mem_region_info_cache;
+    if (address >= DSP_RAM_PADDR && address <= DSP_RAM_PADDR + DSP_RAM_SIZE) {
+        return {&impl->dsp_mem, DSP_RAM_PADDR, DSP_RAM_SIZE};
     }
-
-    switch (area->first) {
-    case VRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->vram_mem, area->first, area->second};
-        break;
-    case DSP_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->dsp_mem, area->first, area->second};
-        break;
-    case FCRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->fcram_mem, area->first, area->second};
-        break;
-    case N3DS_EXTRA_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->n3ds_extra_ram_mem, area->first, area->second};
-        break;
-    default:
-        UNREACHABLE();
+    if (address >= FCRAM_PADDR && address <= FCRAM_PADDR + FCRAM_N3DS_SIZE) {
+        return {&impl->fcram_mem, FCRAM_PADDR, FCRAM_N3DS_SIZE};
     }
-
-    return phys_mem_region_info_cache;
+    if (address >= N3DS_EXTRA_RAM_PADDR &&
+        address <= N3DS_EXTRA_RAM_PADDR + N3DS_EXTRA_RAM_SIZE) {
+        return {&impl->n3ds_extra_ram_mem, N3DS_EXTRA_RAM_PADDR, N3DS_EXTRA_RAM_SIZE};
+    }
+    LOG_ERROR(HW_Memory, "Unknown GetPhysMemRegionInfo @ {:#08X} at PC {:#08X}", address,
+              impl->GetPC());
+    return {};
 }
 
 u8* MemorySystem::GetPhysicalPointer(PAddr address) {

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <fmt/format.h>
 #include "audio_core/codec.h"
 #include "audio_core/hle/common.h"
 #include "audio_core/hle/dsp_stats.h"
@@ -493,8 +495,29 @@ void Source::GenerateFrame() {
 
     std::size_t frame_position = 0;
     while (frame_position < current_frame.size()) {
-        if (state.current_buffer.empty() && !DequeueBuffer()) {
-            break;
+        if (state.current_buffer.empty()) {
+            const std::size_t queued = state.input_queue.size();
+            if (!DequeueBuffer()) {
+                break;
+            }
+            /**
+             * UN BUFFER EN BUCLE DE LONGITUD 0 (0.3.1.7). DequeueBuffer lo
+             * devuelve a la cola, y como la cola va por buffer_id vuelve a salir
+             * el primero: este bucle lo sacaba, no daba ninguna muestra, y otra
+             * vez, para siempre, con el tick de audio sin acabar nunca. Uno que
+             * empieza pasado su final si da muestras a la segunda vuelta.
+             */
+            if (state.current_buffer.empty() && state.input_queue.size() == queued &&
+                state.current_buffer_length == 0) {
+                static std::atomic<bool> noted{false};
+                if (!noted.exchange(true, std::memory_order_relaxed)) {
+                    Common::VitaNote("dsp", fmt::format("fuente {}: buffer {} en bucle con "
+                                                        "longitud 0, sin muestras",
+                                                        source_id, state.current_buffer_id)
+                                                .c_str());
+                }
+                break;
+            }
         }
 
         // AudioInterp consumes samples from current_buffer and already preserves
@@ -592,9 +615,12 @@ bool Source::DequeueBuffer() {
 
     // Because our interpolation consumes samples instead of using an index,
     // let's just consume the samples up to the current sample number.
+    // Con play_position mas alla del final, iterar pasado end() era indefinido.
     state.current_buffer.erase(
         state.current_buffer.begin(),
-        std::next(state.current_buffer.begin(), state.current_sample_number));
+        std::next(state.current_buffer.begin(),
+                  std::min<std::size_t>(state.current_sample_number,
+                                        state.current_buffer.size())));
 
     LOG_TRACE(Audio_DSP,
               "source_id={} buffer_id={} from_queue={} current_buffer.size()={}, "

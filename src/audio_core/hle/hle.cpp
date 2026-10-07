@@ -3,6 +3,8 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <pthread.h>
@@ -32,6 +34,7 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #ifdef __PSVITA__
+#include <fmt/format.h>
 #include "common/vita_diag.h"
 #endif
 
@@ -96,14 +99,22 @@ private:
      * configuracion del juego y limpia sus marcas aqui (Source::Parse,
      * Mixers::Parse, lo que hace el protocolo con el juego), y lo caro --
      * decodificar, interpolar, filtrar y mezclar -- lo hace MixerMain en el
-     * nucleo 2 mientras el ARM sigue. Los estados, las muestras y la
-     * interrupcion de un tick se publican en el siguiente: la consola tambien
-     * tarda en mezclar, y aqui es un tick (unos 5 ms emulados).
+     * nucleo 2 mientras el ARM sigue.
+     *
+     * Los estados, las muestras y la interrupcion se publican A MITAD DEL
+     * INTERVALO (0.3.1.7, PublishCallback). En 0.3.1.5-0.3.1.6 iban en el tick
+     * siguiente, y el juego veia el DSP un tick por detras de lo que habia
+     * pedido, cosa que sin el hilo no pasa; con esas dos Pokemon Sol se
+     * congelaba al arrancar. Ahora cada interrupcion lleva lo de su propio
+     * tick, como sin el hilo, solo que media vuelta mas tarde (la consola
+     * tambien tarda en mezclar), y la mezcla tiene esa media vuelta para acabar.
      */
     bool TickAsync();
     bool StartMixer();
     void WaitMixer();
+    void RunMix();
     void PublishMix();
+    void PublishCallback();
     void MixerMain();
     static void* MixerEntry(void* self);
 
@@ -128,6 +139,7 @@ private:
     DspHle& parent;
     Core::Timing& core_timing;
     Core::TimingEventType* tick_event{};
+    Core::TimingEventType* publish_event{};
 
     std::unique_ptr<HLE::DecoderBase> aac_decoder{};
 
@@ -149,6 +161,9 @@ private:
     HLE::IntermediateMixSamples mixer_write_samples{};
     std::array<bool, 2> mixer_aux_sent{};
     StereoFrame16 mixer_frame{};
+    /// Por donde va RunMix, para la nota de WaitMixer si no acaba.
+    std::atomic<const char*> mixer_where{"libre"};
+    std::atomic<int> mixer_source{-1};
 
 public:
     template <class Archive>
@@ -179,11 +194,14 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
         core_timing.RegisterEvent("AudioCore::DspHle::tick_event", [this](u64, s64 cycles_late) {
             this->AudioTickCallback(cycles_late);
         });
+    publish_event = core_timing.RegisterEvent("AudioCore::DspHle::publish_event",
+                                              [this](u64, s64) { this->PublishCallback(); });
     core_timing.ScheduleEvent(audio_frame_ticks, tick_event);
 }
 
 DspHle::Impl::~Impl() {
     core_timing.UnscheduleEvent(tick_event, 0);
+    core_timing.UnscheduleEvent(publish_event, 0);
     if (mixer_started) {
         {
             const std::lock_guard lock{mixer_mutex};
@@ -554,7 +572,87 @@ void DspHle::Impl::WaitMixer() {
         return;
     }
     std::unique_lock lock{mixer_mutex};
+#ifdef __PSVITA__
+    if (!mixer_busy) {
+        return;
+    }
+    /**
+     * Una mezcla son 0,1-3 ms. Si pasa de kPatienceUs se apunta por donde va,
+     * y el vigilante de main.cpp ve esta etapa si el juego se queda aqui. Si el
+     * hilo ni la ha cogido, no ha tocado nada todavia: se hace aqui y la
+     * partida sigue sin el hilo, en vez de esperarle sin saber hasta cuando.
+     * Los plazos se miden con el reloj, no con lo que diga wait_for.
+     */
+    constexpr unsigned long long kPatienceUs = 500 * 1000;
+    const Common::ScopedVitaStage stage{"esperando al dsp"};
+    const unsigned long long begin = Common::VitaMicros();
+    bool noted = false;
+    while (!mixer_cv.wait_for(lock, std::chrono::milliseconds(100),
+                              [this] { return !mixer_busy; })) {
+        const unsigned long long waited_us = Common::VitaMicros() - begin;
+        if (waited_us < kPatienceUs) {
+            continue;
+        }
+        if (mixer_request) {
+            mixer_request = false;
+            lock.unlock();
+            RunMix();
+            lock.lock();
+            mixer_busy = false;
+            DspHle::async_mix.store(false, std::memory_order_relaxed);
+            Common::VitaNote("dsp", fmt::format("el hilo de la mezcla no la cogio en {} ms: hecha "
+                                                "en el de emulacion, y dsp_hilo apagado",
+                                                waited_us / 1000)
+                                        .c_str());
+            return;
+        }
+        if (!noted) {
+            noted = true;
+            Common::VitaNote("dsp", fmt::format("la mezcla lleva {} ms sin acabar, en '{}' "
+                                                "(fuente {})",
+                                                waited_us / 1000,
+                                                mixer_where.load(std::memory_order_relaxed),
+                                                mixer_source.load(std::memory_order_relaxed))
+                                        .c_str());
+        }
+    }
+    if (noted) {
+        Common::VitaNote("dsp", fmt::format("la mezcla acabo a los {} ms",
+                                            (Common::VitaMicros() - begin) / 1000)
+                                    .c_str());
+    }
+#else
     mixer_cv.wait(lock, [this] { return !mixer_busy; });
+#endif
+}
+
+void DspHle::Impl::RunMix() {
+#ifdef __PSVITA__
+    const unsigned long long begin = Common::VitaMicros();
+#endif
+    std::array<QuadFrame32, 3> intermediate_mixes = {};
+    u32 active = 0;
+    mixer_where.store("fuentes", std::memory_order_relaxed);
+    for (std::size_t i = 0; i < HLE::num_sources; i++) {
+        mixer_source.store(static_cast<int>(i), std::memory_order_relaxed);
+        mixer_statuses[i] = sources[i].Generate();
+        active += mixer_statuses[i].is_enabled ? 1u : 0u;
+        for (std::size_t mix = 0; mix < 3; mix++) {
+            sources[i].MixInto(intermediate_mixes[mix], mix);
+        }
+    }
+    HLE::Stats::ticks.fetch_add(1, std::memory_order_relaxed);
+    HLE::Stats::active.fetch_add(active, std::memory_order_relaxed);
+    mixer_where.store("mezcla", std::memory_order_relaxed);
+    mixer_aux_sent = {mixers.AuxBusEnabled(0), mixers.AuxBusEnabled(1)};
+    mixer_dsp_status = mixers.Mix(mixer_read_samples, mixer_write_samples, intermediate_mixes);
+    mixer_frame = mixers.GetOutput();
+    mixer_where.store("salida", std::memory_order_relaxed);
+    parent.OutputFrame(mixer_frame);
+    mixer_where.store("libre", std::memory_order_relaxed);
+#ifdef __PSVITA__
+    HLE::Stats::worker_us.fetch_add(Common::VitaMicros() - begin, std::memory_order_relaxed);
+#endif
 }
 
 void DspHle::Impl::MixerMain() {
@@ -562,6 +660,9 @@ void DspHle::Impl::MixerMain() {
     // El nucleo 2 es el del compilador de shaders, que va por debajo de todo.
     Common::VitaPinThreadToUserCore(2, "dsp");
     Common::VitaSetThreadPriority(Common::kVitaPriorityHelper, "dsp");
+    // El FPSCR es por hilo: el mismo que el de emulacion, que mezclaba antes,
+    // para sacar las mismas muestras.
+    Common::VitaEnableFastFloatMode();
 #endif
     while (true) {
         {
@@ -572,28 +673,7 @@ void DspHle::Impl::MixerMain() {
             }
             mixer_request = false;
         }
-#ifdef __PSVITA__
-        const unsigned long long begin = Common::VitaMicros();
-#endif
-        std::array<QuadFrame32, 3> intermediate_mixes = {};
-        u32 active = 0;
-        for (std::size_t i = 0; i < HLE::num_sources; i++) {
-            mixer_statuses[i] = sources[i].Generate();
-            active += mixer_statuses[i].is_enabled ? 1u : 0u;
-            for (std::size_t mix = 0; mix < 3; mix++) {
-                sources[i].MixInto(intermediate_mixes[mix], mix);
-            }
-        }
-        HLE::Stats::ticks.fetch_add(1, std::memory_order_relaxed);
-        HLE::Stats::active.fetch_add(active, std::memory_order_relaxed);
-        mixer_aux_sent = {mixers.AuxBusEnabled(0), mixers.AuxBusEnabled(1)};
-        mixer_dsp_status =
-            mixers.Mix(mixer_read_samples, mixer_write_samples, intermediate_mixes);
-        mixer_frame = mixers.GetOutput();
-        parent.OutputFrame(mixer_frame);
-#ifdef __PSVITA__
-        HLE::Stats::worker_us.fetch_add(Common::VitaMicros() - begin, std::memory_order_relaxed);
-#endif
+        RunMix();
         {
             const std::lock_guard lock{mixer_mutex};
             mixer_busy = false;
@@ -625,7 +705,24 @@ void DspHle::Impl::PublishMix() {
     }
 }
 
+void DspHle::Impl::PublishCallback() {
+#ifdef __PSVITA__
+    const unsigned long long begin = Common::VitaMicros();
+#endif
+    WaitMixer();
+    if (mixer_publish) {
+        PublishMix();
+        mixer_publish = false;
+        interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
+    }
+#ifdef __PSVITA__
+    Common::FrameStats::Add(Common::FrameStats::dsp_us, begin);
+#endif
+}
+
 bool DspHle::Impl::TickAsync() {
+    // Lo normal es que PublishCallback ya lo haya publicado. Si este tick llega
+    // antes (muy atrasado), aqui, y la interrupcion la da AudioTickCallback.
     WaitMixer();
     const bool signal = mixer_publish;
     if (mixer_publish) {
@@ -685,6 +782,9 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
             : 1.0;
     s64 adjusted_ticks = static_cast<s64>(audio_frame_ticks / time_scale - cycles_late);
     core_timing.ScheduleEvent(adjusted_ticks, tick_event);
+    if (mixer_publish) {
+        core_timing.ScheduleEvent(std::max<s64>(adjusted_ticks / 2, 0), publish_event);
+    }
 }
 
 std::atomic<bool> DspHle::async_mix{true};
