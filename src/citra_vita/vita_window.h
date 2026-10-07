@@ -333,6 +333,10 @@ private:
     double stats_overlay_ms = 0.0;
     /// DSP HLE por fotograma (0.1.7.7): mezcla dentro de 'cpu', AAC dentro de 'svc'.
     double stats_dsp_ms = 0.0;
+    double stats_aac_ms = 0.0;
+    /// Desglose del DSP (0.3.1.4, ver AudioCore::HLE::Stats).
+    double stats_dsp_decode_ms = 0.0;
+    double stats_dsp_sources = 0.0;
     double stats_instrs_per_vertex = 0.0;
     double stats_fast_percent = 0.0;
     unsigned int stats_close_full = 0;

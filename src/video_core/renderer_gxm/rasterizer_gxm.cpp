@@ -51,6 +51,8 @@ std::atomic<u32> RasterizerGXM::hw_vs_batches{0};
 std::atomic<u32> RasterizerGXM::hw_vs_rejects{0};
 std::atomic<const char*> RasterizerGXM::hw_vs_last_reject{"-"};
 std::array<RasterizerGXM::RejectCount, 12> RasterizerGXM::reject_counts{};
+std::array<RasterizerGXM::RejectCount, 12> RasterizerGXM::transfer_rejects{};
+std::array<std::atomic<u32>, RasterizerGXM::kWritebackSites> RasterizerGXM::writeback_sites{};
 std::array<std::atomic<unsigned long long>, static_cast<u32>(RasterizerGXM::GpuWait::Count)>
     RasterizerGXM::gpu_wait_us{};
 std::atomic<u32> RasterizerGXM::Ablation::mode{0};
@@ -70,6 +72,16 @@ namespace {
 /// pasaron de ~11 us en 0.2.2.1 a ~46 en 0.2.2.8, y hay que saber si es eso o
 /// el cache.
 unsigned long long g_state_copy_us = 0;
+/**
+ * Programas de vertices nuevos (HwShaderCache::Build, 0.3.1.4): cuantos, lo que
+ * cuestan en el hilo de la GPU y cuanto de eso es traducir. En crash.txt de
+ * 0.3.1.3 la fase "vs" de Pokemon Sol llego a 5,9 ms por lote en un intervalo
+ * y no habia forma de saber en que.
+ */
+std::atomic<u32> g_vs_builds{0};
+std::atomic<unsigned long long> g_vs_build_us{0};
+std::atomic<unsigned long long> g_vs_generate_us{0};
+std::atomic<unsigned long long> g_vs_build_max_us{0};
 } // Anonymous namespace
 std::atomic<u32> RasterizerGXM::texture_source_writebacks{0};
 std::atomic<u32> RasterizerGXM::gpu_fills{0};
@@ -833,8 +845,9 @@ struct RasterizerGXM::BlitProgram {
 namespace {
 /// Pantallas a la vez: las dos de arriba y las dos de abajo del doble buffer.
 /// Ocho desde 0.2.2.4: aqui van tambien las texturas de TextureFromCopy, y
-/// rehacer una copia cuesta un sceGxmFinish.
-constexpr std::size_t kMaxScreenCopies = 8;
+/// rehacer una copia cuesta un sceGxmFinish. Doce desde 0.3.1.4, con las dos
+/// del ojo derecho.
+constexpr std::size_t kMaxScreenCopies = 12;
 /// Vertice del quad del blit: posicion float4 y coordenada float2, como el
 /// presentador.
 constexpr u32 kBlitVertexStride = 6 * sizeof(float);
@@ -1959,31 +1972,72 @@ private:
          * volver a darselo en otra sesion.
          */
         using namespace Pica::Shader::Generator::GXM;
-        static constexpr u32 kVariants[] = {kCgFloatAddress, kCgFloatAddress | kCgFlat, kCgFlat,
-                                            0};
+        struct BuildTimer {
+            unsigned long long begin = Common::VitaMicros();
+            ~BuildTimer() {
+                const unsigned long long spent = Common::VitaMicros() - begin;
+                g_vs_builds.fetch_add(1, std::memory_order_relaxed);
+                g_vs_build_us.fetch_add(spent, std::memory_order_relaxed);
+                if (spent > g_vs_build_max_us.load(std::memory_order_relaxed)) {
+                    g_vs_build_max_us.store(spent, std::memory_order_relaxed);
+                }
+            }
+        } const build_timer;
         const char* generator_reason = nullptr;
-        std::vector<std::string> sources;
-        std::vector<u32> variants;
-        for (const u32 variant : kVariants) {
+        const auto generate = [&](u32 variant) {
+            const unsigned long long generate_begin = Common::VitaMicros();
             g_cg_variant.store(variant, std::memory_order_relaxed);
             auto source = GenerateVertexShader(setup, config, extra, inputs, write_lighting,
                                                write_w, &generator_reason);
-            if (!source.has_value()) {
-                // Sin subrutinas en linea el analisis es el mismo en todas las
-                // variantes: si falla, fallaria igual en las demas. En linea
-                // puede fallar solo por tamano, y la siguiente sin linea vale.
-                if ((variant & kCgFlat) == 0) {
-                    break;
-                }
-                continue;
-            }
-            sources.push_back(std::move(*source));
-            variants.push_back(variant);
-        }
-        g_cg_variant.store(0, std::memory_order_relaxed);
-        if (sources.empty()) {
+            g_cg_variant.store(0, std::memory_order_relaxed);
+            g_vs_generate_us.fetch_add(Common::VitaMicros() - generate_begin,
+                                       std::memory_order_relaxed);
+            return source;
+        };
+        /**
+         * LA DE SIEMPRE Y LA DE LECTURAS COMPARTIDAS, Y LAS DEMAS SOLO SI HACE
+         * FALTA COMPILAR (0.3.1.4). Se generaban las cuatro variantes de cada
+         * programa nuevo en el hilo de la GPU aunque estuviera en la cache de
+         * la tarjeta, que es casi siempre: ahora la de siempre (la clave de
+         * todo lo que ya hay en la cache) y la de kCgRelCache, primero en lo
+         * precargado y despues en la tarjeta. Si hay que compilar, la de
+         * lecturas compartidas va la primera: mucho menos codigo para el
+         * compilador en los shaders de piel. Sin lecturas con registro de
+         * direccion las dos son el mismo texto y se queda una.
+         */
+        static constexpr const char* kName = "azahar_gxm_vs.cg";
+        static constexpr const char* kSharedName = "azahar_gxm_vsc.cg";
+        std::optional<std::string> first = generate(kCgFloatAddress);
+        if (!first.has_value()) {
+            // Sin subrutinas en linea el analisis es el mismo en todas las
+            // variantes: si falla, fallaria igual en las demas.
             program.reason = generator_reason != nullptr ? generator_reason : "vs traducir";
             return;
+        }
+        if (const SceShaccCgCompileOutput* cached =
+                LoadCgCache(SCE_SHACCCG_PROFILE_VP, kName, first->c_str(), false)) {
+            Finish(program, cached, kCgFloatAddress);
+            return;
+        }
+        std::optional<std::string> shared = generate(kCgFloatAddress | kCgRelCache);
+        if (shared.has_value() && *shared == *first) {
+            shared.reset();
+        }
+        for (const bool from_card : {false, true}) {
+            if (from_card) {
+                if (const SceShaccCgCompileOutput* cached =
+                        LoadCgCache(SCE_SHACCCG_PROFILE_VP, kName, first->c_str(), true)) {
+                    Finish(program, cached, kCgFloatAddress);
+                    return;
+                }
+            }
+            if (shared.has_value()) {
+                if (const SceShaccCgCompileOutput* cached = LoadCgCache(
+                        SCE_SHACCCG_PROFILE_VP, kSharedName, shared->c_str(), from_card)) {
+                    Finish(program, cached, kCgFloatAddress | kCgRelCache);
+                    return;
+                }
+            }
         }
         /**
          * TOPE DE TAMANO (0.1.9.2). crash.txt de 0.1.9.0 y 0.1.9.1: un shader de
@@ -2010,27 +2064,38 @@ private:
          */
         constexpr std::size_t kMaxCompileSource = 23u * 1024u;
         constexpr std::size_t kHeavySource = 16u * 1024u;
-        // De la cache de la tarjeta: es leer un fichero, aqui mismo.
-        if (const SceShaccCgCompileOutput* cached =
-                LoadCgCache(SCE_SHACCCG_PROFILE_VP, "azahar_gxm_vs.cg", sources.front().c_str())) {
-            Finish(program, cached, variants.front());
-            return;
-        }
-        if (sources.front().size() > kMaxCompileSource) {
+        // El tope mira la de siempre: con el de la otra, un programa que antes
+        // se especializaba podria pasar a compilarse entero (ver
+        // AccelerateDrawBatch) y dejar sin usar los especializados de la cache.
+        if (first->size() > kMaxCompileSource) {
             static u32 big_notes = 0;
             if (big_notes < 4) {
                 big_notes++;
                 NoteFmt("gxm vs", "{} bytes de Cg: no se compila en partida, a la CPU",
-                        sources.front().size());
+                        first->size());
             }
             program.reason = "vs demasiado grande";
             return;
         }
-        // Al hilo de compilacion (0.1.9.6); GetProgram recoge el resultado.
         auto job = std::make_shared<CgJob>();
-        job->heavy = sources.front().size() > kHeavySource;
-        job->sources = std::move(sources);
-        job->variants = std::move(variants);
+        if (shared.has_value()) {
+            job->sources.push_back(std::move(*shared));
+            job->variants.push_back(kCgFloatAddress | kCgRelCache);
+            job->names.push_back(kSharedName);
+        }
+        job->sources.push_back(std::move(*first));
+        job->variants.push_back(kCgFloatAddress);
+        job->names.push_back(kName);
+        for (const u32 variant : {kCgFloatAddress | kCgFlat, kCgFlat, 0u}) {
+            // En linea puede fallar solo por tamano, y la siguiente sin linea vale.
+            if (auto source = generate(variant); source.has_value()) {
+                job->sources.push_back(std::move(*source));
+                job->variants.push_back(variant);
+                job->names.push_back(kName);
+            }
+        }
+        // Al hilo de compilacion (0.1.9.6); GetProgram recoge el resultado.
+        job->heavy = job->sources.front().size() > kHeavySource;
         program.job = job;
         CgSubmit(std::move(job));
     }
@@ -2046,7 +2111,7 @@ private:
             static u32 variant_notes = 0;
             if (used_variant != 0 && variant_notes < 4) {
                 variant_notes++;
-                NoteFmt("gxm vs", "variante {} (1 sin enteros, 2 en linea, 3 ambas)",
+                NoteFmt("gxm vs", "variante {} (1 sin enteros, 2 en linea, 4 lecturas compartidas)",
                         used_variant);
             }
         }
@@ -2772,10 +2837,11 @@ std::string RasterizerGXM::TakeGpuWaitSummary(double frames) {
     return text.empty() ? "-" : text;
 }
 
-void RasterizerGXM::WriteBack(Surface& surface) {
+void RasterizerGXM::WriteBack(Surface& surface, u32 site) {
     if (!surface.dirty) {
         return;
     }
+    writeback_sites[site].fetch_add(1, std::memory_order_relaxed);
     if (surface.clear_pending) {
         ApplyClearOnCpu(surface);
     }
@@ -2982,9 +3048,20 @@ RasterizerGXM::DirectPresent RasterizerGXM::QueryDirectPresent(u32 guest_address
 }
 
 bool RasterizerGXM::IsDisplayFramebuffer(PAddr addr, u32 size, u32 row_bytes) {
+    /**
+     * EL OJO DERECHO TAMBIEN ES PANTALLA (0.3.1.4). Zelda: Ocarina of Time 3D,
+     * Yo-Kai Watch e Inazuma Eleven GO copian su 3D a dos buffers, uno justo
+     * detras del otro (0x46500 bytes, una pantalla RGB8): el del ojo izquierdo
+     * y el del derecho, aunque aqui solo se presente el izquierdo. La del
+     * derecho se rechazaba por "no es pantalla" y se hacia por software:
+     * volcar la superficie esperando a la GPU y copiarla con la CPU. En la GPU
+     * no se presenta nunca, y si el juego lee esa memoria se escribe ahi como
+     * cualquier otra copia (MaterializeCopy).
+     */
     for (u32 i = 0; i < 2; i++) {
         const auto& framebuffer = pica.regs.framebuffer_config[i];
-        for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2}) {
+        for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2,
+                                  framebuffer.address_right1, framebuffer.address_right2}) {
             if (shown == 0 || std::find(display_addresses.begin(), display_addresses.end(),
                                         shown) != display_addresses.end()) {
                 continue;
@@ -3008,7 +3085,8 @@ bool RasterizerGXM::IsDisplayFramebuffer(PAddr addr, u32 size, u32 row_bytes) {
     // de esa memoria (el arranque deja las suyas en la VRAM).
     for (u32 i = 0; i < 2; i++) {
         const auto& framebuffer = pica.regs.framebuffer_config[i];
-        for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2}) {
+        for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2,
+                                  framebuffer.address_right1, framebuffer.address_right2}) {
             if (shown > addr && shown < addr + size && (shown - addr) % row_bytes == 0) {
                 return true;
             }
@@ -3141,7 +3219,7 @@ const SceGxmTexture* RasterizerGXM::TextureFromCopy(u32 unit) {
             !surface->Overlaps(address, span)) {
             continue;
         }
-        WriteBack(*surface);
+        WriteBack(*surface, kWritebackTextureCopy);
         texture_source_writebacks.fetch_add(1, std::memory_order_relaxed);
         if (textures != nullptr) {
             texture_marks[4].fetch_add(
@@ -3646,6 +3724,17 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
      * saber por que.
      */
     const auto reject = [&](const char* why) {
+        for (auto& slot : transfer_rejects) {
+            const char* reason = slot.reason.load(std::memory_order_relaxed);
+            if (reason == nullptr) {
+                slot.reason.store(why, std::memory_order_relaxed);
+                reason = why;
+            }
+            if (reason == why) {
+                slot.count.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
         static const char* noted[12] = {};
         static u32 noted_count = 0;
         for (u32 i = 0; i < noted_count; i++) {
@@ -4491,7 +4580,7 @@ void RasterizerGXM::FlushPending() {
     MaterializeAllCopies();
     EndScene();
     for (auto& surface : surfaces) {
-        WriteBack(*surface);
+        WriteBack(*surface, kWritebackPending);
     }
 }
 
@@ -4534,7 +4623,7 @@ void RasterizerGXM::FlushForPresent() {
     frame_first_fence = 0;
     for (auto& surface : surfaces) {
         if (!surface->copied) {
-            WriteBack(*surface);
+            WriteBack(*surface, kWritebackPresent);
         }
     }
 }
@@ -5010,7 +5099,7 @@ void RasterizerGXM::PrepareSoftwareBatch() {
             if (open_surface == surface.get()) {
                 EndScene();
             }
-            WriteBack(*surface);
+            WriteBack(*surface, kWritebackSoftwareBatch);
             software_syncs.fetch_add(1, std::memory_order_relaxed);
         }
         surface->needs_reload = true;
@@ -5719,7 +5808,7 @@ void RasterizerGXM::FlushRegion(PAddr addr, u32 size) {
             continue;
         }
         EndScene();
-        WriteBack(*surface);
+        WriteBack(*surface, kWritebackFlush);
     }
     // El cache de texturas se crea en el primer lote, y estos vaciados llegan
     // desde el arranque del juego, mucho antes: sin la comprobacion esto era
@@ -5807,7 +5896,7 @@ void RasterizerGXM::FlushAndInvalidateRegion(PAddr addr, u32 size) {
         if (hits_color) {
             // Volcar solo tiene sentido para el color: la profundidad no se
             // comparte con el invitado, asi que ahi no hay nada que devolver.
-            WriteBack(*surface);
+            WriteBack(*surface, kWritebackFlushInvalidate);
             surface->needs_reload = true;
             reload_causes[2].fetch_add(1, std::memory_order_relaxed);
         }
@@ -6681,6 +6770,46 @@ std::string RasterizerGXM::TakeRejectSummary() {
     return text;
 }
 
+std::string RasterizerGXM::TakeCopySummary() {
+    std::string text = "pantalla rechazadas:";
+    bool any = false;
+    for (auto& slot : transfer_rejects) {
+        const char* reason = slot.reason.load(std::memory_order_relaxed);
+        const u32 count = slot.count.exchange(0, std::memory_order_relaxed);
+        if (reason != nullptr && count != 0) {
+            text += fmt::format("{} {} {}", any ? "," : "", reason, count);
+            any = true;
+        }
+    }
+    if (!any) {
+        text += " -";
+    }
+    static constexpr const char* kSites[kWritebackSites] = {
+        "textura", "pendiente", "presentar", "lote soft", "vaciado", "vaciado+inv"};
+    text += " | volcados por:";
+    any = false;
+    for (u32 i = 0; i < kWritebackSites; i++) {
+        const u32 count = writeback_sites[i].exchange(0, std::memory_order_relaxed);
+        if (count != 0) {
+            text += fmt::format("{} {} {}", any ? "," : "", kSites[i], count);
+            any = true;
+        }
+    }
+    if (!any) {
+        text += " -";
+    }
+    auto& tex = TextureCache::rejects;
+    text += fmt::format(
+        " | sin textura: tipo {} tam {} mem {} rep {} sin gpu {}, apagadas servidas {}",
+        tex[TextureCache::kRejectType].exchange(0, std::memory_order_relaxed),
+        tex[TextureCache::kRejectSize].exchange(0, std::memory_order_relaxed),
+        tex[TextureCache::kRejectMemory].exchange(0, std::memory_order_relaxed),
+        tex[TextureCache::kRejectWrap].exchange(0, std::memory_order_relaxed),
+        tex[TextureCache::kRejectGpuMemory].exchange(0, std::memory_order_relaxed),
+        tex[TextureCache::kServedDisabled].exchange(0, std::memory_order_relaxed));
+    return text;
+}
+
 std::string RasterizerGXM::TakeBatchProfile() {
     const u32 samples = batch_phase_samples;
     const auto avg = [samples](unsigned long long total) {
@@ -6690,7 +6819,7 @@ std::string RasterizerGXM::TakeBatchProfile() {
         "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
         "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
         "muestras) | texturas a revisar por: vaciado {} invalidar {} ambos {} relleno {} "
-        "copia {}",
+        "copia {} | vs nuevos {} ({} ms, traducir {} ms, el peor {} ms)",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
         avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples,
@@ -6698,7 +6827,11 @@ std::string RasterizerGXM::TakeBatchProfile() {
         texture_marks[1].exchange(0, std::memory_order_relaxed),
         texture_marks[2].exchange(0, std::memory_order_relaxed),
         texture_marks[3].exchange(0, std::memory_order_relaxed),
-        texture_marks[4].exchange(0, std::memory_order_relaxed));
+        texture_marks[4].exchange(0, std::memory_order_relaxed),
+        g_vs_builds.exchange(0, std::memory_order_relaxed),
+        g_vs_build_us.exchange(0, std::memory_order_relaxed) / 1000,
+        g_vs_generate_us.exchange(0, std::memory_order_relaxed) / 1000,
+        g_vs_build_max_us.exchange(0, std::memory_order_relaxed) / 1000);
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
     state_scene_us = 0;

@@ -14,6 +14,7 @@
 #include "audio_core/hle/aac_decoder.h"
 #include "audio_core/hle/common.h"
 #include "audio_core/hle/decoder.h"
+#include "audio_core/hle/dsp_stats.h"
 #include "audio_core/hle/hle.h"
 #include "audio_core/hle/mixers.h"
 #include "audio_core/hle/shared_memory.h"
@@ -286,6 +287,7 @@ void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
         const HLE::BinaryMessage response = aac_decoder->ProcessRequest(request);
 #ifdef __PSVITA__
         Common::FrameStats::Add(Common::FrameStats::dsp_us, decode_begin);
+        Common::FrameStats::Add(Common::FrameStats::aac_us, decode_begin);
 #endif
         pipe_data[static_cast<u32>(pipe_number)].resize(sizeof(response));
         std::memcpy(pipe_data[static_cast<u32>(pipe_number)].data(), &response, sizeof(response));
@@ -427,13 +429,18 @@ StereoFrame16 DspHle::Impl::GenerateCurrentFrame() {
     std::array<QuadFrame32, 3> intermediate_mixes = {};
 
     // Generate intermediate mixes
+    u32 active = 0;
     for (std::size_t i = 0; i < HLE::num_sources; i++) {
         write.source_statuses.status[i] =
             sources[i].Tick(read.source_configurations.config[i], read.adpcm_coefficients.coeff[i]);
+        active += write.source_statuses.status[i].is_enabled ? 1u : 0u;
         for (std::size_t mix = 0; mix < 3; mix++) {
             sources[i].MixInto(intermediate_mixes[mix], mix);
         }
     }
+
+    HLE::Stats::ticks.fetch_add(1, std::memory_order_relaxed);
+    HLE::Stats::active.fetch_add(active, std::memory_order_relaxed);
 
     // Generate final mix
     write.dsp_status = mixers.Tick(read.dsp_configuration, read.intermediate_mix_samples,

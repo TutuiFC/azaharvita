@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -66,8 +67,8 @@ namespace Gxm {
  * lo segundo el cache creeria que cabe diez veces mas de lo que cabe.
  *
  * Lo que no se soporta todavia devuelve nullptr y el lote entero cae al
- * rasterizador de software: texturas que no sean 2D, unidades deshabilitadas y
- * el modo de repetido ClampToBorder2.
+ * rasterizador de software: texturas que no sean 2D y el modo de repetido
+ * ClampToBorder2.
  */
 class TextureCache {
 public:
@@ -111,6 +112,17 @@ public:
     /// Textura de la unidad (0-2) para el estado actual, o nullptr.
     [[nodiscard]] const SceGxmTexture* Get(u32 unit, const Pica::RegsInternal& regs,
                                           Memory::MemorySystem& memory);
+
+    /**
+     * Por que Get devolvio nullptr, para crash.txt (0.3.1.4): cada lote asi va
+     * entero al rasterizador de software ("estado" en la linea "gpu"), y sin
+     * esto no se sabia cual de las causas era. El ultimo hueco cuenta las
+     * unidades que se sirven con un color fijo, que ya no rechazan (ver
+     * ConstantTexture).
+     */
+    enum Reject : u32 { kRejectType, kRejectSize, kRejectMemory, kRejectWrap, kRejectGpuMemory,
+                        kServedDisabled, kRejectCount };
+    static std::array<std::atomic<u32>, kRejectCount> rejects;
 
     /// Tira las texturas que solapen el rango.
     /// Devuelve cuantas entradas pasan a sospechosas (para crash.txt).
@@ -205,6 +217,11 @@ private:
     /// Banda de 8 lineas en RAM para decodificar por filas de mosaicos (ver
     /// Get). Se reutiliza: como mucho 1024 x 8 texeles, 32 KB.
     std::vector<u32> band;
+    /// Texturas de un solo color: (0,0,0,0) y (0,0,0,255). Ver Get.
+    const SceGxmTexture* ConstantTexture(bool opaque);
+    std::array<SceGxmTexture, 2> constant_textures{};
+    Allocation constant_texels;
+    bool constant_failed = false;
 };
 
 } // namespace Gxm

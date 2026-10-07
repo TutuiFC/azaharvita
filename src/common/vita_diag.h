@@ -154,6 +154,8 @@ inline std::atomic<unsigned long long> overlay_us{0};
 /// DSP HLE (0.1.7.7): la mezcla de cada tick de audio y la decodificacion AAC,
 /// las dos en el hilo de emulacion. No aparecia en ninguna medida.
 inline std::atomic<unsigned long long> dsp_us{0};
+/// La parte AAC de dsp_us (0.3.1.4): la musica de unos juegos y no la de otros.
+inline std::atomic<unsigned long long> aac_us{0};
 /**
  * JIT del ARM11 (0.1.4.8, ver arm_dyncom_jit.h). Todo lo cuenta el hilo de
  * emulacion, que es el unico que ejecuta el ARM:
@@ -213,6 +215,7 @@ inline void Reset() {
     shade_busy_us.store(0, std::memory_order_relaxed);
     overlay_us.store(0, std::memory_order_relaxed);
     dsp_us.store(0, std::memory_order_relaxed);
+    aac_us.store(0, std::memory_order_relaxed);
     // Los contadores de "desde el arranque" (fast_programs, jit_*, etc) NO se
     // tocan aqui. shade_slow_opcodes SI: es un desglose del intervalo, como
     // shade_slow_instrs, y el overlay lo anota en crash.txt una vez por segundo.

@@ -12,6 +12,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 #include <fmt/format.h>
 #include <nihstro/shader_bytecode.h>
 #include "common/logging/log.h"
@@ -635,6 +636,37 @@ constexpr auto GetSelectorSrc3 = GetSelector<&SwizzlePattern::GetSelectorSrc3>;
 
 using RegGetter = std::function<std::string(u32)>;
 
+/**
+ * La profundidad de bloques { } del codigo emitido y cual esta abierto en cada
+ * nivel (0.3.1.4): una variable declarada en un bloque solo se ve mientras ese
+ * MISMO bloque siga abierto, no en un hermano que se abra despues a la misma
+ * profundidad. Ver RelRead.
+ */
+struct Scope {
+    int depth = 0;
+    std::vector<u32> open{0};
+    u32 next = 1;
+
+    Scope& operator++() {
+        ++depth;
+        open.push_back(next++);
+        return *this;
+    }
+    Scope& operator--() {
+        --depth;
+        if (open.size() > 1) {
+            open.pop_back();
+        }
+        return *this;
+    }
+    [[nodiscard]] bool IsOpen(u32 id) const {
+        return std::find(open.begin(), open.end(), id) != open.end();
+    }
+    [[nodiscard]] u32 Current() const {
+        return open.back();
+    }
+};
+
 /// Emite el cuerpo del shader con sangria, igual que el ShaderWriter de GLSL.
 class Writer {
 public:
@@ -642,7 +674,7 @@ public:
     void AddLine(fmt::format_string<Args...> text, Args&&... args) {
         const std::string line = fmt::format(text, std::forward<Args>(args)...);
         if (!line.empty()) {
-            source.append(static_cast<std::size_t>(scope) * 4, ' ');
+            source.append(static_cast<std::size_t>(scope.depth) * 4, ' ');
         }
         source += line;
         source += '\n';
@@ -656,7 +688,7 @@ public:
         return std::move(source);
     }
 
-    int scope = 0;
+    Scope scope;
 
 private:
     std::string source;
@@ -745,8 +777,39 @@ private:
         }
     }
 
-    std::string GetSourceRegister(const SourceRegister& source_reg,
-                                  u32 address_register_index) const {
+    /**
+     * LAS LECTURAS CON REGISTRO DE DIRECCION, UNA VEZ (kCgRelCache, 0.3.1.4).
+     * La piel de los modelos lee cada fila de la matriz de un hueso ("c[a0.x +
+     * 10]") con su get_offset_register -- comparaciones, selecciones y una
+     * lectura indexada -- tantas veces como instrucciones la usan: en el shader
+     * de combate de Pokemon Sol, cinco por fila, quince por hueso y cuarenta y
+     * cinco en el programa. El compilador de la consola tarda mas cuanto mas
+     * codigo le llega (1,7 millones de reservas y 35 s de CPU para uno de 12
+     * KB, crash.txt de 0.3.1.2) y la GPU las repite por vertice. Aqui la
+     * primera se guarda en una variable y las siguientes la reutilizan
+     * mientras el registro no cambie y siga abierto el bloque donde se
+     * declaro. Se olvida todo al escribir el registro (MOVA), en cada bucle (el
+     * registro z cambia en cada vuelta) y en cada subrutina (puede escribirlo).
+     */
+    struct RelRead {
+        u32 index;
+        u32 component;
+        u32 block;
+        std::string name;
+    };
+    std::vector<RelRead> rel_reads;
+    u32 rel_count = 0;
+
+    void ForgetRelReads() {
+        rel_reads.clear();
+    }
+
+    void ForgetRelReads(u32 component) {
+        std::erase_if(rel_reads,
+                      [component](const RelRead& read) { return read.component == component; });
+    }
+
+    std::string GetSourceRegister(const SourceRegister& source_reg, u32 address_register_index) {
         const u32 index = static_cast<u32>(source_reg.GetIndex());
         switch (source_reg.GetRegisterType()) {
         case RegisterType::Input:
@@ -755,12 +818,26 @@ private:
             return fmt::format("reg_tmp{}", index);
         case RegisterType::FloatUniform:
             if (address_register_index != 0) {
-                if (FloatAddress()) {
-                    return fmt::format("get_offset_register({}.0, address_registers.{})", index,
-                                       "xyz"[address_register_index - 1]);
+                const u32 component = address_register_index - 1;
+                std::string read =
+                    FloatAddress()
+                        ? fmt::format("get_offset_register({}.0, address_registers.{})", index,
+                                      "xyz"[component])
+                        : fmt::format("get_offset_register({}, address_registers.{})", index,
+                                      "xyz"[component]);
+                if (!RelCache()) {
+                    return read;
                 }
-                return fmt::format("get_offset_register({}, address_registers.{})", index,
-                                   "xyz"[address_register_index - 1]);
+                for (const RelRead& cached : rel_reads) {
+                    if (cached.index == index && cached.component == component &&
+                        shader.scope.IsOpen(cached.block)) {
+                        return cached.name;
+                    }
+                }
+                std::string name = fmt::format("rel{}", rel_count++);
+                shader.AddLine("float4 {} = {};", name, read);
+                rel_reads.push_back({index, component, shader.scope.Current(), name});
+                return name;
             }
             return fmt::format("vs_f[{}]", index);
         default:
@@ -846,8 +923,17 @@ private:
     static bool Flat() {
         return (g_cg_variant.load(std::memory_order_relaxed) & kCgFlat) != 0;
     }
+    static bool RelCache() {
+        return (g_cg_variant.load(std::memory_order_relaxed) & kCgRelCache) != 0;
+    }
 
     void CallSubroutine(const Subroutine& subroutine) {
+        ForgetRelReads();
+        CallSubroutineBody(subroutine);
+        ForgetRelReads();
+    }
+
+    void CallSubroutineBody(const Subroutine& subroutine) {
         if (Flat()) {
             /**
              * Subrutina EN LINEA (0.1.7.3). Todo esta dentro de exec_shader, asi
@@ -994,9 +1080,12 @@ private:
                     // Truncado hacia cero sin enteros (0.1.7.3, ver g_cg_variant).
                     SetDest(swizzle, "address_registers", fmt::format("ar_trunc(({}).xy)", src1),
                             2, 2);
-                    break;
+                } else {
+                    SetDest(swizzle, "address_registers", fmt::format("int2(({}).xy)", src1), 2,
+                            2);
                 }
-                SetDest(swizzle, "address_registers", fmt::format("int2(({}).xy)", src1), 2, 2);
+                ForgetRelReads(0);
+                ForgetRelReads(1);
                 break;
             case OpCode::Id::MOV:
                 SetDest(swizzle, dest_reg, src1, 4, 4);
@@ -1278,6 +1367,7 @@ private:
                  */
                 const u32 id = instr.flow_control.int_uniform_id.Value();
                 const std::string loop_var = fmt::format("loop{}", offset);
+                ForgetRelReads();
                 if (FloatAddress()) {
                     shader.AddLine("address_registers.z = vs_i[{}].y;", id);
                     shader.AddLine("for (int {0} = 0; {0} <= (int)vs_i[{1}].x; "
@@ -1304,6 +1394,7 @@ private:
 
                 --shader.scope;
                 shader.AddLine("}}");
+                ForgetRelReads();
 
                 if (loop_sub->exit_method == ExitMethod::AlwaysEnd) {
                     offset = PROGRAM_END - 1;

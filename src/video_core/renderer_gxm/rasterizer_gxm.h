@@ -314,6 +314,26 @@ public:
     [[nodiscard]] static std::string TakeRejectSummary();
 
     /**
+     * LAS COPIAS QUE NO VAN A LA GPU Y LOS VOLCADOS, CONTADOS (0.3.1.4). Cada
+     * motivo de rechazo de AccelerateDisplayTransfer salia UNA vez en
+     * crash.txt, asi que no se sabia si se repetia en cada fotograma; y
+     * "volcado" en las esperas era un total sin decir quien lo pedia. Por
+     * intervalo, con TakeCopySummary.
+     */
+    static std::array<RejectCount, 12> transfer_rejects;
+    enum WritebackSite : u32 {
+        kWritebackTextureCopy,
+        kWritebackPending,
+        kWritebackPresent,
+        kWritebackSoftwareBatch,
+        kWritebackFlush,
+        kWritebackFlushInvalidate,
+        kWritebackSites,
+    };
+    static std::array<std::atomic<u32>, kWritebackSites> writeback_sites;
+    [[nodiscard]] static std::string TakeCopySummary();
+
+    /**
      * QUIEN ESPERA A LA GPU (0.2.1.9). "espera a la gpu" de crash.txt era un
      * total: 9-11 ms por fotograma en el 3D de Pokemon Sol, y quitar la espera
      * de la presentacion (0.2.1.8) apenas lo movio. Ahora cada espera se
@@ -488,7 +508,8 @@ private:
     /// Las ultimas direcciones vistas en la configuracion de las pantallas:
     /// un juego puede escribir siempre en la misma ranura y alternar la
     /// direccion, y la copia llega antes de que la pantalla nueva se configure.
-    std::array<PAddr, 8> display_addresses{};
+    /// Con las del ojo derecho desde 0.3.1.4 (ver IsDisplayFramebuffer).
+    std::array<PAddr, 16> display_addresses{};
     u32 display_address_next = 0;
     /// Escribe en la memoria del invitado lo que solo esta en la copia.
     void MaterializeCopy(ScreenCopy& copy);
@@ -567,7 +588,8 @@ private:
 
     /// Vuelca la superficie al framebuffer del invitado (de nuestro orden
     /// lineal al de tiles de la PICA). No hace nada si no esta sucia.
-    void WriteBack(Surface& surface);
+    /// 'site' es quien lo pide, para crash.txt (ver writeback_sites).
+    void WriteBack(Surface& surface, u32 site);
 
     /// Al reves: trae a la superficie lo que el invitado tenga en ese
     /// framebuffer. Es lo que hace que dibujar encima de lo anterior funcione.

@@ -65,7 +65,7 @@ u32 CgGeneration();
  * compilacion ocupado eso era esperarle (Yo-kai Watch, 0.1.9.8).
  */
 const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, const char* name,
-                                           const char* source);
+                                           const char* source, bool from_card = true);
 
 /// Compila un shader. El resultado vive hasta ReleaseCgOutput.
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
@@ -104,6 +104,8 @@ struct CgJob {
     const char* name = "azahar_gxm_vs.cg";
     std::vector<std::string> sources;
     std::vector<u32> variants;
+    /// El nombre de cada fuente para crash.txt, si no es 'name' (0.3.1.4).
+    std::vector<const char*> names;
     /// Lo escribe el hilo de compilacion ANTES de poner done.
     const SceShaccCgCompileOutput* output = nullptr;
     u32 used_variant = 0;

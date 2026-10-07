@@ -55,7 +55,11 @@ create_target_directory_groups(audio_core)
 # y decodificacion AAC. Todo iba a -Os como el resto del proyecto, y crash.txt
 # de 0.1.8.4 midio "dsp" hasta 9.4 ms por vblank en Zafiro Alfa. El estirado y
 # el remuestreo corren en el hilo de salida, pero cuestan CPU igual.
+# codec.cpp desde 0.3.1.4: decodifica (ADPCM, PCM) cada buffer entero al
+# empezar a sonar, y en un bucle de ambiente de varios segundos son decenas de
+# miles de muestras de golpe en el hilo de emulacion.
 set_source_files_properties(
+    codec.cpp
     hle/hle.cpp
     hle/source.cpp
     hle/mixers.cpp

@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <fmt/format.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -104,7 +105,6 @@ std::atomic<u32> g_generation{0};
  * DESCARGAR el modulo. Desde 0.1.8.5 solo se mide (picos y lo retenido, ver
  * NoteCompileMemory): liberar lo apuntado tras descargar resulto peligroso.
  */
-std::unordered_set<void*> g_compile_allocs;
 std::size_t g_live_bytes = 0;
 /// Lo maximo que ha tenido vivo durante la compilacion en curso.
 std::size_t g_peak_bytes = 0;
@@ -144,7 +144,21 @@ constexpr std::size_t kQuarantineBytes = 2u * 1024u * 1024u;
 /// Reservas de la compilacion en curso: cuantas y cuanto (ver CompileCg).
 u32 g_alloc_calls = 0;
 u64 g_alloc_total = 0;
-std::deque<std::pair<void*, std::size_t>> g_quarantine;
+/**
+ * LA CUENTA SIN UN CONJUNTO DE PUNTEROS, Y LA COLA EN UN ANILLO (0.3.1.4). Cada
+ * reserva del compilador entraba en un unordered_set (un malloc de nodo, y
+ * rehacer la tabla al crecer) y cada liberacion en una deque: el doble de
+ * llamadas a malloc que las del propio compilador, que son millones por shader
+ * de vertices grande (1,7 millones y 35 s de CPU uno de 12 KB de Pokemon Sol en
+ * crash.txt de 0.3.1.2). El conjunto solo servia para no descontar bloques de
+ * otro modulo, y el modulo descargado no vuelve a liberar nada: la cuenta se
+ * lleva con lo que dice malloc_usable_size. El anillo guarda lo mismo que la
+ * deque, con tope de entradas ademas del de bytes.
+ */
+constexpr std::size_t kQuarantineSlots = 32768;
+std::vector<std::pair<void*, std::size_t>> g_quarantine;
+std::size_t g_quarantine_head = 0;
+std::size_t g_quarantine_count = 0;
 std::size_t g_quarantine_bytes = 0;
 
 void* CgAlloc(unsigned int size) {
@@ -175,13 +189,6 @@ void* CgAlloc(unsigned int size) {
         g_alloc_calls++;
         g_alloc_total += rounded;
     }
-    try {
-        g_compile_allocs.insert(pointer);
-    } catch (...) {
-        std::free(pointer);
-        g_compile_over_budget = true;
-        return nullptr;
-    }
     const std::size_t usable = malloc_usable_size(pointer);
     g_live_bytes += usable;
     if (g_live_bytes > g_peak_bytes) {
@@ -198,24 +205,34 @@ void CgFree(void* pointer) {
         return;
     }
     const std::size_t size = malloc_usable_size(pointer);
-    if (g_compile_allocs.erase(pointer) != 0) {
-        g_live_bytes = g_live_bytes > size ? g_live_bytes - size : 0;
-        if (g_tracking) {
-            g_compile_bytes = g_compile_bytes > size ? g_compile_bytes - size : 0;
+    g_live_bytes = g_live_bytes > size ? g_live_bytes - size : 0;
+    if (g_tracking) {
+        g_compile_bytes = g_compile_bytes > size ? g_compile_bytes - size : 0;
+    }
+    if (g_quarantine.empty()) {
+        try {
+            g_quarantine.resize(kQuarantineSlots);
+        } catch (...) {
+            std::free(pointer);
+            return;
         }
     }
-    try {
-        g_quarantine.emplace_back(pointer, size);
-    } catch (...) {
-        std::free(pointer);
-        return;
-    }
-    g_quarantine_bytes += size;
-    while (g_quarantine_bytes > kQuarantineBytes) {
-        const auto oldest = g_quarantine.front();
-        g_quarantine.pop_front();
-        g_quarantine_bytes -= oldest.second;
+    const auto free_oldest = [] {
+        auto& oldest = g_quarantine[g_quarantine_head];
         std::free(oldest.first);
+        g_quarantine_bytes -= oldest.second;
+        oldest = {};
+        g_quarantine_head = (g_quarantine_head + 1) % kQuarantineSlots;
+        g_quarantine_count--;
+    };
+    if (g_quarantine_count == kQuarantineSlots) {
+        free_oldest();
+    }
+    g_quarantine[(g_quarantine_head + g_quarantine_count) % kQuarantineSlots] = {pointer, size};
+    g_quarantine_count++;
+    g_quarantine_bytes += size;
+    while (g_quarantine_bytes > kQuarantineBytes && g_quarantine_count > 1) {
+        free_oldest();
     }
 }
 
@@ -267,6 +284,14 @@ pthread_t g_worker_thread{};
 bool g_worker_running = false;
 bool g_cache_dir_ready = false;
 u32 g_cache_notes = 0;
+/**
+ * Topes de las notas de compilacion, por juego (0.3.1.4): eran de toda la
+ * sesion, y en crash.txt de 0.3.1.3 Kirby gasto las sesenta de tiempos antes
+ * de que Pokemon Sol, cuarto juego de la sesion, compilara nada. Los pone a
+ * cero PreloadCgCache, al arrancar cada juego.
+ */
+std::atomic<u32> g_start_notes{0};
+std::atomic<u32> g_time_notes{0};
 
 u64 Fnv1a64(const char* data, std::size_t size) {
     u64 hash = 0xCBF29CE484222325ull;
@@ -827,7 +852,6 @@ void RecoverFromInternalError() {
                                        "shaders de vertices en esta sesion");
     }
     if (g_generation >= kMaxRecoveries) {
-        g_compile_allocs.clear();
         g_live_bytes = 0;
         return;
     }
@@ -838,8 +862,7 @@ void RecoverFromInternalError() {
                                                    "({:#x}): sigue sin compilar",
                                                    static_cast<u32>(rc))
                                            .c_str());
-        g_compile_allocs.clear(); // no se puede devolver: el modulo sigue vivo
-        g_live_bytes = 0;
+        g_live_bytes = 0; // no se puede devolver: el modulo sigue vivo
         g_poisoned = true;
         return;
     }
@@ -851,7 +874,6 @@ void RecoverFromInternalError() {
      * fallida (unos MB), y esto solo pasa con errores internos.
      */
     const std::size_t lost = g_live_bytes;
-    g_compile_allocs.clear();
     g_live_bytes = 0;
     g_module = -1;
     g_last_attempt_us = 0; // recargar ya en la siguiente compilacion
@@ -946,6 +968,10 @@ void PurgeUnoptimizedVertexPrograms() {
 
 u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress) {
     PurgeUnoptimizedVertexPrograms();
+    g_start_notes.store(0, std::memory_order_relaxed);
+    g_time_notes.store(0, std::memory_order_relaxed);
+    g_cache_notes = 0;
+    g_mem_notes = 0;
     // Nada de lo anterior sirve para otro juego.
     std::vector<std::string> paths;
     {
@@ -1025,7 +1051,7 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
 }
 
 const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, const char* name,
-                                           const char* source) {
+                                           const char* source, bool from_card) {
     const std::size_t source_size = std::strlen(source);
     CacheHeader key{};
     key.magic = kCacheMagic;
@@ -1035,7 +1061,17 @@ const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, cons
     key.hash_city = Common::ComputeHash64(source, source_size);
     key.hash_fnv = Fnv1a64(source, source_size);
     const unsigned long long begin_us = Common::VitaMicros();
-    const SceShaccCgCompileOutput* cached = LoadCached(key, CachePath(key.hash_city, profile));
+    const std::string path = CachePath(key.hash_city, profile);
+    const SceShaccCgCompileOutput* cached = nullptr;
+    if (from_card) {
+        cached = LoadCached(key, path);
+    } else {
+        const std::lock_guard lock{g_preload_mutex};
+        const auto it = g_preloaded.find(path);
+        if (it != g_preloaded.end()) {
+            cached = FromPreloaded(key, it->second);
+        }
+    }
     if (cached != nullptr) {
         NoteCache(fmt::format("{} leido de la cache en {} us", name,
                               Common::VitaMicros() - begin_us));
@@ -1145,15 +1181,17 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     // Que se compila y de que tamano, a crash.txt (0.1.9.1): en 0.1.9.0 el
     // juego se quedaba congelado dentro de una compilacion sin saber cual.
     // Hasta 200 (eran 24): con menos, el que tumba el compilador no salia.
-    static u32 start_notes = 0;
-    if (start_notes < 200) {
-        start_notes++;
+    if (g_start_notes.fetch_add(1, std::memory_order_relaxed) < 200) {
         Common::VitaNote("gxm compila", fmt::format("{}: {} bytes de codigo, heap libre {} KB, O{}",
                                                     name, g_source.size, FreeHeap() / 1024,
                                                     options.optimizationLevel)
                                             .c_str());
     }
     const SceShaccCgCompileOutput* output = nullptr;
+    // Lo que tarda en la tarjeta lo de antes de compilar (0.3.1.4): la nota y
+    // las dos marcas, en el tiempo de reloj de "compilado en".
+    const unsigned long long marker_us = Common::VitaMicros() - compile_begin_us;
+    const unsigned long long marker_begin_us = Common::VitaMicros();
     {
         const CompilingMarker compiling{BadSource{key.hash_city, key.hash_fnv},
                                         static_cast<u32>(profile),
@@ -1173,6 +1211,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
             sceIoClose(marker);
         }
     }
+    const unsigned long long card_us = marker_us + (Common::VitaMicros() - marker_begin_us);
     if (g_worker_running && pthread_equal(pthread_self(), g_worker_thread)) {
         output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     } else {
@@ -1278,9 +1317,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     {
         // Aparte de las notas de la cache, que se gastan al arrancar (0.2.1.1):
         // es lo que tarda en aparecer un modelo con los shaders asincronos.
-        static u32 time_notes = 0;
-        if (time_notes < 60) {
-            time_notes++;
+        if (g_time_notes.fetch_add(1, std::memory_order_relaxed) < 60) {
             SceKernelThreadInfo info_after{};
             info_after.size = sizeof(info_after);
             std::string cpu = "-";
@@ -1292,9 +1329,9 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
             }
             Common::VitaNote("gxm compila",
                              fmt::format("{}: compilado en {} ms (CPU {}; {} reservas, {} MB "
-                                         "pedidos)",
+                                         "pedidos; tarjeta antes {} ms)",
                                          name, compile_ms, cpu, g_alloc_calls,
-                                         g_alloc_total >> 20)
+                                         g_alloc_total >> 20, card_us / 1000)
                                  .c_str());
         }
     }
@@ -1421,8 +1458,9 @@ void* CgWorkerMain(void*) {
             if (job->profile == SCE_SHACCCG_PROFILE_VP && CgPoisoned()) {
                 break;
             }
+            const char* name = i < job->names.size() ? job->names[i] : job->name;
             const SceShaccCgCompileOutput* output =
-                CompileCg(job->profile, job->name, job->sources[i].c_str());
+                CompileCg(job->profile, name, job->sources[i].c_str());
             if (output != nullptr) {
                 job->output = output;
                 job->used_variant = job->variants[i];

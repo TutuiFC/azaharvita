@@ -54,9 +54,27 @@ const char* BaseName(const char* path) {
     }
     return base;
 }
+
+/// Las carpetas de crash.txt, creadas una vez (eran dos sceIoMkdir por nota).
+std::atomic<bool> g_log_dirs_ready{false};
+
+/**
+ * LO QUE CUESTA ESCRIBIR UNA NOTA (0.3.1.4). Cada una abre, escribe y cierra
+ * dos ficheros en la tarjeta, desde el hilo que la pide: el de la GPU escribe
+ * las del overlay cada 10 s y el de compilacion tres por shader. En crash.txt
+ * de Kirby las compilaciones de 0,6 s de CPU tardaban 1-2,4 s de reloj, y si es
+ * la tarjeta, aqui sale: cada kNoteReport notas, una linea con su tiempo.
+ */
+constexpr unsigned int kNoteReport = 64;
+std::atomic<unsigned int> g_note_count{0};
+std::atomic<unsigned long long> g_note_us{0};
+std::atomic<unsigned long long> g_note_max_us{0};
+
+void WriteLogLine(const char* line, std::size_t n);
 } // Anonymous namespace
 
 void VitaNote(const char* title, const char* detail) {
+    const unsigned long long begin = VitaMicros();
     // La linea entera se monta en un buffer y se escribe de UNA sola vez.
     //
     // Antes esto hacia cuatro sceIoWrite seguidos (titulo, ": ", detalle, salto
@@ -90,9 +108,40 @@ void VitaNote(const char* title, const char* detail) {
     }
     append(detail, sizeof(line));
     line[n++] = '\n';
+    WriteLogLine(line, n);
 
-    sceIoMkdir("ux0:/data", 0777);
-    sceIoMkdir("ux0:/data/azahar", 0777);
+    const unsigned long long spent = VitaMicros() - begin;
+    g_note_us.fetch_add(spent, std::memory_order_relaxed);
+    unsigned long long worst = g_note_max_us.load(std::memory_order_relaxed);
+    while (spent > worst &&
+           !g_note_max_us.compare_exchange_weak(worst, spent, std::memory_order_relaxed)) {
+    }
+    if (g_note_count.fetch_add(1, std::memory_order_relaxed) % kNoteReport != kNoteReport - 1) {
+        return;
+    }
+    // Sin snprintf, como el resto de este fichero.
+    char report[96] = "notas: ";
+    std::size_t r = std::strlen(report);
+    r += AppendUInt(report + r, kNoteReport);
+    std::memcpy(report + r, " en ", 4);
+    r += 4;
+    r += AppendUInt(report + r,
+                    static_cast<unsigned int>(g_note_us.exchange(0, std::memory_order_relaxed) / 1000));
+    std::memcpy(report + r, " ms, la peor ", 13);
+    r += 13;
+    r += AppendUInt(report + r, static_cast<unsigned int>(
+                                    g_note_max_us.exchange(0, std::memory_order_relaxed) / 1000));
+    std::memcpy(report + r, " ms\n", 4);
+    r += 4;
+    WriteLogLine(report, r);
+}
+
+namespace {
+void WriteLogLine(const char* line, std::size_t n) {
+    if (!g_log_dirs_ready.exchange(true, std::memory_order_relaxed)) {
+        sceIoMkdir("ux0:/data", 0777);
+        sceIoMkdir("ux0:/data/azahar", 0777);
+    }
     const SceUID fd = sceIoOpen(kCrashLog, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     if (fd >= 0) {
         sceIoWrite(fd, line, n);
@@ -107,6 +156,7 @@ void VitaNote(const char* title, const char* detail) {
         }
     }
 }
+} // Anonymous namespace
 
 void SetVitaGameLog(const char* path) {
     if (path == nullptr) {

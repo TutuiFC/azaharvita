@@ -6,11 +6,27 @@
 #include <array>
 #include "audio_core/codec.h"
 #include "audio_core/hle/common.h"
+#include "audio_core/hle/dsp_stats.h"
 #include "audio_core/hle/source.h"
 #include "audio_core/interpolate.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/vita_diag.h"
 #include "core/memory.h"
+
+namespace {
+/// Mide una decodificacion de buffer para AudioCore::HLE::Stats.
+struct DecodeTimer {
+    explicit DecodeTimer(std::size_t samples) {
+        AudioCore::HLE::Stats::decoded.fetch_add(samples, std::memory_order_relaxed);
+    }
+    ~DecodeTimer() {
+        AudioCore::HLE::Stats::decode_us.fetch_add(Common::VitaMicros() - begin,
+                                                   std::memory_order_relaxed);
+    }
+    unsigned long long begin = Common::VitaMicros();
+};
+} // Anonymous namespace
 
 namespace AudioCore::HLE {
 
@@ -262,14 +278,33 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
                 UNIMPLEMENTED_MSG("{} not handled for partial buffer updates", "PCM8");
                 // state.current_buffer = Codec::DecodePCM8(num_channels, memory, config.length);
                 break;
-            case Format::PCM16:
-                state.current_buffer = Codec::DecodePCM16(num_channels, memory, config.length);
+            case Format::PCM16: {
+                /**
+                 * SOLO LO QUE QUEDA POR SONAR (0.3.1.4). Se decodificaba el
+                 * buffer entero desde el principio y despues se tiraba lo ya
+                 * sonado (ver abajo), en cada alargamiento: con un buffer que se
+                 * va alargando a medio sonar, cada vez mas trabajo para nada. Lo
+                 * mismo que deja lo de abajo, sin decodificar lo que tira. Si el
+                 * buffer se queda mas corto que lo sonado, entero, como antes.
+                 */
+                const u32 length = config.length;
+                const bool restart = state.current_sample_number > length;
+                const u32 skip = restart ? 0 : state.current_sample_number;
+                {
+                    const DecodeTimer timer{length - skip};
+                    state.current_buffer = Codec::DecodePCM16(
+                        num_channels, memory + std::size_t{skip} * num_channels * sizeof(s16),
+                        length - skip);
+                }
+                if (restart) {
+                    state.current_sample_number = 0;
+                }
                 state.current_buffer_length = config.length;
                 state.current_buffer_mono_or_stereo = state.mono_or_stereo;
                 state.current_buffer_format = state.format;
                 state.current_buffer_is_looping = config.is_looping != 0;
-                valid = true;
                 break;
+            }
             case Format::ADPCM:
                 // TODO(xperia64): Are partial embedded buffer updates even valid for ADPCM? What
                 // about the adpcm state?
@@ -413,6 +448,7 @@ void Source::GenerateFrame() {
 
         if (memory) {
             const u32 remaining_samples = state.current_buffer_length - state.current_sample_number;
+            const DecodeTimer timer{0};
             /**
              * SOLO LO QUE ESTE FOTOGRAMA PUEDE CONSUMIR, Y EN SU SITIO (0.2.2.3).
              * Esto decodificaba TODO lo que quedaba del buffer en una deque nueva
@@ -505,6 +541,7 @@ bool Source::DequeueBuffer() {
     const u8* const memory = memory_system->GetPhysicalPointer(buf.physical_address & 0xFFFFFFFC);
     if (memory) {
         const unsigned num_channels = buf.mono_or_stereo == MonoOrStereo::Stereo ? 2 : 1;
+        const DecodeTimer timer{buf.length};
         switch (buf.format) {
         case Format::PCM8:
             state.current_buffer = Codec::DecodePCM8(num_channels, memory, buf.length);

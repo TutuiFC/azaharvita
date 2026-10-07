@@ -34,11 +34,14 @@ extern std::atomic<bool> g_allow_vs_escapes;
  *   kCgFloatAddress: registros de direccion y calculo del indice en float,
  *                    sin enteros ni operaciones de bits.
  *   kCgFlat:         todas las subrutinas en linea dentro de exec_shader.
+ *   kCgRelCache:     cada lectura de uniform con registro de direccion se hace
+ *                    una vez y se reutiliza (0.3.1.4, ver RelRead en el .cpp).
  * Lo elige HwShaderCache en rasterizer_gxm.cpp, probando en orden si el
  * compilador se rompe (y se recupera entre medias, ver gxm_cg.cpp).
  */
 constexpr u32 kCgFloatAddress = 1;
 constexpr u32 kCgFlat = 2;
+constexpr u32 kCgRelCache = 4;
 extern std::atomic<u32> g_cg_variant;
 
 /**

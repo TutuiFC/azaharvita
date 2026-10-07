@@ -238,6 +238,8 @@ void DecodeTileRow(const u8* row_source, const Pica::Texture::TextureInfo& info,
 
 } // Anonymous namespace
 
+std::array<std::atomic<u32>, TextureCache::kRejectCount> TextureCache::rejects{};
+
 TextureCache::TextureCache() = default;
 TextureCache::~TextureCache() = default;
 
@@ -284,6 +286,41 @@ void TextureCache::Clear() {
     for (auto& entry : entries) {
         Retire(entry);
     }
+}
+
+const SceGxmTexture* TextureCache::ConstantTexture(bool opaque) {
+    if (!constant_texels.Valid()) {
+        if (constant_failed) {
+            return nullptr;
+        }
+        // 8x8 y no 1x1: el paso de una textura lineal va en multiplos de 8
+        // texeles. La transparente en los primeros 256 bytes, la negra detras.
+        Allocation texels = Allocate(Pool::Host, 4096);
+        if (!texels.Valid()) {
+            constant_failed = true;
+            return nullptr;
+        }
+        auto* words = static_cast<u32*>(texels.Data());
+        for (u32 i = 0; i < 64; i++) {
+            words[i] = 0;
+            words[64 + i] = 0xFF000000u;
+        }
+        for (u32 i = 0; i < 2; i++) {
+            SceGxmTexture& texture = constant_textures[i];
+            if (sceGxmTextureInitLinear(&texture, words + 64 * i,
+                                        SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 8, 8, 1) < 0) {
+                constant_failed = true;
+                return nullptr;
+            }
+            sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+            sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+            sceGxmTextureSetMipFilter(&texture, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+            sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_REPEAT);
+            sceGxmTextureSetVAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_REPEAT);
+        }
+        constant_texels = std::move(texels);
+    }
+    return &constant_textures[opaque ? 1 : 0];
 }
 
 u32 TextureCache::InvalidateRange(PAddr addr, u32 size) {
@@ -417,13 +454,6 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
         config = &texturing.texture0;
         format = texturing.texture0_format;
         enabled = texturing.main_config.texture0_enable;
-        // La unidad 0 tiene tipo (2D, proyeccion, cubo, sombra). El resto no.
-        // Proyectada es una textura 2D normal: lo que cambia es la coordenada
-        // (dividida por w en el shader), no la imagen. Cubo y sombra no.
-        if (config->type != TexturingRegs::TextureConfig::Texture2D &&
-            config->type != TexturingRegs::TextureConfig::Projection2D) {
-            return nullptr;
-        }
         break;
     case 1:
         config = &texturing.texture1;
@@ -438,13 +468,32 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     default:
         return nullptr;
     }
-    if (!enabled) {
-        // Una unidad apagada vale (0,0,0,0) en el rasterizador de software: su
-        // array de colores arranca a cero y la rama de la unidad apagada no lo
-        // toca. El generador de shaders todavia no reproduce eso -- declara el
-        // sampler y muestrea igual -- asi que mejor caer a software que pintar
-        // otra cosa. Arreglarlo pide que la configuracion del shader lleve que
-        // unidades estan encendidas, y hoy solo lleva la 0.
+    /**
+     * LAS UNIDADES SIN TEXTURA, EN LA GPU (0.3.1.4). El rasterizador de
+     * software (TextureColor) deja (0,0,0,0) en una unidad apagada y en la 0
+     * con tipo "Disabled" (su array de colores arranca a cero y esas ramas no
+     * lo tocan), y pone (0,0,0,255) en una con la direccion a cero. El shader
+     * de fragmentos declara el sampler y muestrea igual, y hasta ahora el lote
+     * entero iba a software, con la superficie bajada a la memoria y vuelta a
+     * subir ("estado" y "lote soft" en crash.txt). Una textura con todos sus
+     * texeles de ese color da lo mismo en cualquier coordenada y con cualquier
+     * filtro.
+     */
+    if (!enabled || config->address == 0 ||
+        (unit == 0 && config->type == TexturingRegs::TextureConfig::Disabled)) {
+        // En el orden de TextureColor: la direccion se mira antes que el tipo.
+        const SceGxmTexture* constant = ConstantTexture(enabled && config->address == 0);
+        if (constant != nullptr) {
+            rejects[kServedDisabled].fetch_add(1, std::memory_order_relaxed);
+        }
+        return constant;
+    }
+    // La unidad 0 tiene tipo (2D, proyeccion, cubo, sombra). El resto no.
+    // Proyectada es una textura 2D normal: lo que cambia es la coordenada
+    // (dividida por w en el shader), no la imagen. Cubo y sombra no.
+    if (unit == 0 && config->type != TexturingRegs::TextureConfig::Texture2D &&
+        config->type != TexturingRegs::TextureConfig::Projection2D) {
+        rejects[kRejectType].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
 
@@ -470,6 +519,7 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     SceGxmTextureAddrMode wrap_s{};
     SceGxmTextureAddrMode wrap_t{};
     if (!MapWrap(config->wrap_s.Value(), &wrap_s) || !MapWrap(config->wrap_t.Value(), &wrap_t)) {
+        rejects[kRejectWrap].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
 
@@ -539,11 +589,13 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     const u32 width = info.width;
     const u32 height = info.height;
     if (width == 0 || height == 0 || width > 1024 || height > 1024) {
+        rejects[kRejectSize].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     const PAddr address = info.physical_address;
     const u8* source = memory.GetPhysicalPointer(address);
     if (source == nullptr) {
+        rejects[kRejectMemory].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     // Filas de mosaicos redondeando hacia ARRIBA. Con height/8, un alto que no
@@ -551,12 +603,14 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     // la decodificacion la leia igual.
     const u32 span = static_cast<u32>(info.stride) * ((height + 7) / 8);
     if (span == 0) {
+        rejects[kRejectSize].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     // El tramo entero tiene que estar mapeado y contiguo: la decodificacion
     // recorre todos los texeles, no solo los que el juego llegue a muestrear.
     const u8* last = memory.GetPhysicalPointer(address + span - 1);
     if (last != source + span - 1) {
+        rejects[kRejectMemory].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
 
@@ -573,6 +627,7 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     }
     if (!buffer.Valid()) {
         LOG_ERROR(Render, "GXM: sin memoria para decodificar una textura de {}x{}", width, height);
+        rejects[kRejectGpuMemory].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
 
