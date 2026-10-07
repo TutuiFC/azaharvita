@@ -143,7 +143,6 @@ private:
     bool mixer_stop = false;
     /// Hay un tick mezclado esperando a publicarse (ver PublishMix).
     bool mixer_publish = false;
-    std::size_t mixer_write_region = 0;
     std::array<HLE::SourceStatus::Status, HLE::num_sources> mixer_statuses{};
     HLE::DspStatus mixer_dsp_status{};
     HLE::IntermediateMixSamples mixer_read_samples{};
@@ -604,8 +603,11 @@ void DspHle::Impl::MixerMain() {
 }
 
 void DspHle::Impl::PublishMix() {
-    HLE::SharedMemory& write =
-        mixer_write_region == 0 ? dsp_memory->region_0 : dsp_memory->region_1;
+    // En la region de salida de AHORA, no en la del tick en que se leyo: entre
+    // medias el juego ha recibido la interrupcion anterior y ha cambiado de
+    // region, y busca los estados donde los dejaria el DSP en este momento.
+    // En la de antes, Pokemon Sol se quedaba esperando un buffer al arrancar.
+    HLE::SharedMemory& write = WriteRegion();
     for (std::size_t i = 0; i < HLE::num_sources; i++) {
         write.source_statuses.status[i] = mixer_statuses[i];
     }
@@ -635,7 +637,6 @@ bool DspHle::Impl::TickAsync() {
     }
     const std::size_t read_index = CurrentRegionIndex();
     HLE::SharedMemory& read = read_index == 0 ? dsp_memory->region_0 : dsp_memory->region_1;
-    mixer_write_region = read_index == 0 ? 1 : 0;
     for (std::size_t i = 0; i < HLE::num_sources; i++) {
         sources[i].Parse(read.source_configurations.config[i], read.adpcm_coefficients.coeff[i]);
     }
