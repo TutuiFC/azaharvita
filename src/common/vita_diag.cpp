@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <mutex>
+#include <pthread.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/cpu.h>
@@ -59,22 +61,136 @@ const char* BaseName(const char* path) {
 std::atomic<bool> g_log_dirs_ready{false};
 
 /**
- * LO QUE CUESTA ESCRIBIR UNA NOTA (0.3.1.4). Cada una abre, escribe y cierra
- * dos ficheros en la tarjeta, desde el hilo que la pide: el de la GPU escribe
- * las del overlay cada 10 s y el de compilacion tres por shader. En crash.txt
- * de Kirby las compilaciones de 0,6 s de CPU tardaban 1-2,4 s de reloj, y si es
- * la tarjeta, aqui sale: cada kNoteReport notas, una linea con su tiempo.
+ * LAS NOTAS, DESDE UN HILO APARTE (0.3.1.5). crash.txt de 0.3.1.4: "notas: 64
+ * en 2,7-3,9 s, la peor 100-450 ms". Cada nota abria, escribia y cerraba dos
+ * ficheros en la tarjeta desde el hilo que la pedia: el de la GPU escribe
+ * trece cada 10 s (el overlay), con el juego esperandole, y el de compilacion
+ * tres por shader. Ahora, con una partida en marcha (SetVitaGameLog), la linea
+ * se copia a g_ring y NoteWriterMain las escribe todas juntas, con una sola
+ * apertura por fichero, cada kNoteFlushUs. Antes de la primera partida, o si
+ * el anillo esta lleno o el cerrojo no llega enseguida, se escribe aqui mismo
+ * como antes. Una caida pierde, como mucho, lo de ese ultimo intervalo.
  */
-constexpr unsigned int kNoteReport = 64;
-std::atomic<unsigned int> g_note_count{0};
-std::atomic<unsigned long long> g_note_us{0};
-std::atomic<unsigned long long> g_note_max_us{0};
+constexpr std::size_t kRingBytes = 64 * 1024;
+constexpr unsigned int kNoteFlushUs = 50 * 1000;
+char g_ring[kRingBytes];
+std::size_t g_ring_used = 0;
+std::atomic_flag g_ring_lock = ATOMIC_FLAG_INIT;
+std::atomic<bool> g_writer_running{false};
+/// Quien escribe en los ficheros: el hilo y SetVitaGameLog, que vacia el
+/// anillo en el crash.txt de la partida que se cierra antes de cambiarlo.
+std::mutex g_write_mutex;
+char g_batch[kRingBytes];
+
+/// Cada kNoteReport lineas escritas por el hilo, una con lo que ha costado.
+constexpr unsigned int kNoteReport = 256;
+unsigned int g_report_lines = 0;
+unsigned int g_report_writes = 0;
+unsigned long long g_report_us = 0;
+unsigned long long g_report_max_us = 0;
 
 void WriteLogLine(const char* line, std::size_t n);
+
+bool LockRing(unsigned int max_spins) {
+    for (unsigned int spins = 0; g_ring_lock.test_and_set(std::memory_order_acquire); spins++) {
+        if (spins >= max_spins) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TryEnqueue(const char* line, std::size_t n) {
+    if (!g_writer_running.load(std::memory_order_acquire) || !LockRing(20000)) {
+        return false;
+    }
+    const bool fits = g_ring_used + n <= kRingBytes;
+    if (fits) {
+        std::memcpy(g_ring + g_ring_used, line, n);
+        g_ring_used += n;
+    }
+    g_ring_lock.clear(std::memory_order_release);
+    return fits;
+}
+
+/// Escribe lo encolado. Con g_write_mutex cogido.
+void DrainRing() {
+    // Durmiendo entre intentos: quien tiene el cerrojo puede ser un hilo de
+    // menos prioridad en este mismo nucleo, y girando no le dejaria acabar.
+    while (!LockRing(1000)) {
+        sceKernelDelayThread(100);
+    }
+    const std::size_t n = g_ring_used;
+    std::memcpy(g_batch, g_ring, n);
+    g_ring_used = 0;
+    g_ring_lock.clear(std::memory_order_release);
+    if (n == 0) {
+        return;
+    }
+    const unsigned long long begin = VitaMicros();
+    WriteLogLine(g_batch, n);
+    const unsigned long long spent = VitaMicros() - begin;
+    g_report_writes++;
+    g_report_us += spent;
+    g_report_max_us = std::max(g_report_max_us, spent);
+    g_report_lines += static_cast<unsigned int>(std::count(g_batch, g_batch + n, '\n'));
+    if (g_report_lines < kNoteReport) {
+        return;
+    }
+    // Sin snprintf, como el resto de este fichero.
+    char report[128] = "notas: ";
+    std::size_t r = std::strlen(report);
+    const auto text = [&](const char* piece) {
+        const std::size_t len = std::strlen(piece);
+        std::memcpy(report + r, piece, len);
+        r += len;
+    };
+    r += AppendUInt(report + r, g_report_lines);
+    text(" lineas en ");
+    r += AppendUInt(report + r, g_report_writes);
+    text(" escrituras, ");
+    r += AppendUInt(report + r, static_cast<unsigned int>(g_report_us / 1000));
+    text(" ms de tarjeta, la peor ");
+    r += AppendUInt(report + r, static_cast<unsigned int>(g_report_max_us / 1000));
+    text(" ms\n");
+    WriteLogLine(report, r);
+    g_report_lines = 0;
+    g_report_writes = 0;
+    g_report_us = 0;
+    g_report_max_us = 0;
+}
+
+void* NoteWriterMain(void*) {
+    // Por encima del compilador de shaders, que comparte nucleo y pasa
+    // minutos sin soltarlo, y por debajo de todo lo demas.
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), kVitaPriorityBackground - 1);
+    while (true) {
+        sceKernelDelayThread(kNoteFlushUs);
+        const std::lock_guard lock{g_write_mutex};
+        DrainRing();
+    }
+    return nullptr;
+}
+
+void StartNoteWriter() {
+    static bool started = false;
+    if (started) {
+        return;
+    }
+    started = true;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64 * 1024);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, &NoteWriterMain, nullptr) == 0) {
+        pthread_detach(thread);
+        g_writer_running.store(true, std::memory_order_release);
+    }
+    pthread_attr_destroy(&attr);
+}
 } // Anonymous namespace
 
 void VitaNote(const char* title, const char* detail) {
-    const unsigned long long begin = VitaMicros();
     // La linea entera se monta en un buffer y se escribe de UNA sola vez.
     //
     // Antes esto hacia cuatro sceIoWrite seguidos (titulo, ": ", detalle, salto
@@ -108,32 +224,9 @@ void VitaNote(const char* title, const char* detail) {
     }
     append(detail, sizeof(line));
     line[n++] = '\n';
-    WriteLogLine(line, n);
-
-    const unsigned long long spent = VitaMicros() - begin;
-    g_note_us.fetch_add(spent, std::memory_order_relaxed);
-    unsigned long long worst = g_note_max_us.load(std::memory_order_relaxed);
-    while (spent > worst &&
-           !g_note_max_us.compare_exchange_weak(worst, spent, std::memory_order_relaxed)) {
+    if (!TryEnqueue(line, n)) {
+        WriteLogLine(line, n);
     }
-    if (g_note_count.fetch_add(1, std::memory_order_relaxed) % kNoteReport != kNoteReport - 1) {
-        return;
-    }
-    // Sin snprintf, como el resto de este fichero.
-    char report[96] = "notas: ";
-    std::size_t r = std::strlen(report);
-    r += AppendUInt(report + r, kNoteReport);
-    std::memcpy(report + r, " en ", 4);
-    r += 4;
-    r += AppendUInt(report + r,
-                    static_cast<unsigned int>(g_note_us.exchange(0, std::memory_order_relaxed) / 1000));
-    std::memcpy(report + r, " ms, la peor ", 13);
-    r += 13;
-    r += AppendUInt(report + r, static_cast<unsigned int>(
-                                    g_note_max_us.exchange(0, std::memory_order_relaxed) / 1000));
-    std::memcpy(report + r, " ms\n", 4);
-    r += 4;
-    WriteLogLine(report, r);
 }
 
 namespace {
@@ -159,12 +252,18 @@ void WriteLogLine(const char* line, std::size_t n) {
 } // Anonymous namespace
 
 void SetVitaGameLog(const char* path) {
-    if (path == nullptr) {
-        g_game_log[0] = '\0';
-        return;
+    {
+        // Lo encolado es de la partida que se cierra: a su fichero.
+        const std::lock_guard lock{g_write_mutex};
+        DrainRing();
+        if (path == nullptr) {
+            g_game_log[0] = '\0';
+            return;
+        }
+        std::strncpy(g_game_log, path, sizeof(g_game_log) - 1);
+        g_game_log[sizeof(g_game_log) - 1] = '\0';
     }
-    std::strncpy(g_game_log, path, sizeof(g_game_log) - 1);
-    g_game_log[sizeof(g_game_log) - 1] = '\0';
+    StartNoteWriter();
 }
 
 const char* VitaGameLog() {
@@ -191,6 +290,10 @@ void VitaAssertFail(const char* file, int line) noexcept {
     g_last_fatal[n] = 0;
 
     VitaNote("ASSERT", g_last_fatal);
+    {
+        const std::lock_guard lock{g_write_mutex};
+        DrainRing();
+    }
 
     // El texto del assert ya esta unas lineas mas arriba en el mismo fichero:
     // lo escribio LOG_CRITICAL al pasar por FmtLogMessageImpl. Aqui solo queda

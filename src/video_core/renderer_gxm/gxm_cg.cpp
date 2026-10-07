@@ -313,6 +313,18 @@ std::mutex g_preload_mutex;
 std::unordered_map<std::string, std::vector<u8>> g_preloaded;
 std::unordered_set<std::string> g_game_list;
 std::string g_game_list_path;
+/**
+ * LO QUE HAY EN LA CARPETA DE LA CACHE, EN MEMORIA (0.3.1.5). Lo que no esta
+ * precargado se buscaba con sceIoOpen, y casi siempre no esta (es un shader
+ * nuevo): en una carpeta de mas de mil ficheros y con esta tarjeta, decenas de
+ * ms por intento, y cada programa nuevo prueba dos. crash.txt de 0.3.1.4 en
+ * Pokemon Sol: "vs nuevos 72 (8692 ms, traducir 2719 ms)", en el hilo de la
+ * GPU. PreloadCgCache lista la carpeta una vez por juego (tambien con
+ * g_preload_mutex) y lo que no aparece ahi no se abre; StoreCached apunta lo
+ * que escribe.
+ */
+std::unordered_set<std::string> g_card_files;
+bool g_card_index_ready = false;
 
 /// Apunta el fichero en la lista del juego, una vez.
 void RememberForGame(const std::string& path) {
@@ -381,6 +393,9 @@ const SceShaccCgCompileOutput* LoadCached(const CacheHeader& want, const std::st
             if (const SceShaccCgCompileOutput* output = FromPreloaded(want, it->second)) {
                 return output;
             }
+        }
+        if (g_card_index_ready && g_card_files.count(path) == 0) {
+            return nullptr;
         }
     }
     const SceShaccCgCompileOutput* output = LoadCachedFromCard(want, path);
@@ -525,6 +540,10 @@ void StoreCached(CacheHeader header, const std::string& path,
         // A medias no sirve: que la proxima vez se compile.
         sceIoRemove(path.c_str());
         return;
+    }
+    {
+        const std::lock_guard lock{g_preload_mutex};
+        g_card_files.insert(path);
     }
     RememberForGame(path);
 }
@@ -1047,6 +1066,27 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
     Common::VitaNote("gxm cache", fmt::format("precarga: {} de {} shaders, {} KB", loaded, total,
                                               total_bytes / 1024)
                                       .c_str());
+    {
+        const unsigned long long list_begin = Common::VitaMicros();
+        std::unordered_set<std::string> files;
+        const SceUID dir = sceIoDopen(kCacheDir);
+        if (dir >= 0) {
+            SceIoDirent entry{};
+            while (sceIoDread(dir, &entry) > 0) {
+                files.insert(fmt::format("{}/{}", kCacheDir, entry.d_name));
+            }
+            sceIoDclose(dir);
+        }
+        const std::size_t count = files.size();
+        {
+            const std::lock_guard lock{g_preload_mutex};
+            g_card_files = std::move(files);
+            g_card_index_ready = dir >= 0;
+        }
+        Common::VitaNote("gxm cache", fmt::format("carpeta: {} ficheros en {} ms", count,
+                                                  (Common::VitaMicros() - list_begin) / 1000)
+                                          .c_str());
+    }
     return loaded;
 }
 

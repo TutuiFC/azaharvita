@@ -31,7 +31,12 @@ DspStatus Mixers::Tick(DspConfiguration& config, const IntermediateMixSamples& r
                        IntermediateMixSamples& write_samples,
                        const std::array<QuadFrame32, 3>& input) {
     ParseConfig(config);
+    return Mix(read_samples, write_samples, input);
+}
 
+DspStatus Mixers::Mix(const IntermediateMixSamples& read_samples,
+                      IntermediateMixSamples& write_samples,
+                      const std::array<QuadFrame32, 3>& input) {
     AuxReturn(read_samples);
     AuxSend(write_samples, input);
 

@@ -24,5 +24,7 @@ inline std::atomic<unsigned long long> ticks{0};
 inline std::atomic<unsigned long long> active{0};
 inline std::atomic<unsigned long long> decode_us{0};
 inline std::atomic<unsigned long long> decoded{0};
+/// Lo que tarda la mezcla en el hilo del DSP (0.3.1.5), fuera del de emulacion.
+inline std::atomic<unsigned long long> worker_us{0};
 
 } // namespace AudioCore::HLE::Stats

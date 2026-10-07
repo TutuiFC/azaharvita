@@ -60,6 +60,14 @@ public:
                               const s16_le (&adpcm_coeffs)[16]);
 
     /**
+     * Tick en dos mitades (0.3.1.5, ver DspHle::Impl::TickAsync): Parse lee la
+     * configuracion del juego y limpia sus marcas, en el hilo de emulacion, y
+     * Generate hace el fotograma, que puede ir en otro hilo.
+     */
+    void Parse(SourceConfiguration::Configuration& config, const s16_le (&adpcm_coeffs)[16]);
+    SourceStatus::Status Generate();
+
+    /**
      * Mix this source's output into dest, using the gains for the `intermediate_mix_id`-th
      * intermediate mixer.
      * @param dest The QuadFrame32 to mix into.

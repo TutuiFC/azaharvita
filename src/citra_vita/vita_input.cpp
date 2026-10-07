@@ -183,6 +183,17 @@ void ApplyDefaultMapping() {
     Common::ParamPackage motion;
     motion.Set("engine", kEngineName);
     profile.motion_device = motion.Serialize();
+
+    /**
+     * EL TACTIL (0.3.1.5). EmuWindow_Vita lee el panel y se lo da al estado
+     * tactil de EmuWindow, pero el HID del 3DS solo lo consulta a traves del
+     * dispositivo que nombra el perfil, y aqui no se nombraba ninguno: vacio es
+     * el dispositivo nulo, que nunca esta pulsado. En escritorio lo pone la
+     * configuracion ("engine:emu_window", la fabrica que registra EmuWindow).
+     */
+    Common::ParamPackage touch;
+    touch.Set("engine", "emu_window");
+    profile.touch_device = touch.Serialize();
 }
 
 } // namespace VitaFrontend::Input

@@ -3,6 +3,9 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <pthread.h>
 
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/base_object.hpp>
@@ -85,6 +88,25 @@ private:
     bool Tick();
     void AudioTickCallback(s64 cycles_late);
 
+    /**
+     * LA MEZCLA EN OTRO NUCLEO (0.3.1.5). El DSP HLE corria entero en el hilo de
+     * emulacion, en cada tick de audio: crash.txt de 0.3.1.4, "dsp" de 25 ms por
+     * fotograma en Zelda: Ocarina of Time 3D (17-23 fuentes) y hasta 23 en New
+     * Super Mario Bros. 2, con el juego al 20 %. Ahora el tick lee la
+     * configuracion del juego y limpia sus marcas aqui (Source::Parse,
+     * Mixers::Parse, lo que hace el protocolo con el juego), y lo caro --
+     * decodificar, interpolar, filtrar y mezclar -- lo hace MixerMain en el
+     * nucleo 2 mientras el ARM sigue. Los estados, las muestras y la
+     * interrupcion de un tick se publican en el siguiente: la consola tambien
+     * tarda en mezclar, y aqui es un tick (unos 5 ms emulados).
+     */
+    bool TickAsync();
+    bool StartMixer();
+    void WaitMixer();
+    void PublishMix();
+    void MixerMain();
+    static void* MixerEntry(void* self);
+
     DspState dsp_state = DspState::Off;
     std::array<std::vector<u8>, num_dsp_pipe> pipe_data{};
 
@@ -111,8 +133,28 @@ private:
 
     std::function<void(Service::DSP::InterruptType type, DspPipe pipe)> interrupt_handler{};
 
+    bool mixer_started = false;
+    bool mixer_failed = false;
+    pthread_t mixer_thread{};
+    std::mutex mixer_mutex;
+    std::condition_variable mixer_cv;
+    bool mixer_request = false;
+    bool mixer_busy = false;
+    bool mixer_stop = false;
+    /// Hay un tick mezclado esperando a publicarse (ver PublishMix).
+    bool mixer_publish = false;
+    std::size_t mixer_write_region = 0;
+    std::array<HLE::SourceStatus::Status, HLE::num_sources> mixer_statuses{};
+    HLE::DspStatus mixer_dsp_status{};
+    HLE::IntermediateMixSamples mixer_read_samples{};
+    HLE::IntermediateMixSamples mixer_write_samples{};
+    std::array<bool, 2> mixer_aux_sent{};
+    StereoFrame16 mixer_frame{};
+
+public:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
+        WaitMixer();
         ar& boost::serialization::make_binary_object(backup_dsp_memory.raw_memory.data(),
                                                      backup_dsp_memory.raw_memory.size());
         ar & dsp_state;
@@ -143,6 +185,14 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
 
 DspHle::Impl::~Impl() {
     core_timing.UnscheduleEvent(tick_event, 0);
+    if (mixer_started) {
+        {
+            const std::lock_guard lock{mixer_mutex};
+            mixer_stop = true;
+        }
+        mixer_cv.notify_all();
+        pthread_join(mixer_thread, nullptr);
+    }
 }
 
 DspState DspHle::Impl::GetDspState() const {
@@ -233,6 +283,11 @@ void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
         // Waking up from sleep garbles some of the structs in the memory region. (TODO:
         // Implement this.) Applications store away the state of these structs before
         // sleeping and reset it back after wakeup on behalf of the DSP.
+
+        // El estado de las fuentes y del mezclador se toca abajo: con la mezcla
+        // del tick en curso acabada, y sin publicar la de un DSP que cambia.
+        WaitMixer();
+        mixer_publish = false;
 
         switch (static_cast<StateChange>(buffer[0])) {
         case StateChange::Initialize:
@@ -474,15 +529,149 @@ bool DspHle::Impl::Tick() {
     return is_on;
 }
 
+bool DspHle::Impl::StartMixer() {
+    if (mixer_started) {
+        return true;
+    }
+    if (mixer_failed) {
+        return false;
+    }
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    mixer_started = pthread_create(&mixer_thread, &attr, &MixerEntry, this) == 0;
+    mixer_failed = !mixer_started;
+    pthread_attr_destroy(&attr);
+    return mixer_started;
+}
+
+void* DspHle::Impl::MixerEntry(void* self) {
+    static_cast<Impl*>(self)->MixerMain();
+    return nullptr;
+}
+
+void DspHle::Impl::WaitMixer() {
+    if (!mixer_started) {
+        return;
+    }
+    std::unique_lock lock{mixer_mutex};
+    mixer_cv.wait(lock, [this] { return !mixer_busy; });
+}
+
+void DspHle::Impl::MixerMain() {
+#ifdef __PSVITA__
+    // El nucleo 2 es el del compilador de shaders, que va por debajo de todo.
+    Common::VitaPinThreadToUserCore(2, "dsp");
+    Common::VitaSetThreadPriority(Common::kVitaPriorityHelper, "dsp");
+#endif
+    while (true) {
+        {
+            std::unique_lock lock{mixer_mutex};
+            mixer_cv.wait(lock, [this] { return mixer_request || mixer_stop; });
+            if (mixer_stop) {
+                return;
+            }
+            mixer_request = false;
+        }
+#ifdef __PSVITA__
+        const unsigned long long begin = Common::VitaMicros();
+#endif
+        std::array<QuadFrame32, 3> intermediate_mixes = {};
+        u32 active = 0;
+        for (std::size_t i = 0; i < HLE::num_sources; i++) {
+            mixer_statuses[i] = sources[i].Generate();
+            active += mixer_statuses[i].is_enabled ? 1u : 0u;
+            for (std::size_t mix = 0; mix < 3; mix++) {
+                sources[i].MixInto(intermediate_mixes[mix], mix);
+            }
+        }
+        HLE::Stats::ticks.fetch_add(1, std::memory_order_relaxed);
+        HLE::Stats::active.fetch_add(active, std::memory_order_relaxed);
+        mixer_aux_sent = {mixers.AuxBusEnabled(0), mixers.AuxBusEnabled(1)};
+        mixer_dsp_status =
+            mixers.Mix(mixer_read_samples, mixer_write_samples, intermediate_mixes);
+        mixer_frame = mixers.GetOutput();
+        parent.OutputFrame(mixer_frame);
+#ifdef __PSVITA__
+        HLE::Stats::worker_us.fetch_add(Common::VitaMicros() - begin, std::memory_order_relaxed);
+#endif
+        {
+            const std::lock_guard lock{mixer_mutex};
+            mixer_busy = false;
+        }
+        mixer_cv.notify_all();
+    }
+}
+
+void DspHle::Impl::PublishMix() {
+    HLE::SharedMemory& write =
+        mixer_write_region == 0 ? dsp_memory->region_0 : dsp_memory->region_1;
+    for (std::size_t i = 0; i < HLE::num_sources; i++) {
+        write.source_statuses.status[i] = mixer_statuses[i];
+    }
+    write.dsp_status = mixer_dsp_status;
+    if (mixer_aux_sent[0]) {
+        write.intermediate_mix_samples.mix1 = mixer_write_samples.mix1;
+    }
+    if (mixer_aux_sent[1]) {
+        write.intermediate_mix_samples.mix2 = mixer_write_samples.mix2;
+    }
+    for (std::size_t samplei = 0; samplei < mixer_frame.size(); samplei++) {
+        for (std::size_t channeli = 0; channeli < mixer_frame[0].size(); channeli++) {
+            write.final_samples.pcm16[samplei][channeli] = s16_le(mixer_frame[samplei][channeli]);
+        }
+    }
+}
+
+bool DspHle::Impl::TickAsync() {
+    WaitMixer();
+    const bool signal = mixer_publish;
+    if (mixer_publish) {
+        PublishMix();
+        mixer_publish = false;
+    }
+    if (GetDspState() != DspState::On) {
+        return signal;
+    }
+    const std::size_t read_index = CurrentRegionIndex();
+    HLE::SharedMemory& read = read_index == 0 ? dsp_memory->region_0 : dsp_memory->region_1;
+    mixer_write_region = read_index == 0 ? 1 : 0;
+    for (std::size_t i = 0; i < HLE::num_sources; i++) {
+        sources[i].Parse(read.source_configurations.config[i], read.adpcm_coefficients.coeff[i]);
+    }
+    mixers.Parse(read.dsp_configuration);
+    mixer_read_samples = read.intermediate_mix_samples;
+    {
+        const std::lock_guard lock{mixer_mutex};
+        mixer_request = true;
+        mixer_busy = true;
+    }
+    mixer_cv.notify_all();
+    mixer_publish = true;
+    return signal;
+}
+
 void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
 #ifdef __PSVITA__
     const unsigned long long tick_begin = Common::VitaMicros();
-    const bool ticked = Tick();
-    Common::FrameStats::Add(Common::FrameStats::dsp_us, tick_begin);
-    if (ticked) {
-#else
-    if (Tick()) {
 #endif
+    bool ticked = false;
+    if (DspHle::async_mix.load(std::memory_order_relaxed) && StartMixer()) {
+        ticked = TickAsync();
+    } else {
+        // Apagado a media partida: lo que quedara del otro hilo, primero.
+        WaitMixer();
+        if (mixer_publish) {
+            PublishMix();
+            mixer_publish = false;
+            interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
+        }
+        ticked = Tick();
+    }
+#ifdef __PSVITA__
+    Common::FrameStats::Add(Common::FrameStats::dsp_us, tick_begin);
+#endif
+    if (ticked) {
         // TODO(merry): Signal all the other interrupts as appropriate.
         interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
     }
@@ -496,6 +685,8 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
     s64 adjusted_ticks = static_cast<s64>(audio_frame_ticks / time_scale - cycles_late);
     core_timing.ScheduleEvent(adjusted_ticks, tick_event);
 }
+
+std::atomic<bool> DspHle::async_mix{true};
 
 DspHle::DspHle(Core::System& system, Memory::MemorySystem& memory, Core::Timing& timing)
     : DspInterface(system), impl(std::make_unique<Impl>(*this, memory, timing)) {}

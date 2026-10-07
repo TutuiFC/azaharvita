@@ -53,6 +53,7 @@
 #include "video_core/gpu.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
+#include "audio_core/hle/hle.h"
 #include "video_core/renderer_gxm/rasterizer_gxm.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
 #include "video_core/shader/shader_neon_jit.h"
@@ -401,6 +402,9 @@ struct UserSettings {
     /// (Gxm::RasterizerGXM::vertex_ring_host). Solo ajustes.txt; vale al
     /// reservarlo, en el primer lote.
     bool vertex_ring_host = true;
+    /// 0.3.1.5: la mezcla del DSP en otro nucleo (AudioCore::DspHle::async_mix).
+    /// Solo ajustes.txt; vale desde el siguiente tick de audio.
+    bool dsp_thread = true;
 };
 UserSettings g_user;
 
@@ -498,6 +502,7 @@ void ApplyUserSettings() {
     Gxm::RasterizerGXM::async_vs.store(g_user.async_shaders ? 1u : 0u, std::memory_order_relaxed);
     Gxm::RasterizerGXM::vertex_ring_host.store(g_user.vertex_ring_host ? 1u : 0u,
                                                std::memory_order_relaxed);
+    AudioCore::DspHle::async_mix.store(g_user.dsp_thread, std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -566,6 +571,7 @@ void LoadUserSettings() {
     read_bool("jit_regs_fijos=", g_user.jit_global_regs);
     read_bool("jit_vfp_fijos=", g_user.jit_vfp_regs);
     read_bool("vertices_ram=", g_user.vertex_ring_host);
+    read_bool("dsp_hilo=", g_user.dsp_thread);
 }
 
 /// El contenido de ajustes.txt, una clave por linea.
@@ -577,7 +583,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
         "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
         "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\njit_parche=%d\n"
-        "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n",
+        "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n"
+        "dsp_hilo=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -587,7 +594,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.unlimited_speed ? 1 : 0, g_user.gpu_scale, g_user.async_shaders ? 1 : 0,
         g_user.jit_thumb ? 1 : 0, g_user.jit_link_patch ? 1 : 0,
         g_user.jit_superblocks ? 1 : 0, g_user.jit_global_regs ? 1 : 0,
-        g_user.jit_vfp_regs ? 1 : 0, g_user.vertex_ring_host ? 1 : 0);
+        g_user.jit_vfp_regs ? 1 : 0, g_user.vertex_ring_host ? 1 : 0,
+        g_user.dsp_thread ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin

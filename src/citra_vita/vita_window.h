@@ -337,6 +337,7 @@ private:
     /// Desglose del DSP (0.3.1.4, ver AudioCore::HLE::Stats).
     double stats_dsp_decode_ms = 0.0;
     double stats_dsp_sources = 0.0;
+    double stats_dsp_worker_ms = 0.0;
     double stats_instrs_per_vertex = 0.0;
     double stats_fast_percent = 0.0;
     unsigned int stats_close_full = 0;

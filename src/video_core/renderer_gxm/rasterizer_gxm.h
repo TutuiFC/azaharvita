@@ -321,6 +321,12 @@ public:
      * intervalo, con TakeCopySummary.
      */
     static std::array<RejectCount, 12> transfer_rejects;
+    /// La ultima copia rechazada por cada motivo de transfer_rejects (0.3.1.5):
+    /// la primera, la de la nota unica, suele ser del arranque y no la de cada
+    /// fotograma.
+    static std::array<std::array<char, 96>, 12> transfer_reject_detail;
+    /// La ultima superficie volcada al presentar (0.3.1.5), por lo mismo.
+    static std::array<char, 64> present_writeback_detail;
     enum WritebackSite : u32 {
         kWritebackTextureCopy,
         kWritebackPending,
@@ -510,6 +516,8 @@ private:
     /// direccion, y la copia llega antes de que la pantalla nueva se configure.
     /// Con las del ojo derecho desde 0.3.1.4 (ver IsDisplayFramebuffer).
     std::array<PAddr, 16> display_addresses{};
+    /// Cuando se vio cada una en la configuracion (VitaMicros), 0.3.1.5.
+    std::array<unsigned long long, 16> display_seen_us{};
     u32 display_address_next = 0;
     /// Escribe en la memoria del invitado lo que solo esta en la copia.
     void MaterializeCopy(ScreenCopy& copy);

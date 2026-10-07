@@ -25,6 +25,18 @@ public:
     DspStatus Tick(DspConfiguration& config, const IntermediateMixSamples& read_samples,
                    IntermediateMixSamples& write_samples, const std::array<QuadFrame32, 3>& input);
 
+    /// Tick en dos mitades (0.3.1.5), como Source::Parse y Source::Generate.
+    void Parse(DspConfiguration& config) {
+        ParseConfig(config);
+    }
+    DspStatus Mix(const IntermediateMixSamples& read_samples, IntermediateMixSamples& write_samples,
+                  const std::array<QuadFrame32, 3>& input);
+
+    /// Si AuxSend escribe la mezcla intermedia 'bus' (0 o 1) para el juego.
+    bool AuxBusEnabled(std::size_t bus) const {
+        return state.aux_bus_enable[bus];
+    }
+
     StereoFrame16 GetOutput() const {
         return current_frame;
     }

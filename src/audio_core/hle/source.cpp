@@ -32,8 +32,16 @@ namespace AudioCore::HLE {
 
 SourceStatus::Status Source::Tick(SourceConfiguration::Configuration& config,
                                   const s16_le (&adpcm_coeffs)[16]) {
-    ParseConfig(config, adpcm_coeffs);
+    Parse(config, adpcm_coeffs);
+    return Generate();
+}
 
+void Source::Parse(SourceConfiguration::Configuration& config,
+                   const s16_le (&adpcm_coeffs)[16]) {
+    ParseConfig(config, adpcm_coeffs);
+}
+
+SourceStatus::Status Source::Generate() {
     if (state.enabled) {
         GenerateFrame();
     }

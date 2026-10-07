@@ -52,6 +52,8 @@ std::atomic<u32> RasterizerGXM::hw_vs_rejects{0};
 std::atomic<const char*> RasterizerGXM::hw_vs_last_reject{"-"};
 std::array<RasterizerGXM::RejectCount, 12> RasterizerGXM::reject_counts{};
 std::array<RasterizerGXM::RejectCount, 12> RasterizerGXM::transfer_rejects{};
+std::array<std::array<char, 96>, 12> RasterizerGXM::transfer_reject_detail{};
+std::array<char, 64> RasterizerGXM::present_writeback_detail{};
 std::array<std::atomic<u32>, RasterizerGXM::kWritebackSites> RasterizerGXM::writeback_sites{};
 std::array<std::atomic<unsigned long long>, static_cast<u32>(RasterizerGXM::GpuWait::Count)>
     RasterizerGXM::gpu_wait_us{};
@@ -1679,10 +1681,50 @@ struct RasterizerGXM::PipelineCache {
             SceGxmBlendFactor alpha_src{};
             SceGxmBlendFactor alpha_dst{};
             const auto& factors = merger.alpha_blending;
-            const auto src_rgb = factors.factor_source_rgb.Value();
-            const auto dst_rgb = factors.factor_dest_rgb.Value();
-            const auto src_a = factors.factor_source_a.Value();
-            const auto dst_a = factors.factor_dest_a.Value();
+            /**
+             * UNA CONSTANTE DE 0 O DE 255 ES ZERO U ONE (0.3.1.5). El rasterizador
+             * de software multiplica por blend_const y divide por 255: con 255
+             * el resultado es exactamente el otro operando, y con 0 es cero.
+             * Zelda: Ocarina of Time 3D mezcla con "eq 0/0 fac 2/12 1/0"
+             * (destino por el alfa constante) y el alfa de la fuente hace falta,
+             * asi que no cabe en el alfa de la fuente: esos lotes iban a
+             * software ("fragmentos" en crash.txt de 0.3.1.4, con su volcado).
+             * En el color, la constante solo vale si sus tres canales son
+             * iguales; en el alfa cuenta el canal alfa.
+             */
+            const auto& constant = merger.blend_const;
+            const auto exact = [&constant](FramebufferRegs::BlendFactor factor, bool alpha_slot) {
+                using Factor = FramebufferRegs::BlendFactor;
+                u32 value = 0;
+                switch (factor) {
+                case Factor::ConstantColor:
+                case Factor::OneMinusConstantColor:
+                    if (alpha_slot) {
+                        value = constant.a;
+                    } else if (constant.r == constant.g && constant.g == constant.b) {
+                        value = constant.r;
+                    } else {
+                        return factor;
+                    }
+                    break;
+                case Factor::ConstantAlpha:
+                case Factor::OneMinusConstantAlpha:
+                    value = constant.a;
+                    break;
+                default:
+                    return factor;
+                }
+                if (value != 0 && value != 255) {
+                    return factor;
+                }
+                const bool inverted = factor == Factor::OneMinusConstantColor ||
+                                      factor == Factor::OneMinusConstantAlpha;
+                return (value == 255) != inverted ? Factor::One : Factor::Zero;
+            };
+            const auto src_rgb = exact(factors.factor_source_rgb.Value(), false);
+            const auto dst_rgb = exact(factors.factor_dest_rgb.Value(), false);
+            const auto src_a = exact(factors.factor_source_a.Value(), true);
+            const auto dst_a = exact(factors.factor_dest_a.Value(), true);
             bool mapped = false;
             if (!IsConstantFactor(src_rgb) && !IsConstantFactor(dst_rgb) &&
                 !IsConstantFactor(src_a) && !IsConstantFactor(dst_a)) {
@@ -1713,13 +1755,14 @@ struct RasterizerGXM::PipelineCache {
                 // Con los seis valores crudos en crash.txt se sabe CUAL de
                 // ellos no tiene equivalente (los factores constantes) sin
                 // gastar otra prueba en consola.
-                NoteOnce(noted[1], "gxm mezcla", "eq {}/{} fac {}/{} {}/{}",
+                NoteOnce(noted[1], "gxm mezcla", "eq {}/{} fac {}/{} {}/{} constante {:#010x}",
                          static_cast<u32>(merger.alpha_blending.blend_equation_rgb.Value()),
                          static_cast<u32>(merger.alpha_blending.blend_equation_a.Value()),
                          static_cast<u32>(merger.alpha_blending.factor_source_rgb.Value()),
                          static_cast<u32>(merger.alpha_blending.factor_dest_rgb.Value()),
                          static_cast<u32>(merger.alpha_blending.factor_source_a.Value()),
-                         static_cast<u32>(merger.alpha_blending.factor_dest_a.Value()));
+                         static_cast<u32>(merger.alpha_blending.factor_dest_a.Value()),
+                         static_cast<u32>(constant.raw));
                 return false;
             }
             blend.colorFunc = color_func;
@@ -2014,29 +2057,11 @@ private:
             program.reason = generator_reason != nullptr ? generator_reason : "vs traducir";
             return;
         }
-        if (const SceShaccCgCompileOutput* cached =
-                LoadCgCache(SCE_SHACCCG_PROFILE_VP, kName, first->c_str(), false)) {
-            Finish(program, cached, kCgFloatAddress);
-            return;
-        }
-        std::optional<std::string> shared = generate(kCgFloatAddress | kCgRelCache);
-        if (shared.has_value() && *shared == *first) {
-            shared.reset();
-        }
         for (const bool from_card : {false, true}) {
-            if (from_card) {
-                if (const SceShaccCgCompileOutput* cached =
-                        LoadCgCache(SCE_SHACCCG_PROFILE_VP, kName, first->c_str(), true)) {
-                    Finish(program, cached, kCgFloatAddress);
-                    return;
-                }
-            }
-            if (shared.has_value()) {
-                if (const SceShaccCgCompileOutput* cached = LoadCgCache(
-                        SCE_SHACCCG_PROFILE_VP, kSharedName, shared->c_str(), from_card)) {
-                    Finish(program, cached, kCgFloatAddress | kCgRelCache);
-                    return;
-                }
+            if (const SceShaccCgCompileOutput* cached =
+                    LoadCgCache(SCE_SHACCCG_PROFILE_VP, kName, first->c_str(), from_card)) {
+                Finish(program, cached, kCgFloatAddress);
+                return;
             }
         }
         /**
@@ -2076,6 +2101,21 @@ private:
             }
             program.reason = "vs demasiado grande";
             return;
+        }
+        // La de lecturas compartidas, despues del tope (0.3.1.5): un programa
+        // que no se va a compilar no necesita su segunda traduccion.
+        std::optional<std::string> shared = generate(kCgFloatAddress | kCgRelCache);
+        if (shared.has_value() && *shared == *first) {
+            shared.reset();
+        }
+        if (shared.has_value()) {
+            for (const bool from_card : {false, true}) {
+                if (const SceShaccCgCompileOutput* cached = LoadCgCache(
+                        SCE_SHACCCG_PROFILE_VP, kSharedName, shared->c_str(), from_card)) {
+                    Finish(program, cached, kCgFloatAddress | kCgRelCache);
+                    return;
+                }
+            }
         }
         auto job = std::make_shared<CgJob>();
         if (shared.has_value()) {
@@ -3058,15 +3098,21 @@ bool RasterizerGXM::IsDisplayFramebuffer(PAddr addr, u32 size, u32 row_bytes) {
      * no se presenta nunca, y si el juego lee esa memoria se escribe ahi como
      * cualquier otra copia (MaterializeCopy).
      */
+    const unsigned long long now = Common::VitaMicros();
     for (u32 i = 0; i < 2; i++) {
         const auto& framebuffer = pica.regs.framebuffer_config[i];
         for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2,
                                   framebuffer.address_right1, framebuffer.address_right2}) {
-            if (shown == 0 || std::find(display_addresses.begin(), display_addresses.end(),
-                                        shown) != display_addresses.end()) {
+            if (shown == 0) {
+                continue;
+            }
+            const auto it = std::find(display_addresses.begin(), display_addresses.end(), shown);
+            if (it != display_addresses.end()) {
+                display_seen_us[it - display_addresses.begin()] = now;
                 continue;
             }
             display_addresses[display_address_next] = shown;
+            display_seen_us[display_address_next] = now;
             display_address_next = (display_address_next + 1) % display_addresses.size();
         }
     }
@@ -3080,16 +3126,22 @@ bool RasterizerGXM::IsDisplayFramebuffer(PAddr addr, u32 size, u32 row_bytes) {
     if (size == 0 || row_bytes == 0) {
         return false;
     }
-    // Una pantalla que empieza mas abajo (ver QueryDirectPresent): solo las
-    // configuradas ahora, no las vistas alguna vez, que pueden ser de otro uso
-    // de esa memoria (el arranque deja las suyas en la VRAM).
-    for (u32 i = 0; i < 2; i++) {
-        const auto& framebuffer = pica.regs.framebuffer_config[i];
-        for (const PAddr shown : {framebuffer.address_left1, framebuffer.address_left2,
-                                  framebuffer.address_right1, framebuffer.address_right2}) {
-            if (shown > addr && shown < addr + size && (shown - addr) % row_bytes == 0) {
-                return true;
-            }
+    /**
+     * Una pantalla que empieza mas abajo (ver QueryDirectPresent): las vistas
+     * en la configuracion en el ultimo kRecentDisplayUs, no todas las vistas
+     * alguna vez, que pueden ser de otro uso de esa memoria (el arranque deja
+     * las suyas en la VRAM). Hasta 0.3.1.4, solo las configuradas en ese
+     * momento: New Super Mario Bros. 2 copia a 0x18000000 y 0x18300000 por
+     * turnos y presenta desde 0x2000 mas abajo, y la copia a la que no se
+     * estaba mostrando se iba a software ("no es pantalla" 35-51 de cada 10 s
+     * en crash.txt de 0.3.1.4, con su volcado esperando a la GPU).
+     */
+    constexpr unsigned long long kRecentDisplayUs = 1000000;
+    for (u32 i = 0; i < display_addresses.size(); i++) {
+        const PAddr shown = display_addresses[i];
+        if (shown != 0 && now - display_seen_us[i] < kRecentDisplayUs && shown > addr &&
+            shown < addr + size && (shown - addr) % row_bytes == 0) {
+            return true;
         }
     }
     return false;
@@ -3724,7 +3776,8 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
      * saber por que.
      */
     const auto reject = [&](const char* why) {
-        for (auto& slot : transfer_rejects) {
+        for (u32 i = 0; i < transfer_rejects.size(); i++) {
+            auto& slot = transfer_rejects[i];
             const char* reason = slot.reason.load(std::memory_order_relaxed);
             if (reason == nullptr) {
                 slot.reason.store(why, std::memory_order_relaxed);
@@ -3732,6 +3785,13 @@ bool RasterizerGXM::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
             }
             if (reason == why) {
                 slot.count.fetch_add(1, std::memory_order_relaxed);
+                auto& detail = transfer_reject_detail[i];
+                const auto end = fmt::format_to_n(detail.data(), detail.size() - 1,
+                                                  "{:#x}->{:#x} {}x{} fmt {}->{}{}", src, dst,
+                                                  width, height, static_cast<u32>(in_format),
+                                                  static_cast<u32>(out_format),
+                                                  config.dont_swizzle != 0 ? " textura" : "");
+                *end.out = '\0';
                 break;
             }
         }
@@ -4623,6 +4683,13 @@ void RasterizerGXM::FlushForPresent() {
     frame_first_fence = 0;
     for (auto& surface : surfaces) {
         if (!surface->copied) {
+            if (surface->dirty) {
+                const auto end = fmt::format_to_n(
+                    present_writeback_detail.data(), present_writeback_detail.size() - 1,
+                    "{:#x} {}x{} bpp {}", surface->guest_address, surface->width, surface->height,
+                    surface->bpp);
+                *end.out = '\0';
+            }
             WriteBack(*surface, kWritebackPresent);
         }
     }
@@ -6773,11 +6840,13 @@ std::string RasterizerGXM::TakeRejectSummary() {
 std::string RasterizerGXM::TakeCopySummary() {
     std::string text = "pantalla rechazadas:";
     bool any = false;
-    for (auto& slot : transfer_rejects) {
+    for (u32 i = 0; i < transfer_rejects.size(); i++) {
+        auto& slot = transfer_rejects[i];
         const char* reason = slot.reason.load(std::memory_order_relaxed);
         const u32 count = slot.count.exchange(0, std::memory_order_relaxed);
         if (reason != nullptr && count != 0) {
-            text += fmt::format("{} {} {}", any ? "," : "", reason, count);
+            text += fmt::format("{} {} {} ({})", any ? "," : "", reason, count,
+                                transfer_reject_detail[i].data());
             any = true;
         }
     }
@@ -6792,6 +6861,9 @@ std::string RasterizerGXM::TakeCopySummary() {
         const u32 count = writeback_sites[i].exchange(0, std::memory_order_relaxed);
         if (count != 0) {
             text += fmt::format("{} {} {}", any ? "," : "", kSites[i], count);
+            if (i == kWritebackPresent) {
+                text += fmt::format(" ({})", present_writeback_detail.data());
+            }
             any = true;
         }
     }

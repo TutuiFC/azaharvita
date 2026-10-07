@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 #include <boost/serialization/export.hpp>
@@ -42,6 +43,10 @@ public:
 
     void LoadComponent(std::span<const u8> buffer) override;
     void UnloadComponent() override;
+
+    /// La mezcla de cada tick en otro nucleo (0.3.1.5, ver Impl::TickAsync).
+    /// Lo pone el frontend desde ajustes.txt ("dsp_hilo").
+    static std::atomic<bool> async_mix;
 
 private:
     struct Impl;

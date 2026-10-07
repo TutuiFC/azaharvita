@@ -224,6 +224,49 @@ void UntileRGBA8ToRGB8(const u8* src, u8* dst, u32 output_width, u32 output_heig
     }
 }
 
+/**
+ * Mosaico RGBA8 -> lineal de 16 bits, sin escalado (0.3.1.5): la copia de la
+ * intro de Super Mario 3D Land a su pantalla RGB565, cuando todavia no hay GXM
+ * ("sin gxm" 285-399 de cada 10 s en crash.txt de 0.3.1.4, y el juego
+ * esperando 26 ms por fotograma al hilo de la GPU). Era el bucle general.
+ * Mismos bytes que EncodeRGB565/EncodeRGB5A1/EncodeRGBA4 sobre DecodeRGBA8:
+ * RGBA8 guarda A, B, G, R y cada canal se recorta quitando bits bajos.
+ */
+template <typename Encode>
+void UntileRGBA8To16(const u8* src, u8* dst, u32 output_width, u32 output_height, u32 input_width,
+                     bool flip_vertically, Encode&& encode) {
+    const auto put = [&encode](const u8* in, u8* out) {
+        const u16 value = encode(in[3], in[2], in[1], in[0]);
+        std::memcpy(out, &value, sizeof(value));
+    };
+    const u32 full_tiles = output_width & ~7u;
+    for (u32 y = 0; y < output_height; ++y) {
+        const u32 output_y = flip_vertically ? (output_height - y - 1) : y;
+        u8* const dst_row = dst + static_cast<std::size_t>(output_y) * output_width * 2;
+        const u8* const tile_row = src + static_cast<std::size_t>(y & ~7u) * input_width * 4;
+
+        u32 pair_offset[4];
+        for (u32 k = 0; k < 4; k++) {
+            pair_offset[k] = VideoCore::GetMortonOffset(k * 2, y, 4);
+        }
+
+        for (u32 tile_x = 0; tile_x < full_tiles; tile_x += 8) {
+            const u8* const tile_base = tile_row + static_cast<std::size_t>(tile_x) * 8 * 4;
+            u8* out = dst_row + static_cast<std::size_t>(tile_x) * 2;
+            for (u32 k = 0; k < 4; k++) {
+                const u8* in = tile_base + pair_offset[k];
+                put(in, out);
+                put(in + 4, out + 2);
+                out += 4;
+            }
+        }
+        for (u32 x = full_tiles; x < output_width; ++x) {
+            put(tile_row + VideoCore::GetMortonOffset(x, y, 4),
+                dst_row + static_cast<std::size_t>(x) * 2);
+        }
+    }
+}
+
 #ifdef __PSVITA__
 /// Cada combinacion distinta de transferencia, una vez, en crash.txt: con eso
 /// se sabe que caminos rapidos faltan sin tener que adivinar. Hasta ocho.
@@ -417,6 +460,35 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
         UntileRGBA8ToRGB8(src_pointer, dst_pointer, output_width, output_height,
                           config.input_width, config.flip_vertically != 0);
         return;
+    }
+    if (config.scaling == config.NoScale && !config.input_linear && !config.dont_swizzle &&
+        config.input_format.Value() == Pica::PixelFormat::RGBA8) {
+        const bool flip = config.flip_vertically != 0;
+        switch (config.output_format.Value()) {
+        case Pica::PixelFormat::RGB565:
+            UntileRGBA8To16(src_pointer, dst_pointer, output_width, output_height,
+                            config.input_width, flip, [](u32 r, u32 g, u32 b, u32) {
+                                return static_cast<u16>(((r >> 3) << 11) | ((g >> 2) << 5) |
+                                                        (b >> 3));
+                            });
+            return;
+        case Pica::PixelFormat::RGB5A1:
+            UntileRGBA8To16(src_pointer, dst_pointer, output_width, output_height,
+                            config.input_width, flip, [](u32 r, u32 g, u32 b, u32 a) {
+                                return static_cast<u16>(((r >> 3) << 11) | ((g >> 3) << 6) |
+                                                        ((b >> 3) << 1) | (a >> 7));
+                            });
+            return;
+        case Pica::PixelFormat::RGBA4:
+            UntileRGBA8To16(src_pointer, dst_pointer, output_width, output_height,
+                            config.input_width, flip, [](u32 r, u32 g, u32 b, u32 a) {
+                                return static_cast<u16>(((r >> 4) << 12) | ((g >> 4) << 8) |
+                                                        ((b >> 4) << 4) | (a >> 4));
+                            });
+            return;
+        default:
+            break;
+        }
     }
 
     /**
