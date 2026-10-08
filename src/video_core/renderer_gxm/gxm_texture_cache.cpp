@@ -254,6 +254,11 @@ void TextureCache::Retire(Entry& entry) {
     entry.address = 0;
     entry.span = 0;
     entry.stale = false;
+    entry.dirty_begin = 0;
+    entry.dirty_end = 0;
+    entry.band_hashes.clear();
+    shadow_bytes -= static_cast<u32>(entry.shadow.size() * sizeof(u32));
+    std::vector<u32>().swap(entry.shadow);
     if (entry.buffer.Valid()) {
         // A la lista de espera, NO al suelo: puede haber un dibujado apuntado
         // que todavia no ha leido estos pixeles. Ver ReleaseRetired.
@@ -350,6 +355,15 @@ u32 TextureCache::InvalidateRange(PAddr addr, u32 size) {
      */
     for (auto& entry : entries) {
         if (entry.valid && entry.address < end && addr < entry.address + entry.span) {
+            const u32 lo = addr > entry.address ? addr - entry.address : 0;
+            const u32 hi = std::min<u32>(end - entry.address, entry.span);
+            if (entry.stale) {
+                entry.dirty_begin = std::min(entry.dirty_begin, lo);
+                entry.dirty_end = std::max(entry.dirty_end, hi);
+            } else {
+                entry.dirty_begin = lo;
+                entry.dirty_end = hi;
+            }
             marked += entry.stale ? 0u : 1u;
             entry.stale = true;
         }
@@ -551,6 +565,7 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
                     (static_cast<u64>(min_linear) << 60) | (static_cast<u64>(mag_linear) << 61);
 
     clock++;
+    bool want_shadow = false;
     if (const auto found = index.find(key); found != index.end()) {
         Entry& entry = entries[found->second];
         if (entry.stale) {
@@ -562,20 +577,48 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
                 bytes != nullptr ? memory.GetPhysicalPointer(entry.address + entry.span - 1)
                                  : nullptr;
             bool same = false;
+            bool partial = false;
+            changed_bands.clear();
             if (bytes != nullptr && last == bytes + entry.span - 1) {
                 const unsigned long long rehash_begin = Common::VitaMicros();
-                same = Common::ComputeHash64(bytes, entry.span) == entry.source_hash;
+                if (!entry.band_hashes.empty()) {
+                    // Solo las filas que pisa el tramo avisado.
+                    const u32 bands = static_cast<u32>(entry.band_hashes.size());
+                    const u32 first = std::min(entry.dirty_begin / entry.stride, bands);
+                    const u32 end_band =
+                        std::min((entry.dirty_end + entry.stride - 1) / entry.stride, bands);
+                    for (u32 b = first; b < end_band; b++) {
+                        const u64 hash = Common::ComputeHash64(
+                            bytes + static_cast<std::size_t>(b) * entry.stride, entry.stride);
+                        if (hash != entry.band_hashes[b]) {
+                            changed_bands.push_back(b);
+                        }
+                    }
+                    Common::FrameStats::texture_rehash_bytes.fetch_add(
+                        (end_band - first) * entry.stride, std::memory_order_relaxed);
+                    same = changed_bands.empty();
+                    partial = !same && !entry.shadow.empty();
+                } else {
+                    same = Common::ComputeHash64(bytes, entry.span) == entry.source_hash;
+                    Common::FrameStats::texture_rehash_bytes.fetch_add(
+                        entry.span, std::memory_order_relaxed);
+                }
                 Common::FrameStats::Add(Common::FrameStats::texture_rehash_us, rehash_begin);
-                Common::FrameStats::texture_rehash_bytes.fetch_add(entry.span,
-                                                                   std::memory_order_relaxed);
             }
             if (same) {
                 entry.stale = false;
                 Common::FrameStats::texture_reuses.fetch_add(1, std::memory_order_relaxed);
             } else {
-                // Ha cambiado de verdad: se retira y se decodifica abajo.
                 Common::FrameStats::texture_changed.fetch_add(1, std::memory_order_relaxed);
-                Retire(entry);
+                const Pica::Texture::TextureInfo info =
+                    Pica::Texture::TextureInfo::FromPicaRegister(*config, format);
+                if (!partial || !RedecodeBands(entry, bytes, info, changed_bands, min_linear,
+                                               mag_linear, wrap_s, wrap_t)) {
+                    // Ha cambiado y no se puede por filas: se retira y se
+                    // decodifica entera abajo, ya con copia en RAM.
+                    want_shadow = true;
+                    Retire(entry);
+                }
             }
         }
         if (entry.valid) {
@@ -664,7 +707,14 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     }
     const unsigned long long decode_begin = Common::VitaMicros();
     auto* dest = static_cast<u32*>(buffer.Data());
-    if (width % 8 == 0 && height % 8 == 0) {
+    entry.band_hashes.clear();
+    const bool tiled_rows = width % 8 == 0 && height % 8 == 0;
+    if (tiled_rows && want_shadow && needed <= kMaxShadowTexture &&
+        shadow_bytes + needed <= kMaxShadowBytes) {
+        entry.shadow.resize(static_cast<std::size_t>(width) * height);
+        shadow_bytes += needed;
+    }
+    if (tiled_rows) {
         /**
          * EL CAMINO NORMAL: por filas de mosaicos, con una banda en RAM.
          *
@@ -677,14 +727,22 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
          * el camino de abajo; solo cambia el orden en que se calculan.
          */
         band.resize(static_cast<std::size_t>(width) * 8);
+        entry.band_hashes.resize(height / 8);
         for (u32 tile_y = 0; tile_y < height / 8; tile_y++) {
-            DecodeTileRow(source + tile_y * info.stride, info, width, band.data());
+            const u8* row_source = source + tile_y * info.stride;
+            entry.band_hashes[tile_y] = Common::ComputeHash64(row_source, info.stride);
+            DecodeTileRow(row_source, info, width, band.data());
             for (u32 line = 0; line < 8; line++) {
                 // Volteo vertical: ver el comentario de arriba.
                 const u32 dest_y = height - 1 - (tile_y * 8 + line);
                 std::memcpy(dest + static_cast<std::size_t>(dest_y) * width,
                             band.data() + static_cast<std::size_t>(line) * width,
                             static_cast<std::size_t>(width) * 4);
+                if (!entry.shadow.empty()) {
+                    std::memcpy(entry.shadow.data() + static_cast<std::size_t>(dest_y) * width,
+                                band.data() + static_cast<std::size_t>(line) * width,
+                                static_cast<std::size_t>(width) * 4);
+                }
             }
         }
     } else {
@@ -701,11 +759,39 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     Common::FrameStats::texture_decodes.fetch_add(1, std::memory_order_relaxed);
     Common::FrameStats::Add(Common::FrameStats::texture_decode_us, decode_begin);
 
+    entry.buffer = std::move(buffer);
+    SetupTexture(entry, width, height, min_linear, mag_linear, wrap_s, wrap_t);
+    if (!entry.buffer.Valid()) {
+        shadow_bytes -= static_cast<u32>(entry.shadow.size() * sizeof(u32));
+        std::vector<u32>().swap(entry.shadow);
+        entry.band_hashes.clear();
+        return nullptr;
+    }
+
+    entry.valid = true;
+    entry.key = key;
+    entry.address = address;
+    entry.span = span;
+    entry.stride = static_cast<u32>(info.stride);
+    entry.last_use = clock;
+    // Con hashes por fila no hace falta el del tramo entero (0.3.1.8).
+    entry.source_hash = entry.band_hashes.empty() ? Common::ComputeHash64(source, span) : 0;
+    entry.stale = false;
+    bytes_used += entry.buffer.Size();
+    index[key] = static_cast<u32>(&entry - entries.data());
+    return &entry.texture;
+}
+
+void TextureCache::SetupTexture(Entry& entry, u32 width, u32 height, bool min_linear,
+                                bool mag_linear, SceGxmTextureAddrMode wrap_s,
+                                SceGxmTextureAddrMode wrap_t) {
     // Los bytes van en orden R,G,B,A, que es lo que describe el nombre ABGR de
     // GXM (los nombres listan los canales del mas significativo al menos).
-    if (sceGxmTextureInitLinear(&entry.texture, buffer.Data(), SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR,
-                                width, height, 1) < 0) {
-        return nullptr;
+    if (sceGxmTextureInitLinear(&entry.texture, entry.buffer.Data(),
+                                SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, width, height, 1) < 0) {
+        retired.push_back(std::move(entry.buffer));
+        entry.buffer = Allocation{};
+        return;
     }
     sceGxmTextureSetMinFilter(&entry.texture, min_linear ? SCE_GXM_TEXTURE_FILTER_LINEAR
                                                          : SCE_GXM_TEXTURE_FILTER_POINT);
@@ -718,18 +804,70 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     sceGxmTextureSetMipmapCount(&entry.texture, 1);
     sceGxmTextureSetUAddrMode(&entry.texture, wrap_s);
     sceGxmTextureSetVAddrMode(&entry.texture, wrap_t);
+}
 
-    entry.valid = true;
-    entry.key = key;
-    entry.address = address;
-    entry.span = span;
-    entry.last_use = clock;
-    entry.source_hash = Common::ComputeHash64(source, span);
-    entry.stale = false;
-    bytes_used += buffer.Size();
+/**
+ * SOLO LAS FILAS QUE CAMBIAN (0.3.1.8). New Super Mario Bros. 2 escribe unos
+ * cientos de bytes de una textura de ~1 MB varias veces por segundo, y cada vez
+ * se decodificaba entera: ~105 ms, 6 por ventana, "tx" 60-110 ms por fotograma.
+ * Ahora las filas cambiadas se decodifican sobre la copia en RAM y la imagen
+ * entera pasa de ahi a un bloque nuevo con un memcpy secuencial (~1-2 ms). El
+ * bloque viejo va a la lista de espera, como en Retire: un dibujado de la
+ * escena abierta puede estar leyendolo.
+ */
+bool TextureCache::RedecodeBands(Entry& entry, const u8* source,
+                                 const Pica::Texture::TextureInfo& info,
+                                 const std::vector<u32>& changed, bool min_linear,
+                                 bool mag_linear, SceGxmTextureAddrMode wrap_s,
+                                 SceGxmTextureAddrMode wrap_t) {
+    const u32 width = info.width;
+    const u32 height = info.height;
+    const u32 needed = width * height * 4;
+    if (entry.shadow.size() * sizeof(u32) != needed || entry.buffer.Size() < needed) {
+        return false;
+    }
+    const Pool first = needed <= kSmallTexture ? Pool::Host : Pool::Cdram;
+    Allocation buffer = Allocate(first, needed);
+    if (!buffer.Valid()) {
+        buffer = Allocate(first == Pool::Host ? Pool::Cdram : Pool::Host, needed);
+    }
+    if (!buffer.Valid()) {
+        return false;
+    }
+    if (!etc1_cache) {
+        etc1_cache = std::make_unique<Pica::Texture::Etc1BlockCache>();
+    }
+    const unsigned long long decode_begin = Common::VitaMicros();
+    band.resize(static_cast<std::size_t>(width) * 8);
+    for (const u32 tile_y : changed) {
+        const u8* row_source = source + static_cast<std::size_t>(tile_y) * info.stride;
+        entry.band_hashes[tile_y] = Common::ComputeHash64(row_source, info.stride);
+        DecodeTileRow(row_source, info, width, band.data());
+        for (u32 line = 0; line < 8; line++) {
+            const u32 dest_y = height - 1 - (tile_y * 8 + line);
+            std::memcpy(entry.shadow.data() + static_cast<std::size_t>(dest_y) * width,
+                        band.data() + static_cast<std::size_t>(line) * width,
+                        static_cast<std::size_t>(width) * 4);
+        }
+    }
+    std::memcpy(buffer.Data(), entry.shadow.data(), needed);
+    Common::FrameStats::texture_decodes.fetch_add(1, std::memory_order_relaxed);
+    Common::FrameStats::Add(Common::FrameStats::texture_decode_us, decode_begin);
+
+    const u32 new_size = buffer.Size();
+    bytes_used -= entry.buffer.Size();
+    retired.push_back(std::move(entry.buffer));
     entry.buffer = std::move(buffer);
-    index[key] = static_cast<u32>(&entry - entries.data());
-    return &entry.texture;
+    SetupTexture(entry, width, height, min_linear, mag_linear, wrap_s, wrap_t);
+    if (!entry.buffer.Valid()) {
+        Retire(entry);
+        return true;
+    }
+    bytes_used += new_size;
+    entry.stale = false;
+    entry.dirty_begin = 0;
+    entry.dirty_end = 0;
+    return true;
 }
 
 } // namespace Gxm

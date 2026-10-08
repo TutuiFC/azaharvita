@@ -159,6 +159,7 @@ public:
     static std::atomic<u32> lazy_fill_kb;
     static std::atomic<u32> texture_copies;
     static std::atomic<u32> texture_copy_kb;
+    static std::atomic<u32> texture_copies_on_gpu;
     [[nodiscard]] static std::string TakeSurfaceSummary();
 
     /// Coste de AccelerateDrawBatch por fases, muestreado (0.1.9.6). La linea
@@ -178,6 +179,16 @@ public:
 
     /// Interruptor del menu ("Copia de pantalla en GPU"). Encendido.
     static std::atomic<u32> transfer_on_gpu;
+    /**
+     * Cada cuantas presentaciones se vuelcan las superficies que nadie ha
+     * leido todavia (0.3.1.8, ver FlushForPresent). 1 = en todas, como hasta
+     * 0.3.1.7. Clave "volcado_cada=" de ajustes.txt.
+     */
+    static std::atomic<u32> present_writeback_every;
+    /// Copias de textura que son una superficie entera, como copia de mosaico a
+    /// mosaico en la GPU (0.3.1.8, ver AccelerateTextureCopy). Clave
+    /// "copia_textura_gpu=" de ajustes.txt.
+    static std::atomic<u32> texture_copy_gpu;
     /**
      * Resolucion de dibujado en la GPU EN MITADES (ajuste "Resolucion GPU"):
      * 1 = 0.5x (0.2.0.4), 2 = 1x, 4 = 2x (0.2.0.3). Las superficies tienen

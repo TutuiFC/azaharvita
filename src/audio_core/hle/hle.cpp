@@ -35,6 +35,7 @@
 #include "core/core_timing.h"
 #ifdef __PSVITA__
 #include <fmt/format.h>
+#include <psp2/kernel/threadmgr.h>
 #include "common/vita_diag.h"
 #endif
 
@@ -116,6 +117,7 @@ private:
     void PublishMix();
     void PublishCallback();
     void MixerMain();
+    void NoteMixerThread(unsigned long long waited_us);
     static void* MixerEntry(void* self);
 
     DspState dsp_state = DspState::Off;
@@ -164,6 +166,13 @@ private:
     /// Por donde va RunMix, para la nota de WaitMixer si no acaba.
     std::atomic<const char*> mixer_where{"libre"};
     std::atomic<int> mixer_source{-1};
+    /// Hilo de la mezcla apagado en ESTA partida (DspHle::async_mix es el ajuste
+    /// del usuario y vale para todas).
+    bool async_off = false;
+    /// Mezclas que el hilo no cogio a tiempo y hizo el de emulacion.
+    u32 mixer_misses = 0;
+    u32 mixer_misses_in_row = 0;
+    std::atomic<int> mixer_tid{-1};
 
 public:
     template <class Archive>
@@ -556,9 +565,15 @@ bool DspHle::Impl::StartMixer() {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 256 * 1024);
-    mixer_started = pthread_create(&mixer_thread, &attr, &MixerEntry, this) == 0;
+    const int rc = pthread_create(&mixer_thread, &attr, &MixerEntry, this);
+    mixer_started = rc == 0;
     mixer_failed = !mixer_started;
     pthread_attr_destroy(&attr);
+#ifdef __PSVITA__
+    if (mixer_failed) {
+        Common::VitaNote("dsp", fmt::format("no se pudo crear el hilo de la mezcla: {}", rc).c_str());
+    }
+#endif
     return mixer_started;
 }
 
@@ -577,34 +592,45 @@ void DspHle::Impl::WaitMixer() {
         return;
     }
     /**
-     * Una mezcla son 0,1-3 ms. Si pasa de kPatienceUs se apunta por donde va,
-     * y el vigilante de main.cpp ve esta etapa si el juego se queda aqui. Si el
-     * hilo ni la ha cogido, no ha tocado nada todavia: se hace aqui y la
-     * partida sigue sin el hilo, en vez de esperarle sin saber hasta cuando.
+     * Una mezcla son 0,1-3 ms. Si el hilo no la ha COGIDO en kClaimUs, no ha
+     * tocado nada todavia: la coge este (mixer_request bajo el cerrojo es la
+     * reclamacion, asi que nunca se mezcla dos veces) y la partida sigue. Hasta
+     * 0.3.1.7 se le esperaba 500 ms y luego se apagaba el hilo para siempre y
+     * para todos los juegos: en los logs "otro nucleo" nunca paso de 0,0.
+     * Si ya la cogio, se espera lo que haga falta, con nota a los 500 ms.
      * Los plazos se miden con el reloj, no con lo que diga wait_for.
      */
+    constexpr unsigned long long kClaimUs = 10 * 1000;
     constexpr unsigned long long kPatienceUs = 500 * 1000;
+    constexpr u32 kMaxMissesInRow = 16;
     const Common::ScopedVitaStage stage{"esperando al dsp"};
     const unsigned long long begin = Common::VitaMicros();
     bool noted = false;
-    while (!mixer_cv.wait_for(lock, std::chrono::milliseconds(100),
+    while (!mixer_cv.wait_for(lock, std::chrono::milliseconds(2),
                               [this] { return !mixer_busy; })) {
         const unsigned long long waited_us = Common::VitaMicros() - begin;
-        if (waited_us < kPatienceUs) {
-            continue;
-        }
-        if (mixer_request) {
+        if (mixer_request && waited_us >= kClaimUs) {
             mixer_request = false;
             lock.unlock();
             RunMix();
             lock.lock();
             mixer_busy = false;
-            DspHle::async_mix.store(false, std::memory_order_relaxed);
-            Common::VitaNote("dsp", fmt::format("el hilo de la mezcla no la cogio en {} ms: hecha "
-                                                "en el de emulacion, y dsp_hilo apagado",
-                                                waited_us / 1000)
-                                        .c_str());
+            mixer_misses++;
+            mixer_misses_in_row++;
+            if (mixer_misses == 1) {
+                NoteMixerThread(waited_us);
+            }
+            if (mixer_misses_in_row >= kMaxMissesInRow) {
+                async_off = true;
+                Common::VitaNote("dsp", fmt::format("el hilo de la mezcla no cogio {} seguidas "
+                                                    "({} en total): apagado en esta partida",
+                                                    mixer_misses_in_row, mixer_misses)
+                                            .c_str());
+            }
             return;
+        }
+        if (waited_us < kPatienceUs) {
+            continue;
         }
         if (!noted) {
             noted = true;
@@ -616,6 +642,7 @@ void DspHle::Impl::WaitMixer() {
                                         .c_str());
         }
     }
+    mixer_misses_in_row = 0;
     if (noted) {
         Common::VitaNote("dsp", fmt::format("la mezcla acabo a los {} ms",
                                             (Common::VitaMicros() - begin) / 1000)
@@ -655,11 +682,39 @@ void DspHle::Impl::RunMix() {
 #endif
 }
 
+void DspHle::Impl::NoteMixerThread(unsigned long long waited_us) {
+#ifdef __PSVITA__
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    const int tid = mixer_tid.load(std::memory_order_relaxed);
+    const int rc = tid >= 0 ? sceKernelGetThreadInfo(tid, &info) : -1;
+    Common::VitaNote(
+        "dsp", fmt::format("el hilo de la mezcla no la cogio en {} ms (la hace el de emulacion): "
+                           "rc {:#x} estado {:#x} espera {:#x} prioridad {} nucleo {} ultimo {} "
+                           "ciclos {} expulsado {}",
+                           waited_us / 1000, static_cast<u32>(rc), info.status, info.waitType,
+                           info.currentPriority, info.currentCpuId, info.lastExecutedCpuId,
+                           static_cast<unsigned long long>(info.runClocks),
+                           info.threadPreemptCount)
+                   .c_str());
+#else
+    (void)waited_us;
+#endif
+}
+
 void DspHle::Impl::MixerMain() {
 #ifdef __PSVITA__
-    // El nucleo 2 es el del compilador de shaders, que va por debajo de todo.
+    mixer_tid.store(sceKernelGetThreadId(), std::memory_order_relaxed);
     Common::VitaPinThreadToUserCore(2, "dsp");
-    Common::VitaSetThreadPriority(Common::kVitaPriorityHelper, "dsp");
+    /**
+     * UNO POR ENCIMA DE LOS AYUDANTES (0.3.1.8). Con la misma prioridad que el
+     * worker del rasterizador por software del nucleo 2, y la Vita no reparte
+     * turnos entre iguales: mientras ese worker tenia trabajo encadenado (los
+     * primeros fotogramas, antes de iniciarse GXM) la mezcla no corria nunca
+     * (Pokemon Sol: "no la cogio en 505 ms" justo tras "sin gxm"). Una mezcla
+     * son 0,1-3 ms cada 4,9: el nucleo 2 apenas lo nota.
+     */
+    Common::VitaSetThreadPriority(Common::kVitaPriorityHelper - 1, "dsp");
     // El FPSCR es por hilo: el mismo que el de emulacion, que mezclaba antes,
     // para sacar las mismas muestras.
     Common::VitaEnableFastFloatMode();
@@ -754,7 +809,7 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
     const unsigned long long tick_begin = Common::VitaMicros();
 #endif
     bool ticked = false;
-    if (DspHle::async_mix.load(std::memory_order_relaxed) && StartMixer()) {
+    if (DspHle::async_mix.load(std::memory_order_relaxed) && !async_off && StartMixer()) {
         ticked = TickAsync();
     } else {
         // Apagado a media partida: lo que quedara del otro hilo, primero.

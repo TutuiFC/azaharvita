@@ -405,6 +405,16 @@ struct UserSettings {
     /// 0.3.1.5: la mezcla del DSP en otro nucleo (AudioCore::DspHle::async_mix).
     /// Solo ajustes.txt; vale desde el siguiente tick de audio.
     bool dsp_thread = true;
+    /// 0.3.1.8: perfil de bloques calientes del JIT (Core::ArmJit::profile).
+    /// Apagado: recompilaba todo dos veces por partida. Solo ajustes.txt.
+    bool jit_profile = false;
+    /// 0.3.1.8: cada cuantas presentaciones se vuelcan las superficies que
+    /// nadie ha leido (Gxm::RasterizerGXM::present_writeback_every). 1 = como
+    /// hasta 0.3.1.7. Solo ajustes.txt.
+    int present_writeback_every = 4;
+    /// 0.3.1.8: copias de textura de una superficie entera en la GPU
+    /// (Gxm::RasterizerGXM::texture_copy_gpu). Solo ajustes.txt.
+    bool texture_copy_gpu = true;
 };
 UserSettings g_user;
 
@@ -503,6 +513,11 @@ void ApplyUserSettings() {
     Gxm::RasterizerGXM::vertex_ring_host.store(g_user.vertex_ring_host ? 1u : 0u,
                                                std::memory_order_relaxed);
     AudioCore::DspHle::async_mix.store(g_user.dsp_thread, std::memory_order_relaxed);
+    Core::ArmJit::profile.store(g_user.jit_profile ? 1u : 0u, std::memory_order_relaxed);
+    Gxm::RasterizerGXM::present_writeback_every.store(
+        static_cast<u32>(g_user.present_writeback_every), std::memory_order_relaxed);
+    Gxm::RasterizerGXM::texture_copy_gpu.store(g_user.texture_copy_gpu ? 1u : 0u,
+                                               std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -512,7 +527,7 @@ void LoadUserSettings() {
     if (fd < 0) {
         return;
     }
-    char buffer[512] = {};
+    char buffer[1024] = {};
     const int read = sceIoRead(fd, buffer, sizeof(buffer) - 1);
     sceIoClose(fd);
     if (read <= 0) {
@@ -572,6 +587,11 @@ void LoadUserSettings() {
     read_bool("jit_vfp_fijos=", g_user.jit_vfp_regs);
     read_bool("vertices_ram=", g_user.vertex_ring_host);
     read_bool("dsp_hilo=", g_user.dsp_thread);
+    read_bool("jit_perfil=", g_user.jit_profile);
+    if (read_int("volcado_cada=", value)) {
+        g_user.present_writeback_every = std::clamp(value, 1, 60);
+    }
+    read_bool("copia_textura_gpu=", g_user.texture_copy_gpu);
 }
 
 /// El contenido de ajustes.txt, una clave por linea.
@@ -584,7 +604,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
         "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\njit_parche=%d\n"
         "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n"
-        "dsp_hilo=%d\n",
+        "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada=%d\ncopia_textura_gpu=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -595,13 +615,14 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.jit_thumb ? 1 : 0, g_user.jit_link_patch ? 1 : 0,
         g_user.jit_superblocks ? 1 : 0, g_user.jit_global_regs ? 1 : 0,
         g_user.jit_vfp_regs ? 1 : 0, g_user.vertex_ring_host ? 1 : 0,
-        g_user.dsp_thread ? 1 : 0);
+        g_user.dsp_thread ? 1 : 0, g_user.jit_profile ? 1 : 0, g_user.present_writeback_every,
+        g_user.texture_copy_gpu ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
 /// esto no se sabe si una partida lenta llevaba algo apagado en ajustes.txt.
 void NoteUserSettings() {
-    char buffer[512];
+    char buffer[1024];
     const int length = FormatUserSettings(buffer, sizeof(buffer));
     for (int i = 0; i < length && i < static_cast<int>(sizeof(buffer)) - 1; i++) {
         if (buffer[i] == '\n') {
@@ -612,7 +633,7 @@ void NoteUserSettings() {
 }
 
 void SaveUserSettings() {
-    char buffer[512];
+    char buffer[1024];
     const int length = FormatUserSettings(buffer, sizeof(buffer));
     const SceUID fd = sceIoOpen(kSettingsFile, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd < 0) {

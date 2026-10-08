@@ -65,6 +65,8 @@ std::atomic<u32> RasterizerGXM::vertex_ring_host{1};
 std::array<std::atomic<u32>, 5> RasterizerGXM::texture_marks{};
 std::atomic<u32> RasterizerGXM::async_vs{1};
 std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
+std::atomic<u32> RasterizerGXM::present_writeback_every{4};
+std::atomic<u32> RasterizerGXM::texture_copy_gpu{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
@@ -92,6 +94,7 @@ std::atomic<u32> RasterizerGXM::soft_fills{0};
 std::atomic<u32> RasterizerGXM::soft_fill_kb{0};
 std::atomic<u32> RasterizerGXM::lazy_fill_kb{0};
 std::atomic<u32> RasterizerGXM::texture_copies{0};
+std::atomic<u32> RasterizerGXM::texture_copies_on_gpu{0};
 std::atomic<u32> RasterizerGXM::texture_copy_kb{0};
 
 std::atomic<u32> RasterizerGXM::software_syncs{0};
@@ -708,6 +711,11 @@ struct RasterizerGXM::Surface {
     /// Origen de una copia de mosaico a mosaico (0.2.2.4): si el juego la usa
     /// tambien de textura, se vuelca entonces (ver TextureFromCopy).
     bool tiled_source = false;
+    /// Sucia y sin volcar porque a esta presentacion no le tocaba (0.3.1.8).
+    bool present_skipped = false;
+    /// Alguien ha leido su memoria (textura, copia, vaciado) con un volcado
+    /// aplazado: desde entonces se vuelca en todas las presentaciones.
+    bool consumed = false;
     /// Rellenos de color del invitado que todavia no se han pintado: los hace
     /// la siguiente escena (0.1.9.6, ver AccelerateFill). Cada uno es una
     /// franja de filas y los cuatro bytes del pixel tal como van en
@@ -1189,6 +1197,9 @@ struct RasterizerGXM::PipelineCache {
         const char* reason = "shader";
         /// CgGeneration() al construirla (0.1.5.9). Ver Get.
         u32 cg_generation = 0;
+        /// Cuando fallo y cuantas veces se ha reintentado (0.3.1.8, ver RetryDue).
+        unsigned long long failed_us = 0;
+        u32 retries = 0;
         SceGxmFragmentProgram* program = nullptr;
         /// Este shader lee normales y vista, o sea que necesita el formato de
         /// vertice largo. Lo decide config.lighting.enable al compilarlo.
@@ -1259,6 +1270,29 @@ struct RasterizerGXM::PipelineCache {
         ReleaseVertexFormat(lit);
         ReleaseVertexFormat(plain_proj);
         ReleaseVertexFormat(lit_proj);
+    }
+
+    /**
+     * LOS FALLOS CADUCAN (0.3.1.8). Un fallo guardado era para siempre (salvo
+     * "compilar shader" con el compilador recargado), y los lotes de esa
+     * configuracion iban a la CPU toda la partida: Pokemon X, "fragmentos 1000"
+     * en cada ventana a 4,7 fps sin nada compilandose. Compilar, registrar y
+     * crear el programa pueden fallar por falta de memoria del momento, asi que
+     * se reintentan a los 5, 10, 20 y 40 s; los demas motivos dependen solo de
+     * la configuracion y no cambian.
+     */
+    static bool RetryDue(const Entry& entry) {
+        constexpr u32 kMaxRetries = 4;
+        if (entry.retries >= kMaxRetries || entry.failed_us == 0) {
+            return false;
+        }
+        if (std::strcmp(entry.reason, "compilar shader") != 0 &&
+            std::strcmp(entry.reason, "registrar shader") != 0 &&
+            std::strcmp(entry.reason, "programa de fragmentos") != 0) {
+            return false;
+        }
+        const unsigned long long wait_us = 5'000'000ull << entry.retries;
+        return Common::VitaMicros() - entry.failed_us >= wait_us;
     }
 
     /// El formato de vertice de una combinacion (iluminacion, textura 0
@@ -1426,6 +1460,7 @@ struct RasterizerGXM::PipelineCache {
         PipelineKey key{config, blend_bits};
 
         const auto it = entries.find(key);
+        u32 retries = 0;
         if (it != entries.end() && it->second->job != nullptr) {
             Entry& pending = *it->second;
             if (!pending.job->done.load(std::memory_order_acquire)) {
@@ -1447,6 +1482,7 @@ struct RasterizerGXM::PipelineCache {
             if (!Finish(&pending, output, &reason)) {
                 pending.usable = false;
                 pending.reason = reason != nullptr ? reason : "shader";
+                pending.failed_us = Common::VitaMicros();
             }
         }
         if (it != entries.end()) {
@@ -1456,20 +1492,26 @@ struct RasterizerGXM::PipelineCache {
              * (CgGeneration cambio), se reintenta UNA vez con el nuevo. La
              * entrada fallida no tiene nada que soltar (ver Build).
              */
-            const bool retry = !it->second->usable && it->second->cg_generation != CgGeneration() &&
-                               std::strcmp(it->second->reason, "compilar shader") == 0;
+            const bool retry =
+                !it->second->usable &&
+                ((it->second->cg_generation != CgGeneration() &&
+                  std::strcmp(it->second->reason, "compilar shader") == 0) ||
+                 RetryDue(*it->second));
             if (!retry) {
                 return it->second->usable ? it->second.get() : fail(it->second->reason);
             }
+            retries = it->second->retries + 1;
             entries.erase(it);
         }
 
         auto entry = std::make_unique<Entry>();
         entry->cg_generation = CgGeneration();
+        entry->retries = retries;
         const char* reason = nullptr;
         if (!Build(entry.get(), config, blend, alpha_carrier, &reason)) {
             entry->usable = false;
             entry->reason = reason != nullptr ? reason : "shader";
+            entry->failed_us = Common::VitaMicros();
         }
         if (entry->job != nullptr) {
             entries.emplace(key, std::move(entry));
@@ -2442,6 +2484,13 @@ struct RasterizerGXM::BatchMemo {
         bool specialized = false;
     };
     const PipelineCache::Entry* pipeline = nullptr;
+    /// Motivo del ultimo fallo de pipeline con estos registros, y en que
+    /// fotograma (0.3.1.8): sin esto cada lote de una configuracion que no se
+    /// puede acelerar repetia PipelineCache::Get entero (la clave del shader de
+    /// fragmentos y la mezcla). Vale hasta el siguiente fotograma, para que los
+    /// fallos que caducan (RetryDue) se vuelvan a mirar.
+    const char* pipeline_fail = nullptr;
+    u32 pipeline_fail_frame = 0;
     bool vs_valid = false;
     VertexLayout layout;
 
@@ -2882,6 +2931,10 @@ void RasterizerGXM::WriteBack(Surface& surface, u32 site) {
         return;
     }
     writeback_sites[site].fetch_add(1, std::memory_order_relaxed);
+    if (surface.present_skipped && site != kWritebackPresent) {
+        surface.consumed = true;
+    }
+    surface.present_skipped = false;
     if (surface.clear_pending) {
         ApplyClearOnCpu(surface);
     }
@@ -3267,8 +3320,8 @@ const SceGxmTexture* RasterizerGXM::TextureFromCopy(u32 unit) {
      * mismo lote.
      */
     for (auto& surface : surfaces) {
-        if (!surface->tiled_source || !surface->dirty || surface.get() == open_surface ||
-            !surface->Overlaps(address, span)) {
+        if ((!surface->tiled_source && !surface->present_skipped) || !surface->dirty ||
+            surface.get() == open_surface || !surface->Overlaps(address, span)) {
             continue;
         }
         WriteBack(*surface, kWritebackTextureCopy);
@@ -4012,7 +4065,7 @@ void FillPattern(u8* dst, u32 bytes, u32 texel, u32 bpp) {
 
 std::string RasterizerGXM::TakeSurfaceSummary() {
     return fmt::format("recargas: lote soft {} relleno/transf {} volcar+invalidar {} | "
-                       "rellenos por software {} ({} KB, {} KB sin escribir) | copias de textura {} ({} KB) | "
+                       "rellenos por software {} ({} KB, {} KB sin escribir) | copias de textura {} ({} KB, {} en la gpu) | "
                        "texturas en la gpu {}, volcados por textura {}",
                        reload_causes[0].exchange(0, std::memory_order_relaxed),
                        reload_causes[1].exchange(0, std::memory_order_relaxed),
@@ -4022,6 +4075,7 @@ std::string RasterizerGXM::TakeSurfaceSummary() {
                        lazy_fill_kb.exchange(0, std::memory_order_relaxed),
                        texture_copies.exchange(0, std::memory_order_relaxed),
                        texture_copy_kb.exchange(0, std::memory_order_relaxed),
+                       texture_copies_on_gpu.exchange(0, std::memory_order_relaxed),
                        gpu_texture_transfers.exchange(0, std::memory_order_relaxed),
                        texture_source_writebacks.exchange(0, std::memory_order_relaxed));
 }
@@ -4032,6 +4086,41 @@ bool RasterizerGXM::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
     const u32 size = config.texture_copy.size;
     texture_copies.fetch_add(1, std::memory_order_relaxed);
     texture_copy_kb.fetch_add(size / 1024, std::memory_order_relaxed);
+    /**
+     * UNA SUPERFICIE ENTERA, COMO TRANSFERENCIA (0.3.1.8). Pokemon Sol copia
+     * cada poco un render target de 256x512 RGBA8 (512 KB) a otra direccion
+     * con una copia de textura contigua. Por software eso era cerrar la
+     * escena, esperar a su valla, volcar la superficie entera (~4 ms de
+     * mosaicos en CPU) y copiar 512 KB ("volcados por: vaciado" ~6 por
+     * segundo). Byte a byte es lo mismo que una transferencia de mosaico a
+     * mosaico sin escala ni volteo y con el mismo formato, y esa ya va por la
+     * GPU con su materializacion bajo demanda (screen_copies). Solo RGBA8: la
+     * superficie no guarda su formato del invitado y en 2 bytes hay tres.
+     */
+    if (texture_copy_gpu.load(std::memory_order_relaxed) != 0 && available &&
+        config.texture_copy.input_gap == 0 && config.texture_copy.output_gap == 0) {
+        for (const auto& surface : surfaces) {
+            if (surface->guest_address != src || surface->bpp != 4 ||
+                surface->width * surface->height * 4 != (size & ~0xFu) ||
+                surface->width % 8 != 0 || surface->height % 8 != 0) {
+                continue;
+            }
+            Pica::DisplayTransferConfig transfer = config;
+            transfer.flags = 0;
+            transfer.dont_swizzle.Assign(1);
+            transfer.input_format.Assign(Pica::PixelFormat::RGBA8);
+            transfer.output_format.Assign(Pica::PixelFormat::RGBA8);
+            transfer.input_width.Assign(surface->width);
+            transfer.input_height.Assign(surface->height);
+            transfer.output_width.Assign(surface->width);
+            transfer.output_height.Assign(surface->height);
+            if (AccelerateDisplayTransfer(transfer)) {
+                texture_copies_on_gpu.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            break;
+        }
+    }
     // Las primeras distintas, con lo que tocan: si el origen o el destino es
     // una superficie nuestra, ahi esta el volcado o la recarga.
     static std::array<std::pair<PAddr, PAddr>, 8> seen{};
@@ -4681,8 +4770,25 @@ void RasterizerGXM::FlushForPresent() {
     present_fence_now = frame_first_fence;
     presents_seen++;
     frame_first_fence = 0;
+    /**
+     * NO TODAS EN CADA PRESENTACION (0.3.1.8). Aqui se volcaba a la memoria del
+     * invitado toda superficie sucia, se leyera o no: Pokemon Sol en combate y
+     * Zafiro Alfa un render target de 512 KB por fotograma (3-6 ms de CPU mas
+     * la espera a su valla), Smash ~5 por fotograma. No hay aviso de las
+     * lecturas de la CPU (FlushDataCache de GSP no hace nada), asi que no se
+     * pueden quitar del todo; las que nadie ha leido van cada
+     * present_writeback_every presentaciones. Si una textura, una copia o un
+     * vaciado toca una con el volcado aplazado, se vuelca en ese momento y pasa
+     * a volcarse siempre (consumed).
+     */
+    const u32 every = std::max(1u, present_writeback_every.load(std::memory_order_relaxed));
+    const bool due = every == 1 || presents_seen % every == 0;
     for (auto& surface : surfaces) {
         if (!surface->copied) {
+            if (surface->dirty && !due && !surface->consumed) {
+                surface->present_skipped = true;
+                continue;
+            }
             if (surface->dirty) {
                 const auto end = fmt::format_to_n(
                     present_writeback_detail.data(), present_writeback_detail.size() - 1,
@@ -5993,6 +6099,50 @@ void RasterizerGXM::ClearAll(bool flush) {
  * forma de saber por que 'vsg' se quedaba en 12 de 177 lotes. Los motivos son
  * siempre literales de texto, que viven lo que el programa.
  */
+/**
+ * TOPE DE LOTES POR LA CPU MIENTRAS COMPILA (0.3.1.8). Pasado kAsyncVsWindowUs
+ * (o kAsyncFsStuckUs) un lote cuyo shader sigue compilando va por la CPU, para
+ * que se vea algo (0.2.1.2: saltarlos siempre dejaba la pantalla en negro
+ * mientras el compilador no acababa). Pero si son todos, la partida cae a 1-6
+ * fps durante segundos (Pokemon X, Super Mario 3D Land, Smash) y la CPU que
+ * ocupan es la que necesita el compilador. Ahora solo los primeros
+ * kMaxCpuBatches de cada fotograma; el resto se salta, como en la ventana corta.
+ */
+static bool LongCompileCpuAllowed(u32 frame) {
+    constexpr u32 kMaxCpuBatches = 6;
+    static u32 budget_frame = ~0u;
+    static u32 used = 0;
+    if (budget_frame != frame) {
+        budget_frame = frame;
+        used = 0;
+    }
+    return used++ < kMaxCpuBatches;
+}
+
+/// "fs: <motivo>" como literal propio, para que reject_counts (que compara
+/// punteros) los cuente aparte de los rechazos de vertices.
+static const char* FsRejectName(const char* reason) {
+    static constexpr std::array<std::pair<const char*, const char*>, 10> kNames{{
+        {"mezcla", "fs: mezcla"},
+        {"fs compilando largo", "fs: compilando largo"},
+        {"fs compilando", "fs: compilando"},
+        {"compilar shader", "fs: compilar shader"},
+        {"registrar shader", "fs: registrar shader"},
+        {"programa de fragmentos", "fs: programa de fragmentos"},
+        {"sin vs de luz", "fs: sin vs de luz"},
+        {"sin vs de textura proyectada", "fs: sin vs proyectada"},
+        {"shader", "fs: shader"},
+        {"pipeline nulo", "fs: modo de ablacion"},
+    }};
+    for (const auto& [from, to] : kNames) {
+        if (std::strcmp(from, reason) == 0) {
+            return to;
+        }
+    }
+    // Los del generador (GenerateFragmentShader) ya son literales propios.
+    return reason;
+}
+
 static bool HwVsReject(const char* why) {
     RasterizerGXM::hw_vs_last_reject.store(why, std::memory_order_relaxed);
     RasterizerGXM::hw_vs_rejects.fetch_add(1, std::memory_order_relaxed);
@@ -6207,6 +6357,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
         if (fs_dirty) {
             memo.pipeline = nullptr;
+            memo.pipeline_fail = nullptr;
         }
         if (memo.layout.specialized && AnyDirty(pica.dirty_regs, kVsBoolMask)) {
             vs_dirty = true;
@@ -6221,6 +6372,10 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     }
     const char* fs_reason = nullptr;
     const PipelineCache::Entry* pipeline = memo.pipeline;
+    if (pipeline == nullptr && memo.pipeline_fail != nullptr &&
+        memo.pipeline_fail_frame == presents_seen) {
+        return HwVsReject(memo.pipeline_fail);
+    }
     if (pipeline == nullptr) {
         memo.vs_valid = false;
         pipeline = pipelines->Get(regs, &fs_reason);
@@ -6231,10 +6386,23 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             return true;
         }
         memo.pipeline = pipeline;
+        if (pipeline == nullptr && fs_reason != nullptr &&
+            std::strcmp(fs_reason, "fs compilando largo") == 0 &&
+            async_vs.load(std::memory_order_relaxed) != 0 &&
+            !LongCompileCpuAllowed(presents_seen)) {
+            skipped_batches.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (pipeline == nullptr && fs_reason != nullptr &&
+            std::strcmp(fs_reason, "fs compilando largo") != 0) {
+            memo.pipeline_fail = FsRejectName(fs_reason);
+            memo.pipeline_fail_frame = presents_seen;
+        }
     }
     if (pipeline == nullptr || AblatedByMode()) {
-        // El motivo lo anota la ruta de la CPU al llegar a AddTriangle.
-        return HwVsReject("fragmentos");
+        // El motivo real (0.3.1.8): antes solo "fragmentos", y en Pokemon X no
+        // habia forma de saber por que no se aceleraba nada.
+        return HwVsReject(FsRejectName(fs_reason != nullptr ? fs_reason : "pipeline nulo"));
     }
     phase(0);
 
@@ -6433,6 +6601,12 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             // Compilandose (el generico o su especializado): el lote se salta.
             if (reason != nullptr && std::strcmp(reason, "vs compilando") == 0 &&
                 async_vs.load(std::memory_order_relaxed) != 0) {
+                skipped_batches.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            if (reason != nullptr && std::strcmp(reason, "vs compilando largo") == 0 &&
+                async_vs.load(std::memory_order_relaxed) != 0 &&
+                !LongCompileCpuAllowed(presents_seen)) {
                 skipped_batches.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }

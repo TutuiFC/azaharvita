@@ -152,6 +152,13 @@ extern std::atomic<u32> vfp_native;
 extern std::atomic<u32> thumb;
 
 /**
+ * Perfil de bloques calientes (jit_calientes.txt). 0 por defecto desde
+ * 0.3.1.8: cada partida pagaba dos recompilaciones enteras y un contador por
+ * bloque durante 2 minutos. Clave "jit_perfil=" de ajustes.txt.
+ */
+extern std::atomic<u32> profile;
+
+/**
  * Llamar en el DESPACHO del interprete, con el PC ya alineado. Si hay codigo
  * para este bloque y cabe en el presupuesto, lo ejecuta y devuelve cuantas
  * instrucciones del juego ha ejecutado; con 0, el interprete sigue como
@@ -249,8 +256,9 @@ struct PmuStats {
 /// Lo contado desde la ultima llamada (lo pone a cero).
 void TakePmu(PmuStats& out);
 
-/// Tira todo el codigo generado. La llama ResetTransCache: cuando el
-/// interprete tira sus traducciones, el JIT tira las suyas por lo mismo.
+/// Tira todo el codigo generado. La llama ResetTransCache cuando el codigo del
+/// juego o el mapa de memoria pueden haber cambiado; no cuando el interprete
+/// solo se queda sin sitio (0.3.1.8).
 void Reset();
 
 /**
@@ -262,6 +270,10 @@ void Reset();
  * ejecutar codigo del juego, devuelve a "nuevo" solo los bloques que lo tocan.
  */
 void InvalidateRange(u32 start, u32 size);
+
+/// Compilaciones aplazadas por el presupuesto de Acquire desde la ultima
+/// llamada. Solo desde el hilo de emulacion.
+u32 TakeDeferredCompiles();
 void ApplyInvalidations();
 
 } // namespace Core::ArmJit

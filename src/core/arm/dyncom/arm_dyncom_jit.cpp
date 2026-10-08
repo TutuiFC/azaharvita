@@ -45,6 +45,7 @@ std::atomic<u32> global_regs{1};
 std::atomic<u32> vfp_regs{1};
 std::atomic<u32> vfp_native{1};
 std::atomic<u32> thumb{1};
+std::atomic<u32> profile{0};
 
 namespace {
 
@@ -523,6 +524,10 @@ u64 g_slow_us = 0;
 u64 g_vfp_us = 0;
 u64 g_check_us = 0;
 u64 g_compile_us = 0;
+/// Ventana del presupuesto de compilacion (ver Acquire).
+u64 g_compile_window_begin_us = 0;
+u64 g_compile_window_us = 0;
+u32 g_compile_deferred = 0;
 
 bool TimeThisCall(u64 calls) {
     return (calls & (kTimeSampleEvery - 1)) == 0;
@@ -5190,6 +5195,25 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
     if (++block->visits < kCompileAfterVisits) {
         return nullptr;
     }
+    /**
+     * PRESUPUESTO DE COMPILACION (0.3.1.8). Al cargar se compilaban miles de
+     * bloques seguidos en el hilo de emulacion: Smash, "compilar 1295 ms" en un
+     * solo fotograma, sin ticks de audio ni vblank entre medias. Ahora, pasados
+     * kCompileBudgetUs de compilar en una ventana de kCompileWindowUs, el
+     * bloque se interpreta esta vez y se compila en la siguiente ventana.
+     */
+    constexpr u64 kCompileWindowUs = 16'000;
+    constexpr u64 kCompileBudgetUs = 10'000;
+    const u64 now_us = Common::VitaMicros();
+    if (now_us - g_compile_window_begin_us >= kCompileWindowUs) {
+        g_compile_window_begin_us = now_us;
+        g_compile_window_us = 0;
+    } else if (g_compile_window_us >= kCompileBudgetUs) {
+        block->visits = kCompileAfterVisits - 1;
+        g_compile_deferred++;
+        return nullptr;
+    }
+    const ScopedMicros window_timer{g_compile_window_us};
     const ScopedMicros timer{g_compile_us};
     if (!Analyze(cpu, *block)) {
         block->state = BlockState::Rejected;
@@ -5893,6 +5917,9 @@ void TickProfile(u64 slice_us) {
     }
     g_profile_clock_us += slice_us;
     if (!g_profile_active) {
+        if (profile.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
         if (g_profile_clock_us >= kProfileStartUs) {
             // Los bloques ya compilados no tienen contador: se tiran y se
             // recompilan con el.
@@ -5911,6 +5938,12 @@ void TickProfile(u64 slice_us) {
 }
 
 } // Anonymous namespace
+
+u32 TakeDeferredCompiles() {
+    const u32 value = g_compile_deferred;
+    g_compile_deferred = 0;
+    return value;
+}
 
 void InvalidateRange(u32 start, u32 size) {
     if (!g_ready || size == 0) {

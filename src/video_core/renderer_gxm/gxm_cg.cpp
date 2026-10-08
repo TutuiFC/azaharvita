@@ -668,6 +668,39 @@ struct CompilingMarker {
     u32 free_kb;
 };
 
+/**
+ * LA MARCA CON EL FICHERO ABIERTO (0.3.1.8). Antes de cada compilacion se
+ * abria, truncaba y cerraba la marca (y la fuente), y al acabar se borraba:
+ * operaciones de metadatos en ux0 que con la tarjeta ocupada costaban 0,5-2 s
+ * POR SHADER ("tarjeta antes" en crash.txt; un 12-33 % de cada compilacion en
+ * Super Mario 3D Land). Ahora el fichero se queda abierto y se reescriben sus
+ * 24 bytes en su sitio; "borrar" es escribir una marca vacia, que
+ * LoadBadSources ignora. La fuente solo se guarda para los de vertices y los
+ * grandes, que son los que han colgado el compilador alguna vez.
+ */
+SceUID g_marker_fd = -1;
+constexpr u32 kSaveSourceMinBytes = 4096;
+
+void WriteCompilingMarker(const CompilingMarker& marker) {
+    if (g_marker_fd < 0) {
+        g_marker_fd = sceIoOpen(kCompilingPath, SCE_O_WRONLY | SCE_O_CREAT, 0777);
+        if (g_marker_fd < 0) {
+            return;
+        }
+    }
+    sceIoLseek(g_marker_fd, 0, SCE_SEEK_SET);
+    sceIoWrite(g_marker_fd, &marker, sizeof(marker));
+}
+
+void ClearCompilingMarker() {
+    if (g_marker_fd < 0) {
+        return;
+    }
+    const CompilingMarker empty{};
+    sceIoLseek(g_marker_fd, 0, SCE_SEEK_SET);
+    sceIoWrite(g_marker_fd, &empty, sizeof(empty));
+}
+
 void AppendRecord(const char* path, const BadSource& record) {
     const SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     if (fd < 0) {
@@ -743,7 +776,19 @@ void LoadBadSources() {
     ReadRecords(kNoOptListPath, g_no_opt_sources);
     SceIoStat marker_stat{};
     const bool marker_dated = sceIoGetstat(kCompilingPath, &marker_stat) >= 0;
-    const SceUID crashed_fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
+    SceUID crashed_fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
+    if (crashed_fd >= 0) {
+        CompilingMarker probe{};
+        const int got = sceIoRead(crashed_fd, &probe, sizeof(probe));
+        if (got == static_cast<int>(sizeof(probe)) && probe.source == BadSource{} &&
+            probe.source_size == 0) {
+            // Marca vacia (ver WriteCompilingMarker): no murio compilando.
+            sceIoClose(crashed_fd);
+            crashed_fd = -1;
+        } else {
+            sceIoLseek(crashed_fd, 0, SCE_SEEK_SET);
+        }
+    }
     {
         const SceUID suspect_fd = sceIoOpen(kSuspectPath, SCE_O_RDONLY, 0);
         if (suspect_fd >= 0) {
@@ -1238,18 +1283,15 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
                                         static_cast<u32>(options.optimizationLevel),
                                         static_cast<u32>(source_size),
                                         static_cast<u32>(FreeHeap() / 1024)};
-        const SceUID source_fd =
-            sceIoOpen(kCompilingSourcePath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-        if (source_fd >= 0) {
-            sceIoWrite(source_fd, source, static_cast<SceSize>(source_size));
-            sceIoClose(source_fd);
+        if (profile == SCE_SHACCCG_PROFILE_VP || source_size >= kSaveSourceMinBytes) {
+            const SceUID source_fd =
+                sceIoOpen(kCompilingSourcePath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+            if (source_fd >= 0) {
+                sceIoWrite(source_fd, source, static_cast<SceSize>(source_size));
+                sceIoClose(source_fd);
+            }
         }
-        const SceUID marker =
-            sceIoOpen(kCompilingPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-        if (marker >= 0) {
-            sceIoWrite(marker, &compiling, sizeof(compiling));
-            sceIoClose(marker);
-        }
+        WriteCompilingMarker(compiling);
     }
     const unsigned long long card_us = marker_us + (Common::VitaMicros() - marker_begin_us);
     if (g_worker_running && pthread_equal(pthread_self(), g_worker_thread)) {
@@ -1327,7 +1369,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         if (output != nullptr) {
             sceShaccCgDestroyCompileOutput(output);
         }
-        sceIoRemove(kCompilingPath);
+        ClearCompilingMarker();
         if (internal) {
             // Ese codigo no se vuelve a mandar (ni en otra sesion) y el
             // compilador se recarga limpio para el siguiente.
@@ -1385,11 +1427,11 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     // (como antes de 0.1.7.9) y el compilador se queda como estaba.
     const SceShaccCgCompileOutput* copy = CopyOutput(*output);
     if (copy == nullptr) {
-        sceIoRemove(kCompilingPath);
+        ClearCompilingMarker();
         return output;
     }
     sceShaccCgDestroyCompileOutput(output);
-    sceIoRemove(kCompilingPath);
+    ClearCompilingMarker();
     NoteCompileMemory(name, heap_before, live_before);
     /**
      * TOPE DE LO QUE RETIENE EL COMPILADOR (0.1.9.1). Desde 0.1.8.5 no se le

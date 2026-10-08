@@ -24,6 +24,7 @@ struct RegsInternal;
 
 namespace Pica::Texture {
 class Etc1BlockCache;
+struct TextureInfo;
 }
 
 namespace Gxm {
@@ -182,9 +183,31 @@ private:
          * con source_hash y solo se decodifica otra vez si difieren. Ver Get.
          */
         bool stale = false;
+        /**
+         * POR FILAS DE MOSAICOS (0.3.1.8). Tramo tocado desde la ultima
+         * revalidacion, en bytes desde 'address': solo esas filas se vuelven a
+         * hashear. Y el hash de cada fila, para decodificar solo las que han
+         * cambiado (vacio si el tamano no es multiplo de 8).
+         */
+        u32 dirty_begin = 0;
+        u32 dirty_end = 0;
+        u32 stride = 0;
+        std::vector<u64> band_hashes;
+        /// La imagen ya decodificada y volteada, en RAM, de las que han
+        /// cambiado alguna vez: la CPU no puede releer la CDRAM a buen ritmo, y
+        /// sin esto una fila nueva obligaba a decodificar las demas.
+        std::vector<u32> shadow;
         SceGxmTexture texture{};
         Allocation buffer;
     };
+
+    /// Decodifica de nuevo solo las filas 'changed' de una entrada con copia
+    /// en RAM, en un bloque nuevo. False si no hay memoria (se hace entera).
+    bool RedecodeBands(Entry& entry, const u8* source, const Pica::Texture::TextureInfo& info,
+                       const std::vector<u32>& changed, bool min_linear, bool mag_linear,
+                       SceGxmTextureAddrMode wrap_s, SceGxmTextureAddrMode wrap_t);
+    void SetupTexture(Entry& entry, u32 width, u32 height, bool min_linear, bool mag_linear,
+                      SceGxmTextureAddrMode wrap_s, SceGxmTextureAddrMode wrap_t);
 
     /// Manda la memoria de la entrada a la lista de espera y la deja libre.
     void Retire(Entry& entry);
@@ -217,6 +240,12 @@ private:
     /// Banda de 8 lineas en RAM para decodificar por filas de mosaicos (ver
     /// Get). Se reutiliza: como mucho 1024 x 8 texeles, 32 KB.
     std::vector<u32> band;
+    /// Filas cambiadas en la revalidacion en curso (ver Get).
+    std::vector<u32> changed_bands;
+    /// Lo que suman las copias en RAM (Entry::shadow), con tope.
+    u32 shadow_bytes = 0;
+    static constexpr u32 kMaxShadowBytes = 8 * 1024 * 1024;
+    static constexpr u32 kMaxShadowTexture = 1024 * 1024;
     /// Texturas de un solo color: (0,0,0,0) y (0,0,0,255). Ver Get.
     const SceGxmTexture* ConstantTexture(bool opaque);
     std::array<SceGxmTexture, 2> constant_textures{};

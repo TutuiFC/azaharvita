@@ -157,7 +157,15 @@ bool FlushTransCacheIfNeeded() {
     LOG_INFO(Core_ARM11, "Cache de traduccion llena ({} bytes en {} nucleos), vaciando",
              trans_cache_buf_top, trans_cache_users.size());
     g_flushes_by_capacity++;
+#ifdef __PSVITA__
+    // Solo el interprete (0.3.1.8): su buffer lleno no dice nada del codigo
+    // del juego, y el JIT tiene su propia memoria y su propio "codigo lleno".
+    // Antes cada vaciado por capacidad tiraba tambien todo el JIT y lo ya
+    // comprobado: Zelda recompilaba ~10.000 bloques 14 veces por sesion.
+    ResetInterpreterTranslations();
+#else
     ResetTransCache();
+#endif
     return true;
 }
 

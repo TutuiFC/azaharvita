@@ -230,23 +230,49 @@ void VitaNote(const char* title, const char* detail) {
 }
 
 namespace {
+/**
+ * LOS FICHEROS SE QUEDAN ABIERTOS (0.3.1.8). Cada tanda abria y cerraba
+ * crash.txt y el del juego: "notas: 256 lineas en 80 escrituras, 28699 ms de
+ * tarjeta" en Pokemon Sol (~360 ms por tanda), tarjeta que no tenian la RomFS
+ * ni la cache de shaders. Abiertos solo con una partida en marcha (el hilo
+ * escritor ya funcionando): al arrancar main renombra crash.txt, y antes de
+ * renombrar el del juego SetVitaGameLog cierra el suyo.
+ */
+std::atomic<int> g_crash_fd{-1};
+std::atomic<int> g_game_fd{-1};
+
+void WriteTo(std::atomic<int>& cached, const char* path, const char* line, std::size_t n) {
+    if (!g_writer_running.load(std::memory_order_acquire)) {
+        const SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd >= 0) {
+            sceIoWrite(fd, line, n);
+            sceIoClose(fd);
+        }
+        return;
+    }
+    int fd = cached.load(std::memory_order_acquire);
+    if (fd < 0) {
+        fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+        if (fd < 0) {
+            return;
+        }
+        int expected = -1;
+        if (!cached.compare_exchange_strong(expected, fd, std::memory_order_acq_rel)) {
+            sceIoClose(fd);
+            fd = expected;
+        }
+    }
+    sceIoWrite(fd, line, n);
+}
+
 void WriteLogLine(const char* line, std::size_t n) {
     if (!g_log_dirs_ready.exchange(true, std::memory_order_relaxed)) {
         sceIoMkdir("ux0:/data", 0777);
         sceIoMkdir("ux0:/data/azahar", 0777);
     }
-    const SceUID fd = sceIoOpen(kCrashLog, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-    if (fd >= 0) {
-        sceIoWrite(fd, line, n);
-        sceIoClose(fd);
-    }
+    WriteTo(g_crash_fd, kCrashLog, line, n);
     if (g_game_log[0] != '\0') {
-        const SceUID game_fd =
-            sceIoOpen(g_game_log, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-        if (game_fd >= 0) {
-            sceIoWrite(game_fd, line, n);
-            sceIoClose(game_fd);
-        }
+        WriteTo(g_game_fd, g_game_log, line, n);
     }
 }
 } // Anonymous namespace
@@ -256,6 +282,9 @@ void SetVitaGameLog(const char* path) {
         // Lo encolado es de la partida que se cierra: a su fichero.
         const std::lock_guard lock{g_write_mutex};
         DrainRing();
+        if (const int fd = g_game_fd.exchange(-1, std::memory_order_acq_rel); fd >= 0) {
+            sceIoClose(fd);
+        }
         if (path == nullptr) {
             g_game_log[0] = '\0';
             return;

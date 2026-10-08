@@ -1466,6 +1466,13 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
     const auto shade_range = [&](u32 begin, u32 end, const ParallelShading::Job* warmup) {
         const unsigned long long busy_begin = Common::VitaMicros();
         ShaderUnit unit;
+        // El contador de muestreo de la autocomprobacion vive en la unidad, que
+        // es nueva en cada tramo: empezaba en 0 y el primer vertice de CADA
+        // tramo (y el calentamiento) se comprobaba con el interprete entero,
+        // 2-3 por lote en vez de 1 de cada 512 (0.3.1.8).
+        static std::atomic<u32> check_seed{1};
+        unit.fast_check_counter =
+            check_seed.fetch_add(end - begin + 1, std::memory_order_relaxed);
         AttributeBuffer input;
         AttributeBuffer result;
         if (warmup != nullptr) {
