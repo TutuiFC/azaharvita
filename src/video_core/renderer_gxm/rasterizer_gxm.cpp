@@ -66,7 +66,7 @@ std::array<std::atomic<u32>, 5> RasterizerGXM::texture_marks{};
 std::atomic<u32> RasterizerGXM::async_vs{1};
 std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::present_writeback_every{4};
-std::atomic<u32> RasterizerGXM::texture_copy_gpu{1};
+std::atomic<u32> RasterizerGXM::texture_copy_gpu{0};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
@@ -4096,6 +4096,12 @@ bool RasterizerGXM::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
      * mosaico sin escala ni volteo y con el mismo formato, y esa ya va por la
      * GPU con su materializacion bajo demanda (screen_copies). Solo RGBA8: la
      * superficie no guarda su formato del invitado y en 2 bytes hay tres.
+     *
+     * APAGADO POR DEFECTO (0.3.1.9). En Pokemon Sol el origen se usa tambien
+     * como textura, y como origen de una copia de mosaico a mosaico se vuelca
+     * en CADA uso con la GPU todavia dibujandolo: "esperas gpu: volcado" 8-10
+     * ms por fotograma y la textura redecodificada cada vez. Por la CPU eran
+     * ~6 copias por segundo. copia_textura_gpu=1 para probarlo.
      */
     if (texture_copy_gpu.load(std::memory_order_relaxed) != 0 && available &&
         config.texture_copy.input_gap == 0 && config.texture_copy.output_gap == 0) {

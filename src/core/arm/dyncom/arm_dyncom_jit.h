@@ -270,10 +270,6 @@ void Reset();
  * ejecutar codigo del juego, devuelve a "nuevo" solo los bloques que lo tocan.
  */
 void InvalidateRange(u32 start, u32 size);
-
-/// Compilaciones aplazadas por el presupuesto de Acquire desde la ultima
-/// llamada. Solo desde el hilo de emulacion.
-u32 TakeDeferredCompiles();
 void ApplyInvalidations();
 
 } // namespace Core::ArmJit

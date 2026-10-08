@@ -413,8 +413,10 @@ struct UserSettings {
     /// hasta 0.3.1.7. Solo ajustes.txt.
     int present_writeback_every = 4;
     /// 0.3.1.8: copias de textura de una superficie entera en la GPU
-    /// (Gxm::RasterizerGXM::texture_copy_gpu). Solo ajustes.txt.
-    bool texture_copy_gpu = true;
+    /// (Gxm::RasterizerGXM::texture_copy_gpu). Apagado desde 0.3.1.9: en
+    /// Pokemon Sol costaba 8-10 ms de espera a la GPU por fotograma. Solo
+    /// ajustes.txt.
+    bool texture_copy_gpu = false;
 };
 UserSettings g_user;
 

@@ -1451,7 +1451,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                     "jit",
                     fmt::format("{} {:.0f}% Mi {:.2f} arm {:.1f} | bloques {} rechazados {} "
                                 "comprobados {} ya comprobados {} diferencias {} | rech {} "
-                                "{:.0f}% | codigo {} KB {} B/bloque | aplazados {}",
+                                "{:.0f}% | codigo {} KB {} B/bloque",
                                 stats_jit_on ? "ON" : "off", stats_jit_percent, stats_guest_mips,
                                 stats_arm_ms, stats_jit_blocks, stats_jit_rejected,
                                 stats_jit_checks,
@@ -1460,8 +1460,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 stats_jit_mismatches,
                                 Core::ArmJit::RejectName(stats_jit_top_reject),
                                 stats_jit_top_reject_percent, code_bytes / 1024,
-                                code_blocks != 0 ? code_bytes / code_blocks : 0,
-                                Core::ArmJit::TakeDeferredCompiles())
+                                code_blocks != 0 ? code_bytes / code_blocks : 0)
                         .c_str());
             }
         }

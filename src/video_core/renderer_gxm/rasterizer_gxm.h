@@ -186,8 +186,8 @@ public:
      */
     static std::atomic<u32> present_writeback_every;
     /// Copias de textura que son una superficie entera, como copia de mosaico a
-    /// mosaico en la GPU (0.3.1.8, ver AccelerateTextureCopy). Clave
-    /// "copia_textura_gpu=" de ajustes.txt.
+    /// mosaico en la GPU (0.3.1.8, ver AccelerateTextureCopy). Apagado desde
+    /// 0.3.1.9. Clave "copia_textura_gpu=" de ajustes.txt.
     static std::atomic<u32> texture_copy_gpu;
     /**
      * Resolucion de dibujado en la GPU EN MITADES (ajuste "Resolucion GPU"):
