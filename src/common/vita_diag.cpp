@@ -8,7 +8,11 @@
 #ifdef __PSVITA__
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <string>
+#include <fmt/format.h>
+#include "common/vita_threads.h"
 #include <exception>
 #include <mutex>
 #include <pthread.h>
@@ -331,7 +335,111 @@ void VitaAssertFail(const char* file, int line) noexcept {
     std::terminate();
 }
 
+namespace {
+/**
+ * LOS HILOS CON NOMBRE (0.3.2.0). Para medir cuanto CPU usa de verdad cada uno
+ * (runClocks de sceKernelGetThreadInfo) y cuanto de cada nucleo queda libre
+ * (idleClock de sceKernelGetSystemInfo). Con eso se sabe si el hilo de
+ * emulacion pierde su nucleo frente a otro, cosa que los contadores de
+ * tiempo de pared no distinguen de "trabajo". Se apuntan al pasar por
+ * VitaPinThreadToUserCore o VitaSetThreadPriority, que son los hilos que
+ * importan; el hueco de uno que ya no existe se reutiliza.
+ */
+constexpr std::size_t kMaxNamedThreads = 24;
+struct NamedThread {
+    std::atomic<int> tid{-1};
+    char name[28]{};
+    unsigned long long last_run = 0;
+};
+std::array<NamedThread, kMaxNamedThreads> g_named_threads;
+
+bool ThreadAlive(int tid) {
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    return tid >= 0 && sceKernelGetThreadInfo(tid, &info) >= 0;
+}
+
+void RegisterThread(const char* role) {
+    const int self = sceKernelGetThreadId();
+    for (auto& slot : g_named_threads) {
+        if (slot.tid.load(std::memory_order_acquire) == self) {
+            return;
+        }
+    }
+    for (auto& slot : g_named_threads) {
+        int seen = slot.tid.load(std::memory_order_acquire);
+        if (seen == -2 || (seen >= 0 && ThreadAlive(seen))) {
+            continue;
+        }
+        // -2: reservado mientras se copia el nombre.
+        if (!slot.tid.compare_exchange_strong(seen, -2, std::memory_order_acq_rel)) {
+            continue;
+        }
+        std::size_t n = 0;
+        for (; role != nullptr && role[n] != 0 && n < sizeof(slot.name) - 1; n++) {
+            slot.name[n] = role[n] == ' ' ? '_' : role[n];
+        }
+        slot.name[n] = 0;
+        slot.last_run = 0;
+        slot.tid.store(self, std::memory_order_release);
+        return;
+    }
+}
+} // Anonymous namespace
+
+std::string VitaThreadSummary() {
+    static unsigned long long last_wall = 0;
+    static std::array<unsigned long long, 3> last_idle{};
+    static std::array<unsigned int, 3> last_switches{};
+    const unsigned long long now = VitaMicros();
+    const unsigned long long wall = last_wall != 0 ? now - last_wall : 0;
+    last_wall = now;
+    SceKernelSystemInfo system{};
+    system.size = sizeof(system);
+    const bool have_system = sceKernelGetSystemInfo(&system) >= 0;
+    std::string text = "nucleos ocupados";
+    for (int core = 0; core < 3; core++) {
+        const unsigned long long idle = have_system ? system.cpuInfo[core].idleClock : 0;
+        const unsigned int switches = have_system ? system.cpuInfo[core].threadSwitchCount : 0;
+        if (wall > 0 && have_system) {
+            const double free_percent =
+                std::min(100.0, static_cast<double>(idle - last_idle[core]) * 100.0 /
+                                    static_cast<double>(wall));
+            text += fmt::format(" {} {:.0f}% ({} cambios/s)", core, 100.0 - free_percent,
+                                static_cast<unsigned long long>(switches - last_switches[core]) *
+                                    1000000ull / wall);
+        }
+        last_idle[core] = idle;
+        last_switches[core] = switches;
+    }
+    if (wall == 0) {
+        text += " -";
+    }
+    text += " | cpu de cada hilo:";
+    for (auto& slot : g_named_threads) {
+        const int tid = slot.tid.load(std::memory_order_acquire);
+        if (tid < 0) {
+            continue;
+        }
+        SceKernelThreadInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetThreadInfo(tid, &info) < 0) {
+            continue;
+        }
+        const unsigned long long run = info.runClocks;
+        if (wall > 0 && slot.last_run != 0 && run >= slot.last_run) {
+            text += fmt::format(" {} {:.0f}% n{} p{}", slot.name,
+                                static_cast<double>(run - slot.last_run) * 100.0 /
+                                    static_cast<double>(wall),
+                                info.lastExecutedCpuId, info.currentPriority);
+        }
+        slot.last_run = run;
+    }
+    return text;
+}
+
 void VitaSetThreadPriority(int priority, const char* role) {
+    RegisterThread(role);
     const int before = sceKernelGetThreadCurrentPriority();
     const int rc = sceKernelChangeThreadPriority(sceKernelGetThreadId(), priority);
     char buffer[128];
@@ -354,6 +462,7 @@ void VitaSetThreadPriority(int priority, const char* role) {
 void VitaPinThreadToUserCore(unsigned int index, const char* role) {
     // Tres nucleos de usuario: 0x10000, 0x20000, 0x40000 (psp2/kernel/cpu.h).
     // El cuarto, SCE_KERNEL_CPU_MASK_SYSTEM, lo reserva el sistema y no se toca.
+    RegisterThread(role);
     static const int kUserCoreMasks[3] = {
         SCE_KERNEL_CPU_MASK_USER_0,
         SCE_KERNEL_CPU_MASK_USER_1,

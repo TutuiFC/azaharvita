@@ -24,7 +24,9 @@
 #include "core/cheats/cheats.h"
 #include "core/core.h"
 #ifdef __PSVITA__
+#include <fmt/format.h>
 #include "common/vita_diag.h"
+#include "core/vita_loop_profile.h"
 #endif
 #include "core/core_timing.h"
 #include "core/dumping/backend.h"
@@ -62,6 +64,72 @@
 #include "video_core/renderer_base.h"
 
 namespace Core {
+
+#ifdef __PSVITA__
+namespace {
+/**
+ * EL HILO DE EMULACION POR PARTES (0.3.2.0). En crash.txt, de cada fotograma
+ * del sistema de Pokemon Sol solo un tercio era ARM ("arm" va por
+ * presentacion, y hay dos fotogramas del sistema por cada una), poco SVC y
+ * unos 4 ms de esperar a la GPU: quedaban ~17 ms sin explicar. Uno de cada
+ * cuatro RunLoop, por tramos: interrupciones de la GPU, eventos y
+ * replanificacion antes de la rodaja, la rodaja (ARM) y la replanificacion
+ * despues.
+ */
+struct LoopProfile {
+    unsigned long long total_us = 0;
+    unsigned long long gpu_us = 0;
+    unsigned long long schedule_us = 0;
+    unsigned long long run_us = 0;
+    unsigned long long after_us = 0;
+    unsigned long long calls = 0;
+};
+LoopProfile g_loop{};
+unsigned long long g_loop_since_us = 0;
+u32 g_loop_tick = 0;
+
+struct LoopLap {
+    bool timed;
+    unsigned long long begin = timed ? Common::VitaMicros() : 0;
+    unsigned long long mark = begin;
+    void Lap(unsigned long long& slot) {
+        if (timed) {
+            const unsigned long long now = Common::VitaMicros();
+            slot += now - mark;
+            mark = now;
+        }
+    }
+    ~LoopLap() {
+        if (timed) {
+            g_loop.total_us += Common::VitaMicros() - begin;
+            g_loop.calls++;
+        }
+    }
+};
+} // Anonymous namespace
+
+std::string TakeLoopProfile() {
+    const unsigned long long now = Common::VitaMicros();
+    const unsigned long long wall = g_loop_since_us != 0 ? now - g_loop_since_us : 0;
+    g_loop_since_us = now;
+    const LoopProfile p = g_loop;
+    g_loop = {};
+    if (wall == 0) {
+        return "-";
+    }
+    // Uno de cada cuatro: por cuatro, y en ms por segundo de reloj.
+    const auto per_s = [wall](unsigned long long us) {
+        return static_cast<double>(us) * 4.0 * 1000.0 / static_cast<double>(wall);
+    };
+    const unsigned long long parts = p.gpu_us + p.schedule_us + p.run_us + p.after_us;
+    return fmt::format("ms por s: total {:.0f} | gpu (esperas e irq) {:.0f} eventos y "
+                       "planificar {:.0f} rodaja {:.0f} replanificar {:.0f} resto {:.0f} | {} "
+                       "vueltas/s",
+                       per_s(p.total_us), per_s(p.gpu_us), per_s(p.schedule_us), per_s(p.run_us),
+                       per_s(p.after_us), per_s(p.total_us > parts ? p.total_us - parts : 0),
+                       p.calls * 4 * 1000000ull / wall);
+}
+#endif
 
 /*static*/ System System::s_instance;
 
@@ -203,6 +271,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         return ResultStatus::ErrorSavestate;
     }
 
+#ifdef __PSVITA__
+    LoopLap lap{(++g_loop_tick & 3u) == 0};
+#endif
     /**
      * GPU en otro nucleo (0.2.0.0): las interrupciones que ha levantado el hilo
      * de la GPU se dan aqui, en el hilo de emulacion, que es el de GSP. Y si
@@ -225,6 +296,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         }
         gpu->DeliverInterrupts();
     }
+#ifdef __PSVITA__
+    lap.Lap(g_loop.gpu_us);
+#endif
 
     // All cores should have executed the same amount of ticks. If this is not the case an event was
     // scheduled with a cycles_into_future smaller then the current downcount.
@@ -260,6 +334,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             running_core = current_core_to_execute;
             kernel->SetRunningCPU(running_core);
         }
+#ifdef __PSVITA__
+        lap.Lap(g_loop.schedule_us);
+#endif
         if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
             LOG_TRACE(Core_ARM11, "Core {} idling", current_core_to_execute->GetID());
             current_core_to_execute->GetTimer().Idle();
@@ -271,7 +348,13 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 current_core_to_execute->Step();
             }
         }
+#ifdef __PSVITA__
+        lap.Lap(g_loop.run_us);
+#endif
         Reschedule();
+#ifdef __PSVITA__
+        lap.Lap(g_loop.after_us);
+#endif
     } else {
         // Now all cores are at the same global time. So we will run them one after the other
         // with a max slice that is the minimum of all max slices of all cores
@@ -285,6 +368,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
             max_slice = std::min(max_slice, cpu_core->GetTimer().GetMaxSliceLength());
         }
+#ifdef __PSVITA__
+        lap.Lap(g_loop.schedule_us);
+#endif
         for (auto& cpu_core : cpu_cores) {
             cpu_core->GetTimer().SetNextSlice(max_slice);
             auto start_ticks = cpu_core->GetTimer().GetTicks();
@@ -307,8 +393,14 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                     cpu_core->Step();
                 }
             }
+#ifdef __PSVITA__
+            lap.Lap(g_loop.run_us);
+#endif
             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
             Reschedule();
+#ifdef __PSVITA__
+            lap.Lap(g_loop.after_us);
+#endif
         }
     }
 

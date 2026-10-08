@@ -849,6 +849,15 @@ void GPU::AsyncLoop() {
     // en el hilo de emulacion.
     Common::VitaEnableFastFloatMode();
     Common::VitaPinThreadToUserCore(1, "gpu");
+    /**
+     * Justo por debajo de los ayudantes (0.3.2.0). Se quedaba con la de
+     * std::thread, 191: la mas baja junto al compilador de shaders, asi que
+     * cualquier hilo sin afinidad que cayera en el nucleo 1 (el escritor de
+     * notas, a 190) se lo quitaba, y el juego espera a este hilo. Por debajo de
+     * los ayudantes (159) para que sus workers, que espera girando, le puedan
+     * quitar el nucleo.
+     */
+    Common::VitaSetThreadPriority(Common::kVitaPriorityHelper + 1, "gpu");
 #endif
     const auto fail = [&worker](const char* what) {
         std::lock_guard lock{worker.mutex};

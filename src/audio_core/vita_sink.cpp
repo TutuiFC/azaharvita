@@ -79,6 +79,12 @@ void VitaSink::OutputThread() {
     // pero cuando le toca tiene 21 ms para rellenar el bloque o el sonido se
     // corta. Con la prioridad por defecto de std::thread (la mas baja) y los
     // tres nucleos ocupados, no llegaba.
+    //
+    // En el nucleo 2 (0.3.2.0): con la prioridad mas alta de todas y sin
+    // afinidad podia caer en el 0 y quitarle al hilo de emulacion lo que tarda
+    // el estirado (SoundTouch) en cada bloque. El 2 es el del compilador de
+    // shaders y la mezcla del DSP, que van por debajo.
+    Common::VitaPinThreadToUserCore(2, "audio");
     Common::VitaSetThreadPriority(Common::kVitaPriorityAudio, "audio");
     while (running) {
         // Lo que falte del DSP para este bloque, de una vez: cada llamada al

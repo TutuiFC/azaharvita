@@ -18,7 +18,9 @@
 #include "core/arm/dyncom/arm_dyncom_jit.h"
 #include "core/arm/dyncom/arm_dyncom_trans.h"
 #include "common/vita_diag.h"
+#include "common/vita_threads.h"
 #include "core/core.h"
+#include "core/vita_loop_profile.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_pica_format.h"
@@ -1443,6 +1445,9 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                  Gxm::RasterizerGXM::TakeSurfaceSummary().c_str());
                 Common::VitaNote("copias", Gxm::RasterizerGXM::TakeCopySummary().c_str());
                 Common::VitaNote("jit otro", Core::ArmJit::TakeRejectWords().c_str());
+                Common::VitaNote("bucle", Core::TakeLoopProfile().c_str());
+                Common::VitaNote("eventos", Core::TakeTimingProfile().c_str());
+                Common::VitaNote("hilos", Common::VitaThreadSummary().c_str());
                 Common::VitaNote("vs flujo", Pica::Shader::Fast::TakeFlowSummary().c_str());
                 u32 code_bytes = 0;
                 u32 code_blocks = 0;

@@ -9,8 +9,85 @@
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
+#ifdef __PSVITA__
+#include <array>
+#include <fmt/format.h>
+#include "common/vita_diag.h"
+#include "core/vita_loop_profile.h"
+#endif
 
 namespace Core {
+
+#ifdef __PSVITA__
+namespace {
+/**
+ * LO QUE CUESTA CADA EVENTO (0.3.2.0). Ver TakeLoopProfile: los eventos se
+ * ejecutan fuera de la rodaja y no los veia ningun contador. Uno de cada
+ * cuatro con reloj; la cuenta de llamadas, todas.
+ */
+struct EventCost {
+    const TimingEventType* type = nullptr;
+    unsigned long long calls = 0;
+    unsigned long long timed_us = 0;
+};
+std::array<EventCost, 48> g_event_costs{};
+unsigned long long g_event_since_us = 0;
+u32 g_event_tick = 0;
+
+EventCost* EventCostOf(const TimingEventType* type) {
+    for (auto& cost : g_event_costs) {
+        if (cost.type == type) {
+            return &cost;
+        }
+        if (cost.type == nullptr) {
+            cost.type = type;
+            return &cost;
+        }
+    }
+    return nullptr;
+}
+} // Anonymous namespace
+
+std::string TakeTimingProfile() {
+    const unsigned long long now = Common::VitaMicros();
+    const unsigned long long wall = g_event_since_us != 0 ? now - g_event_since_us : 0;
+    g_event_since_us = now;
+    std::array<EventCost, 48> costs = g_event_costs;
+    // Se quedan, juntos al principio, los que se han llamado: los de una partida
+    // anterior (su Timing ya no existe) dejan el hueco.
+    std::size_t kept = 0;
+    for (const auto& cost : costs) {
+        if (cost.type != nullptr && cost.calls != 0) {
+            g_event_costs[kept++] = EventCost{cost.type, 0, 0};
+        }
+    }
+    for (std::size_t i = kept; i < g_event_costs.size(); i++) {
+        g_event_costs[i] = EventCost{};
+    }
+    if (wall == 0) {
+        return "-";
+    }
+    std::sort(costs.begin(), costs.end(), [](const EventCost& a, const EventCost& b) {
+        return a.timed_us > b.timed_us;
+    });
+    std::string text;
+    double total_ms = 0.0;
+    for (const auto& cost : costs) {
+        if (cost.type != nullptr) {
+            total_ms += static_cast<double>(cost.timed_us) * 4.0 * 1000.0 / static_cast<double>(wall);
+        }
+    }
+    text = fmt::format("ms por s: todos {:.1f} |", total_ms);
+    for (std::size_t i = 0; i < 6 && costs[i].type != nullptr && costs[i].calls != 0; i++) {
+        const auto& cost = costs[i];
+        text += fmt::format(" {} {:.1f} ({}/s)", cost.type->name != nullptr ? *cost.type->name : "?",
+                            static_cast<double>(cost.timed_us) * 4.0 * 1000.0 /
+                                static_cast<double>(wall),
+                            cost.calls * 1000000ull / wall);
+    }
+    return text;
+}
+#endif
 
 // Sort by time, unless the times are the same, in which case sort by the order added to the queue
 bool Timing::Event::operator>(const Timing::Event& right) const {
@@ -224,7 +301,20 @@ void Timing::Timer::Advance() {
         std::pop_heap(event_queue.begin(), event_queue.end(), std::greater<>());
         event_queue.pop_back();
         if (evt.type->callback != nullptr) {
+#ifdef __PSVITA__
+            EventCost* const cost = EventCostOf(evt.type);
+            const bool timed = (++g_event_tick & 3u) == 0;
+            const unsigned long long event_begin = timed ? Common::VitaMicros() : 0;
+#endif
             evt.type->callback(evt.user_data, static_cast<int>(executed_ticks - evt.time));
+#ifdef __PSVITA__
+            if (cost != nullptr) {
+                cost->calls++;
+                if (timed) {
+                    cost->timed_us += Common::VitaMicros() - event_begin;
+                }
+            }
+#endif
         } else {
             LOG_ERROR(Core, "Event '{}' has no callback", *evt.type->name);
         }
