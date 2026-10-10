@@ -124,6 +124,8 @@ public:
     enum Reject : u32 { kRejectType, kRejectSize, kRejectMemory, kRejectWrap, kRejectGpuMemory,
                         kServedDisabled, kRejectCount };
     static std::array<std::atomic<u32>, kRejectCount> rejects;
+    /// Decodificados por filas (RedecodeBands) desde la ultima lectura.
+    static std::atomic<u32> partial_decodes;
 
     /// Tira las texturas que solapen el rango.
     /// Devuelve cuantas entradas pasan a sospechosas (para crash.txt).

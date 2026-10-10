@@ -153,7 +153,11 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
 
     state->NumInstrsToExecute = num_instructions;
 #ifdef __PSVITA__
-    const unsigned long long slice_begin = Common::VitaMicros();
+    // Una rodaja de cada cuatro con reloj, por cuatro (0.3.2.1): son miles por
+    // segundo y cada lectura es una llamada al kernel.
+    static u32 slice_tick = 0;
+    const bool timed = (++slice_tick & 3u) == 0;
+    const unsigned long long slice_begin = timed ? Common::VitaMicros() : 0;
     Core::ArmJit::PmuSliceBegin();
 #endif
     const u32 ticks_executed = InterpreterMainLoop(state.get());
@@ -163,7 +167,7 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
     // 'cpu' lo que es el ARM de verdad de lo demas (servicios, sonido,
     // temporizadores). Las instrucciones las cuenta el propio JIT al final de
     // la rodaja (AbandonPendingCheck).
-    Core::ArmJit::AddSliceTime(Common::VitaMicros() - slice_begin);
+    Core::ArmJit::AddSliceTime(timed ? (Common::VitaMicros() - slice_begin) * 4 : 0);
 #endif
     if (timer) {
         timer->AddTicks(ticks_executed);

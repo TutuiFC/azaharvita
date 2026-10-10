@@ -6,6 +6,8 @@
 
 #include <cstring>
 #include <utility>
+#include <arm_neon.h>
+#include <fmt/format.h>
 #include "common/color.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
@@ -121,6 +123,37 @@ void DecodeTileNibbles(const u8* tile, u32 width, u32* tile_out, Decode&& decode
     }
 }
 
+/**
+ * LOS DE 16 BITS CON NEON (0.3.2.1). Como el RGBA8: cada fila son cuatro
+ * parejas de texeles seguidas en Morton, que se cargan juntas; 'convert' saca
+ * los cuatro canales de los ocho texeles en 16 bits (con las mismas cuentas
+ * que Common::Color) y vst4 los deja intercalados como R,G,B,A.
+ */
+template <typename Convert>
+void DecodeTile16Neon(const u8* tile, u32 width, u32* tile_out, Convert&& convert) {
+    const u32* morton = VideoCore::kMortonValues.data();
+    for (u32 y = 0; y < 8; y++, morton += 8) {
+        u32 pairs[4];
+        std::memcpy(&pairs[0], tile + morton[0] * 2, 4);
+        std::memcpy(&pairs[1], tile + morton[2] * 2, 4);
+        std::memcpy(&pairs[2], tile + morton[4] * 2, 4);
+        std::memcpy(&pairs[3], tile + morton[6] * 2, 4);
+        const uint16x8_t v = vreinterpretq_u16_u32(vld1q_u32(pairs));
+        vst4_u8(reinterpret_cast<u8*>(tile_out + y * width), convert(v));
+    }
+}
+
+/// (c << 3) | (c >> 2), (c << 2) | (c >> 4) y (c << 4) | c, en 16 bits y a 8.
+inline uint8x8_t Expand5(uint16x8_t c) {
+    return vmovn_u16(vorrq_u16(vshlq_n_u16(c, 3), vshrq_n_u16(c, 2)));
+}
+inline uint8x8_t Expand6(uint16x8_t c) {
+    return vmovn_u16(vorrq_u16(vshlq_n_u16(c, 2), vshrq_n_u16(c, 4)));
+}
+inline uint8x8_t Expand4(uint16x8_t c) {
+    return vmovn_u16(vorrq_u16(vshlq_n_u16(c, 4), c));
+}
+
 /// false si el formato no tiene bucle propio (lo hace LookupTexelInTile).
 bool DecodeTileFast(const u8* tile, TexturingRegs::TextureFormat format, u32 width,
                     u32* tile_out) {
@@ -130,12 +163,28 @@ bool DecodeTileFast(const u8* tile, TexturingRegs::TextureFormat format, u32 wid
         return static_cast<u32>(i) * 0x010101u | (static_cast<u32>(a) << 24);
     };
     switch (format) {
-    case Format::RGBA8:
-        DecodeTileTexels<4>(tile, width, tile_out, [](const u8* p) {
-            return static_cast<u32>(p[3]) | (static_cast<u32>(p[2]) << 8) |
-                   (static_cast<u32>(p[1]) << 16) | (static_cast<u32>(p[0]) << 24);
-        });
+    case Format::RGBA8: {
+        /**
+         * CON NEON, DE DOS EN DOS (0.3.2.1). En Morton los texeles x y x+1 de
+         * una fila son m y m+1: ocho bytes seguidos. Cada fila son cuatro
+         * cargas de 64 bits y dos escrituras de 128, y vrev32 da la vuelta a
+         * los bytes de cada texel: el mismo p[3] | p[2] << 8 | p[1] << 16 |
+         * p[0] << 24 que el bucle de texel en texel, que eran cuatro cargas de
+         * un byte por texel (New Super Mario Bros. 2: "tx" 60-110 ms por
+         * fotograma en sus texturas que cambian).
+         */
+        const u32* morton = VideoCore::kMortonValues.data();
+        for (u32 y = 0; y < 8; y++, morton += 8) {
+            const uint32x2_t p0 = vld1_u32(reinterpret_cast<const u32*>(tile + morton[0] * 4));
+            const uint32x2_t p1 = vld1_u32(reinterpret_cast<const u32*>(tile + morton[2] * 4));
+            const uint32x2_t p2 = vld1_u32(reinterpret_cast<const u32*>(tile + morton[4] * 4));
+            const uint32x2_t p3 = vld1_u32(reinterpret_cast<const u32*>(tile + morton[6] * 4));
+            u8* out = reinterpret_cast<u8*>(tile_out + y * width);
+            vst1q_u8(out, vrev32q_u8(vreinterpretq_u8_u32(vcombine_u32(p0, p1))));
+            vst1q_u8(out + 16, vrev32q_u8(vreinterpretq_u8_u32(vcombine_u32(p2, p3))));
+        }
         return true;
+    }
     case Format::RGB8:
         DecodeTileTexels<3>(tile, width, tile_out, [](const u8* p) {
             return static_cast<u32>(p[2]) | (static_cast<u32>(p[1]) << 8) |
@@ -143,16 +192,36 @@ bool DecodeTileFast(const u8* tile, TexturingRegs::TextureFormat format, u32 wid
         });
         return true;
     case Format::RGB5A1:
-        DecodeTileTexels<2>(tile, width, tile_out,
-                            [](const u8* p) { return PackRGBA(Color::DecodeRGB5A1(p)); });
+        DecodeTile16Neon(tile, width, tile_out, [](uint16x8_t v) {
+            const uint16x8_t mask5 = vdupq_n_u16(0x1F);
+            uint8x8x4_t out;
+            out.val[0] = Expand5(vshrq_n_u16(v, 11));
+            out.val[1] = Expand5(vandq_u16(vshrq_n_u16(v, 6), mask5));
+            out.val[2] = Expand5(vandq_u16(vshrq_n_u16(v, 1), mask5));
+            out.val[3] = vmovn_u16(vmulq_n_u16(vandq_u16(v, vdupq_n_u16(1)), 255));
+            return out;
+        });
         return true;
     case Format::RGB565:
-        DecodeTileTexels<2>(tile, width, tile_out,
-                            [](const u8* p) { return PackRGBA(Color::DecodeRGB565(p)); });
+        DecodeTile16Neon(tile, width, tile_out, [](uint16x8_t v) {
+            uint8x8x4_t out;
+            out.val[0] = Expand5(vshrq_n_u16(v, 11));
+            out.val[1] = Expand6(vandq_u16(vshrq_n_u16(v, 5), vdupq_n_u16(0x3F)));
+            out.val[2] = Expand5(vandq_u16(v, vdupq_n_u16(0x1F)));
+            out.val[3] = vdup_n_u8(255);
+            return out;
+        });
         return true;
     case Format::RGBA4:
-        DecodeTileTexels<2>(tile, width, tile_out,
-                            [](const u8* p) { return PackRGBA(Color::DecodeRGBA4(p)); });
+        DecodeTile16Neon(tile, width, tile_out, [](uint16x8_t v) {
+            const uint16x8_t mask4 = vdupq_n_u16(0xF);
+            uint8x8x4_t out;
+            out.val[0] = Expand4(vshrq_n_u16(v, 12));
+            out.val[1] = Expand4(vandq_u16(vshrq_n_u16(v, 8), mask4));
+            out.val[2] = Expand4(vandq_u16(vshrq_n_u16(v, 4), mask4));
+            out.val[3] = Expand4(vandq_u16(v, mask4));
+            return out;
+        });
         return true;
     case Format::IA8:
         DecodeTileTexels<2>(tile, width, tile_out, [&gray](const u8* p) { return gray(p[1], p[0]); });
@@ -239,6 +308,7 @@ void DecodeTileRow(const u8* row_source, const Pica::Texture::TextureInfo& info,
 } // Anonymous namespace
 
 std::array<std::atomic<u32>, TextureCache::kRejectCount> TextureCache::rejects{};
+std::atomic<u32> TextureCache::partial_decodes{0};
 
 TextureCache::TextureCache() = default;
 TextureCache::~TextureCache() = default;
@@ -758,6 +828,21 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     }
     Common::FrameStats::texture_decodes.fetch_add(1, std::memory_order_relaxed);
     Common::FrameStats::Add(Common::FrameStats::texture_decode_us, decode_begin);
+    {
+        // Los que cuestan, con su formato (0.3.2.1): de New Super Mario Bros. 2
+        // solo se sabia que eran ~100 ms cada uno.
+        const unsigned long long spent = Common::VitaMicros() - decode_begin;
+        static u32 slow_notes = 0;
+        if (spent > 5000 && slow_notes < 12) {
+            slow_notes++;
+            Common::VitaNote("gxm textura",
+                             fmt::format("decodificada entera en {} ms: {}x{} formato {} en "
+                                         "{:#010x}{}",
+                                         spent / 1000, width, height, static_cast<u32>(format),
+                                         address, want_shadow ? " (con copia en RAM)" : "")
+                                 .c_str());
+        }
+    }
 
     entry.buffer = std::move(buffer);
     SetupTexture(entry, width, height, min_linear, mag_linear, wrap_s, wrap_t);
@@ -852,6 +937,7 @@ bool TextureCache::RedecodeBands(Entry& entry, const u8* source,
     }
     std::memcpy(buffer.Data(), entry.shadow.data(), needed);
     Common::FrameStats::texture_decodes.fetch_add(1, std::memory_order_relaxed);
+    partial_decodes.fetch_add(1, std::memory_order_relaxed);
     Common::FrameStats::Add(Common::FrameStats::texture_decode_us, decode_begin);
 
     const u32 new_size = buffer.Size();

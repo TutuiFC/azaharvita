@@ -25,6 +25,7 @@
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_pica_format.h"
 #include "video_core/renderer_gxm/gxm_presenter.h"
+#include "video_core/renderer_gxm/gxm_texture_cache.h"
 #include "video_core/renderer_gxm/rasterizer_gxm.h"
 #include "video_core/renderer_gxm/renderer_gxm.h"
 #include "video_core/renderer_software/renderer_software.h"
@@ -1420,11 +1421,14 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 // decodificadas o revisadas, y las esperas enteras a la GPU.
                 Common::VitaNote(
                     "texturas",
-                    fmt::format("decodificadas {} ({:.1f} ms/fot) | revisadas iguales {} "
+                    fmt::format("decodificadas {} ({:.1f} ms/fot, por filas {}) | revisadas iguales {} "
                                 "cambiadas {} expulsadas {} (hash {:.1f} ms y {:.0f} KB por fot) "
                                 "| escenas cerradas por vertices {} por tablas de luz {} | "
                                 "espera a la gpu {:.1f} ms/fot",
-                                stats_texdecodes, stats_texdecode_ms, stats_texreuses,
+                                stats_texdecodes, stats_texdecode_ms,
+                                Gxm::TextureCache::partial_decodes.exchange(
+                                    0, std::memory_order_relaxed),
+                                stats_texreuses,
                                 stats_texchanged, stats_texevictions, stats_texrehash_ms,
                                 stats_texrehash_kb, stats_close_full, stats_close_lut,
                                 stats_finish_ms)
