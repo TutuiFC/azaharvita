@@ -18,6 +18,11 @@ std::string TakeLoopProfile();
 /// anterior (0.3.2.0).
 std::string TakeTimingProfile();
 
+/// Los SVC (por numero) y los comandos de servicios HLE que mas tiempo se
+/// llevan, desde la llamada anterior (0.3.2.3).
+std::string TakeSvcProfile();
+std::string TakeIpcProfile();
+
 } // namespace Core
 
 #endif

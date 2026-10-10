@@ -44,6 +44,12 @@
 #include "core/hle/kernel/wait_object.h"
 #include "core/hle/result.h"
 #include "core/hle/service/plgldr/plgldr.h"
+#ifdef __PSVITA__
+#include <atomic>
+#include <vector>
+#include "common/vita_diag.h"
+#include "core/vita_loop_profile.h"
+#endif
 
 namespace Kernel {
 
@@ -2427,9 +2433,52 @@ const SVC::FunctionDef* SVC::GetSVCInfo(u32 func_num) {
 
 MICROPROFILE_DEFINE(Kernel_SVC, "Kernel", "SVC", MP_RGB(70, 200, 70));
 
+#ifdef __PSVITA__
+namespace {
+/**
+ * QUE SVC SE LLEVAN EL TIEMPO (0.3.2.3). "svc" en crash.txt son 1,4-2,3 ms por
+ * fotograma del sistema en Pokemon Sol (57-90 ms por segundo) sin saber de
+ * quien. Cuenta de todos y reloj en uno de cada ocho, por ocho.
+ */
+struct SvcCost {
+    std::atomic<u32> calls{0};
+    std::atomic<u32> timed_us{0};
+    std::atomic<const char*> name{nullptr};
+};
+std::array<SvcCost, 128> g_svc_costs{};
+u32 g_svc_profile_tick = 0;
+unsigned long long g_svc_profile_since = 0;
+} // Anonymous namespace
+#endif
+
 void SVC::CallSVC(u32 immediate) {
     MICROPROFILE_SCOPE(Kernel_SVC);
     system.perf_stats->BeginSVCProcessing();
+#ifdef __PSVITA__
+    const bool profiled = (++g_svc_profile_tick & 7u) == 0;
+    const unsigned long long profile_begin = profiled ? Common::VitaMicros() : 0;
+    struct SvcProfileEnd {
+        u32 number;
+        bool timed;
+        unsigned long long begin;
+        const char* name;
+        ~SvcProfileEnd() {
+            if (number >= g_svc_costs.size()) {
+                return;
+            }
+            if (g_svc_costs[number].name.load(std::memory_order_relaxed) == nullptr) {
+                g_svc_costs[number].name.store(name, std::memory_order_relaxed);
+            }
+            g_svc_costs[number].calls.fetch_add(1, std::memory_order_relaxed);
+            if (timed) {
+                g_svc_costs[number].timed_us.fetch_add(
+                    static_cast<u32>(Common::VitaMicros() - begin), std::memory_order_relaxed);
+            }
+        }
+    } const svc_profile_end{immediate, profiled, profile_begin,
+                            GetSVCInfo(immediate) != nullptr ? GetSVCInfo(immediate)->name
+                                                             : nullptr};
+#endif
 
     // Lock the kernel mutex when we enter the kernel HLE.
     std::scoped_lock lock{kernel.GetHLELock()};
@@ -2451,6 +2500,46 @@ void SVC::CallSVC(u32 immediate) {
 }
 
 SVC::SVC(Core::System& system) : system(system), kernel(system.Kernel()), memory(system.Memory()) {}
+
+} // namespace Kernel
+
+#ifdef __PSVITA__
+std::string Core::TakeSvcProfile() {
+    const unsigned long long now = Common::VitaMicros();
+    const unsigned long long wall =
+        Kernel::g_svc_profile_since != 0 ? now - Kernel::g_svc_profile_since : 0;
+    Kernel::g_svc_profile_since = now;
+    struct Row {
+        u32 number;
+        u32 calls;
+        u32 timed_us;
+    };
+    std::vector<Row> rows;
+    for (u32 i = 0; i < Kernel::g_svc_costs.size(); i++) {
+        const u32 calls = Kernel::g_svc_costs[i].calls.exchange(0, std::memory_order_relaxed);
+        const u32 timed = Kernel::g_svc_costs[i].timed_us.exchange(0, std::memory_order_relaxed);
+        if (calls != 0) {
+            rows.push_back({i, calls, timed});
+        }
+    }
+    if (wall == 0 || rows.empty()) {
+        return "-";
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.timed_us > b.timed_us; });
+    std::string text = "ms por s:";
+    for (std::size_t i = 0; i < rows.size() && i < 8; i++) {
+        const char* name = Kernel::g_svc_costs[rows[i].number].name.load(std::memory_order_relaxed);
+        text += fmt::format(" {} {:.1f} ({}/s)", name != nullptr ? name : "?",
+                            static_cast<double>(rows[i].timed_us) * 8.0 * 1000.0 /
+                                static_cast<double>(wall),
+                            static_cast<unsigned long long>(rows[i].calls) * 1000000ull / wall);
+    }
+    return text;
+}
+#endif
+
+namespace Kernel {
 
 u32 SVC::GetReg(std::size_t n) {
     return system.GetRunningCore().GetReg(static_cast<int>(n));

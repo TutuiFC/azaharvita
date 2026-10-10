@@ -1455,6 +1455,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 Common::VitaNote("jit otro", Core::ArmJit::TakeRejectWords().c_str());
                 Common::VitaNote("bucle", Core::TakeLoopProfile().c_str());
                 Common::VitaNote("eventos", Core::TakeTimingProfile().c_str());
+                Common::VitaNote("svc", Core::TakeSvcProfile().c_str());
+                Common::VitaNote("servicios", Core::TakeIpcProfile().c_str());
                 Common::VitaNote("hilos", Common::VitaThreadSummary().c_str());
                 Common::VitaNote("vs flujo", Pica::Shader::Fast::TakeFlowSummary().c_str());
                 u32 code_bytes = 0;

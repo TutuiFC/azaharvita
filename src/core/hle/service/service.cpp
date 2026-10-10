@@ -4,6 +4,14 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#ifdef __PSVITA__
+#include <array>
+#include <atomic>
+#include <cstring>
+#include <vector>
+#include "common/vita_diag.h"
+#include "core/vita_loop_profile.h"
+#endif
 #include "common/assert.h"
 #include "common/hacks/hack_manager.h"
 #include "common/logging/log.h"
@@ -175,6 +183,44 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(u32* cmd_buf, const Funct
     cmd_buf[1] = 0;
 }
 
+#ifdef __PSVITA__
+namespace {
+/**
+ * QUE SERVICIOS SE LLEVAN EL TIEMPO (0.3.2.3), por comando: ver TakeSvcProfile.
+ * La clave es el FunctionInfoBase del comando; el nombre del servicio se copia
+ * al crear la entrada (los servicios se destruyen al cerrar la partida).
+ */
+struct IpcCost {
+    std::atomic<const void*> key{nullptr};
+    const char* function = nullptr;
+    char service[12] = {};
+    std::atomic<u32> calls{0};
+    std::atomic<u32> timed_us{0};
+};
+std::array<IpcCost, 128> g_ipc_costs{};
+u32 g_ipc_tick = 0;
+unsigned long long g_ipc_since = 0;
+
+IpcCost* IpcCostOf(const void* key, const char* function, const std::string& service) {
+    const std::size_t start = (reinterpret_cast<std::uintptr_t>(key) >> 3) % g_ipc_costs.size();
+    for (std::size_t i = 0; i < g_ipc_costs.size(); i++) {
+        IpcCost& cost = g_ipc_costs[(start + i) % g_ipc_costs.size()];
+        const void* seen = cost.key.load(std::memory_order_acquire);
+        if (seen == key) {
+            return &cost;
+        }
+        if (seen == nullptr) {
+            cost.function = function;
+            std::strncpy(cost.service, service.c_str(), sizeof(cost.service) - 1);
+            cost.key.store(key, std::memory_order_release);
+            return &cost;
+        }
+    }
+    return nullptr;
+}
+} // Anonymous namespace
+#endif
+
 void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context) {
     auto itr = handlers.find(context.CommandHeader().command_id.Value());
     const FunctionInfoBase* info = itr == handlers.end() ? nullptr : &itr->second;
@@ -185,7 +231,21 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
 
     LOG_TRACE(Service, "{}",
               MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+#ifdef __PSVITA__
+    IpcCost* const cost = IpcCostOf(info, info->name, service_name);
+    const bool timed = (++g_ipc_tick & 7u) == 0;
+    const unsigned long long begin = timed ? Common::VitaMicros() : 0;
+#endif
     handler_invoker(this, info->handler_callback, context);
+#ifdef __PSVITA__
+    if (cost != nullptr) {
+        cost->calls.fetch_add(1, std::memory_order_relaxed);
+        if (timed) {
+            cost->timed_us.fetch_add(static_cast<u32>(Common::VitaMicros() - begin),
+                                     std::memory_order_relaxed);
+        }
+    }
+#endif
 }
 
 std::string ServiceFrameworkBase::GetFunctionName(IPC::Header header) const {
@@ -262,3 +322,43 @@ void Init(Core::System& core, u64 loading_titleid, std::vector<u64>& lle_modules
 }
 
 } // namespace Service
+
+#ifdef __PSVITA__
+std::string Core::TakeIpcProfile() {
+    const unsigned long long now = Common::VitaMicros();
+    const unsigned long long wall =
+        Service::g_ipc_since != 0 ? now - Service::g_ipc_since : 0;
+    Service::g_ipc_since = now;
+    struct Row {
+        const Service::IpcCost* cost;
+        u32 calls;
+        u32 timed_us;
+    };
+    std::vector<Row> rows;
+    for (const auto& cost : Service::g_ipc_costs) {
+        if (cost.key.load(std::memory_order_acquire) == nullptr) {
+            continue;
+        }
+        auto& mutable_cost = const_cast<Service::IpcCost&>(cost);
+        const u32 calls = mutable_cost.calls.exchange(0, std::memory_order_relaxed);
+        const u32 timed = mutable_cost.timed_us.exchange(0, std::memory_order_relaxed);
+        if (calls != 0) {
+            rows.push_back({&cost, calls, timed});
+        }
+    }
+    if (wall == 0 || rows.empty()) {
+        return "-";
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.timed_us > b.timed_us; });
+    std::string text = "ms por s:";
+    for (std::size_t i = 0; i < rows.size() && i < 8; i++) {
+        text += fmt::format(" {}::{} {:.1f} ({}/s)", rows[i].cost->service,
+                            rows[i].cost->function != nullptr ? rows[i].cost->function : "?",
+                            static_cast<double>(rows[i].timed_us) * 8.0 * 1000.0 /
+                                static_cast<double>(wall),
+                            static_cast<unsigned long long>(rows[i].calls) * 1000000ull / wall);
+    }
+    return text;
+}
+#endif

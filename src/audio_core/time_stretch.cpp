@@ -23,6 +23,17 @@ TimeStretcher::TimeStretcher() : sound_touch(std::make_unique<soundtouch::SoundT
     sound_touch->setSampleRate(native_sample_rate);
     sound_touch->setPitch(1.0);
     sound_touch->setTempo(1.0);
+#ifdef __PSVITA__
+    /**
+     * BUSQUEDA RAPIDA (0.3.2.3). Por defecto SoundTouch busca el mejor punto de
+     * solape probando todo su margen de busqueda en cada trozo, y es casi todo
+     * su coste: el hilo de audio, el de mas prioridad, se llevaba un 8-12 % del
+     * nucleo 2 en crash.txt de 0.3.2.0, y en ese nucleo va la mezcla del DSP
+     * que el hilo de emulacion espera en cada publicacion. La busqueda por
+     * pasos es la que la propia libreria recomienda para equipos lentos.
+     */
+    sound_touch->setSetting(SETTING_USE_QUICKSEEK, 1);
+#endif
 }
 
 TimeStretcher::~TimeStretcher() = default;
