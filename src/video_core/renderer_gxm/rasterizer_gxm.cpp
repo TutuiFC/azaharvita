@@ -4570,14 +4570,13 @@ bool RasterizerGXM::UpdateLightingLut() {
      * software.
      */
     constexpr u32 kLutEntries = 256;
-    constexpr u32 kLutCount = 24;
+    constexpr u32 kLutCount = kLutTables;
     constexpr u32 kLutBytes = kLutEntries * kLutCount * 2 * sizeof(f32);
 
     if (!lighting_lut_ready) {
         // CDRAM primero: esto lo lee la GPU en cada pixel iluminado y lo
         // escribe la CPU solo cuando el juego cambia una tabla. Van las
-        // kLutVersions copias en un solo bloque (8 x 48 KB, medio mega de
-        // CDRAM con su grano de 256 KB).
+        // kLutVersions copias en un solo bloque (32 x 48 KB, 1,5 MB).
         lighting_lut_buffer = Allocate(Pool::Cdram, kLutBytes * kLutVersions);
         if (!lighting_lut_buffer.Valid()) {
             lighting_lut_buffer = Allocate(Pool::Host, kLutBytes * kLutVersions);
@@ -4621,6 +4620,10 @@ bool RasterizerGXM::UpdateLightingLut() {
         lighting_lut_retired_in_scene = 0;
         lighting_lut_ready = true;
         lighting_lut_shadow.assign(static_cast<std::size_t>(kLutCount) * kLutEntries * 2, 0.0f);
+        lighting_lut_gen.fill(0);
+        for (auto& held : lighting_lut_version_gen) {
+            held.fill(0);
+        }
         // Recien creada no tiene nada dentro: se suben las 24.
         pica.lighting.lut_dirty = Pica::PicaCore::Lighting::LutAllDirty;
     }
@@ -4649,20 +4652,25 @@ bool RasterizerGXM::UpdateLightingLut() {
                 row[i * 2] = source[i].ToFloat();
                 row[i * 2 + 1] = source[i].DiffToFloat();
             }
+            lighting_lut_gen[index] = ++lighting_lut_gen_counter;
         }
+        pica.lighting.lut_dirty = 0;
     }
     constexpr std::size_t kRowBytes = static_cast<std::size_t>(kLutEntries) * 2 * sizeof(f32);
-    const auto version_data = [this](u32 version) {
-        return static_cast<u8*>(lighting_lut_buffer.Data()) +
-               static_cast<std::size_t>(version) * kLutBytes;
-    };
-    const auto write_row = [&](u32 version, u32 index) {
-        std::memcpy(version_data(version) + index * kRowBytes,
-                    reinterpret_cast<const u8*>(lighting_lut_shadow.data()) + index * kRowBytes,
-                    kRowBytes);
-    };
-    const auto write_all = [&](u32 version) {
-        std::memcpy(version_data(version), lighting_lut_shadow.data(), kLutBytes);
+    // Una version al dia: las tablas que han cambiado desde que se escribio.
+    const auto sync = [&](u32 version) {
+        u8* const base = static_cast<u8*>(lighting_lut_buffer.Data()) +
+                         static_cast<std::size_t>(version) * kLutBytes;
+        auto& held = lighting_lut_version_gen[version];
+        for (u32 index = 0; index < kLutCount; index++) {
+            if (held[index] != lighting_lut_gen[index]) {
+                std::memcpy(base + index * kRowBytes,
+                            reinterpret_cast<const u8*>(lighting_lut_shadow.data()) +
+                                index * kRowBytes,
+                            kRowBytes);
+                held[index] = lighting_lut_gen[index];
+            }
+        }
     };
 
     /**
@@ -4673,12 +4681,11 @@ bool RasterizerGXM::UpdateLightingLut() {
      * Pokemon y compania cambian tablas al cambiar de material, varias veces
      * por fotograma, y cada una era una parada completa de la CPU.
      *
-     * Ahora se pasa a la SIGUIENTE version y se escribe entera (las 24 tablas,
-     * desde pica.lighting.luts, que es la copia de verdad y vive en memoria
-     * normal). La anterior se queda como estaba para los dibujados que ya la
-     * tienen atada. Solo si la escena ya tiene atadas TODAS las versiones se
-     * cierra, como antes: el resultado es el mismo, solo que casi nunca hace
-     * falta esperar.
+     * Ahora se pasa a la SIGUIENTE version y se pone al dia (desde 0.3.2.5
+     * solo las tablas que no tenga ya, ver lighting_lut_gen). La anterior se
+     * queda como estaba para los dibujados que ya la tienen atada. Solo si la
+     * escena ya tiene atadas TODAS las versiones se cierra, como antes: el
+     * resultado es el mismo, solo que casi nunca hace falta esperar.
      *
      * Por que la siguiente esta libre: se avanza siempre de una en una, asi
      * que las que lee la escena son la actual y las 'retired' anteriores. Con
@@ -4690,8 +4697,7 @@ bool RasterizerGXM::UpdateLightingLut() {
             lighting_lut_version = (lighting_lut_version + 1) % kLutVersions;
             // Una escena ya enviada puede seguir leyendo esa version.
             WaitFence(lut_fence[lighting_lut_version], GpuWait::Lut);
-            write_all(lighting_lut_version);
-            pica.lighting.lut_dirty = 0;
+            sync(lighting_lut_version);
             // La version nueva todavia no la ha atado nadie.
             lighting_lut_in_scene = false;
             return true;
@@ -4709,20 +4715,13 @@ bool RasterizerGXM::UpdateLightingLut() {
         const u32 next = (lighting_lut_version + 1) % kLutVersions;
         if (FenceDone(lut_fence[next])) {
             lighting_lut_version = next;
-            write_all(lighting_lut_version);
-            pica.lighting.lut_dirty = 0;
+            sync(lighting_lut_version);
             return true;
         }
         WaitFence(lut_fence[lighting_lut_version], GpuWait::Lut);
     }
-    // Nadie lee la version actual: basta con reescribir las tablas cambiadas.
-    // Esta al dia en todo lo demas, porque cada version se escribe entera al
-    // estrenarla y desde entonces solo se le aplican cambios.
-    while (pica.lighting.lut_dirty != 0) {
-        const u32 index = static_cast<u32>(std::countr_zero(pica.lighting.lut_dirty));
-        pica.lighting.lut_dirty &= ~(1u << index);
-        write_row(lighting_lut_version, index);
-    }
+    // Nadie lee la version actual: se reescriben las tablas cambiadas.
+    sync(lighting_lut_version);
     return true;
 }
 

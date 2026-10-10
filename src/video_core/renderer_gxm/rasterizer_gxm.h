@@ -736,10 +736,22 @@ private:
      * descriptor: cuando el juego cambia una tabla y la escena abierta ya tiene
      * dibujados apuntados que leen la version actual, se pasa a la siguiente en
      * vez de cerrar la escena. Ver UpdateLightingLut.
+     *
+     * 32 desde 0.3.2.5 (eran 8). New Super Mario Bros. 2 cambia de tablas
+     * mas de 8 veces por escena: cada 8 se cerraba la escena y el siguiente
+     * cambio esperaba a que la GPU la terminara entera ("esperas gpu: tablas
+     * de luz" 7-14 ms por fotograma; 4 ms en Pokemon Sol). Son 1,5 MB.
      */
-    static constexpr u32 kLutVersions = 8;
+    static constexpr u32 kLutVersions = 32;
+    static constexpr u32 kLutTables = 24;
     /// La valla de la ultima escena que leyo cada version (0.1.9.4).
     std::array<u32, kLutVersions> lut_fence{};
+    /// Generacion de cada tabla en lighting_lut_shadow, y la que tiene escrita
+    /// cada version (0.3.2.5): al estrenar una version solo se copian las
+    /// tablas que no tiene al dia, no las 24 (48 KB).
+    std::array<u32, kLutTables> lighting_lut_gen{};
+    std::array<std::array<u32, kLutTables>, kLutVersions> lighting_lut_version_gen{};
+    u32 lighting_lut_gen_counter = 0;
     Allocation lighting_lut_buffer;
     /// Las 24 tablas ya convertidas, en memoria normal (0.2.1.1): ver
     /// UpdateLightingLut.
