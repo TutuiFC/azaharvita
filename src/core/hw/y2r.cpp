@@ -5,7 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <memory>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include "common/assert.h"
 #include "common/color.h"
 #include "common/common_types.h"
@@ -77,6 +81,102 @@ static void ConvertYUVToRGB(const u8* input_Y, const u8* input_U, const u8* inpu
     }
 }
 
+#if defined(__ARM_NEON)
+/**
+ * Y2R CON NEON (0.3.3.0). Yo-kai Watch convierte unas 10 imagenes por segundo
+ * de 13,7 ms cada una (y2r:u::StartConversion en crash.txt de 0.3.2.6, el 14 %
+ * del hilo de emulacion) e Inazuma Eleven GO 8,5 de 9,7 ms: ~60 ciclos por
+ * pixel en cinco pasadas escalares. Aqui ocho pixeles de una vez con las mismas
+ * cuentas: productos en 32 bits (vmull/vmlal/vmlsl), los dos desplazamientos
+ * de antes y la saturacion de vqshrun + vqmovn, que es el clamp a 0-255 de
+ * arriba. Comprobado en el PC contra el codigo escalar con 8,8 millones de
+ * pixeles (los seis juegos de coeficientes estandar y coeficientes al azar).
+ */
+static inline void ConvertEight(uint8x8_t y8, uint8x8_t u8x, uint8x8_t v8x,
+                                const CoefficientSet& c, u32* out) {
+    const int16x8_t y = vreinterpretq_s16_u16(vmovl_u8(y8));
+    const int16x8_t u = vreinterpretq_s16_u16(vmovl_u8(u8x));
+    const int16x8_t v = vreinterpretq_s16_u16(vmovl_u8(v8x));
+    const int32x4_t kr = vdupq_n_s32(c[5] + 0x18);
+    const int32x4_t kg = vdupq_n_s32(c[6] + 0x18);
+    const int32x4_t kb = vdupq_n_s32(c[7] + 0x18);
+    const auto half = [&](int16x4_t yh, int16x4_t uh, int16x4_t vh, uint16x4_t& r16,
+                          uint16x4_t& g16, uint16x4_t& b16) {
+        const int32x4_t cy = vmull_n_s16(yh, c[0]);
+        const int32x4_t r = vmlal_n_s16(cy, vh, c[1]);
+        const int32x4_t g = vmlsl_n_s16(vmlsl_n_s16(cy, vh, c[2]), uh, c[3]);
+        const int32x4_t b = vmlal_n_s16(cy, uh, c[4]);
+        r16 = vqshrun_n_s32(vaddq_s32(vshrq_n_s32(r, 3), kr), 5);
+        g16 = vqshrun_n_s32(vaddq_s32(vshrq_n_s32(g, 3), kg), 5);
+        b16 = vqshrun_n_s32(vaddq_s32(vshrq_n_s32(b, 3), kb), 5);
+    };
+    uint16x4_t r_lo, g_lo, b_lo, r_hi, g_hi, b_hi;
+    half(vget_low_s16(y), vget_low_s16(u), vget_low_s16(v), r_lo, g_lo, b_lo);
+    half(vget_high_s16(y), vget_high_s16(u), vget_high_s16(v), r_hi, g_hi, b_hi);
+    // Bytes 0, B, G, R: en little-endian, R << 24 | G << 16 | B << 8.
+    uint8x8x4_t pixels;
+    pixels.val[0] = vdup_n_u8(0);
+    pixels.val[1] = vqmovn_u16(vcombine_u16(b_lo, b_hi));
+    pixels.val[2] = vqmovn_u16(vcombine_u16(g_lo, g_hi));
+    pixels.val[3] = vqmovn_u16(vcombine_u16(r_lo, r_hi));
+    vst4_u8(reinterpret_cast<u8*>(out), pixels);
+}
+
+/// Cuatro bytes de croma, cada uno en dos carriles seguidos (un valor por par
+/// de pixeles).
+static inline uint8x8_t LoadChromaPairs(const u8* in) {
+    u32 word;
+    std::memcpy(&word, in, sizeof(word));
+    const uint8x8_t v = vreinterpret_u8_u32(vdup_n_u32(word));
+    return vzip_u8(v, v).val[0];
+}
+
+/// Lo mismo que ConvertYUVToRGB, de ocho en ocho (el ancho siempre es multiplo
+/// de 8).
+template <InputFormat input_format>
+static void ConvertYUVToRGBNeon(const u8* input_Y, const u8* input_U, const u8* input_V,
+                                ImageTile output[], unsigned int width, unsigned int height,
+                                const CoefficientSet& coefficients) {
+    for (unsigned int y = 0; y < height; ++y) {
+        for (unsigned int x = 0; x < width; x += 8) {
+            uint8x8_t y8;
+            uint8x8_t u8x;
+            uint8x8_t v8x;
+            if constexpr (input_format == InputFormat::YUYV422_Interleaved) {
+                // Y0 U0 Y1 V0 Y2 U1 Y3 V1...: pares los Y, impares U y V alternados.
+                const uint8x8x2_t yc = vld2_u8(input_Y + (y * width + x) * 2);
+                y8 = yc.val[0];
+                const uint8x8x2_t uv = vuzp_u8(yc.val[1], yc.val[1]);
+                u8x = vzip_u8(uv.val[0], uv.val[0]).val[0];
+                v8x = vzip_u8(uv.val[1], uv.val[1]).val[0];
+            } else if constexpr (input_format == InputFormat::YUV422_Indiv8 ||
+                                 input_format == InputFormat::YUV422_Indiv16) {
+                y8 = vld1_u8(input_Y + y * width + x);
+                u8x = LoadChromaPairs(input_U + (y * width + x) / 2);
+                v8x = LoadChromaPairs(input_V + (y * width + x) / 2);
+            } else {
+                y8 = vld1_u8(input_Y + y * width + x);
+                u8x = LoadChromaPairs(input_U + ((y / 2) * width + x) / 2);
+                v8x = LoadChromaPairs(input_V + ((y / 2) * width + x) / 2);
+            }
+            ConvertEight(y8, u8x, v8x, coefficients, &output[x / 8][y * 8]);
+        }
+    }
+}
+#endif
+
+template <InputFormat input_format>
+static void ConvertYUV(const u8* input_Y, const u8* input_U, const u8* input_V, ImageTile output[],
+                       unsigned int width, unsigned int height,
+                       const CoefficientSet& coefficients) {
+#if defined(__ARM_NEON)
+    ConvertYUVToRGBNeon<input_format>(input_Y, input_U, input_V, output, width, height,
+                                      coefficients);
+#else
+    ConvertYUVToRGB<input_format>(input_Y, input_U, input_V, output, width, height, coefficients);
+#endif
+}
+
 /// Simulates an incoming CDMA transfer. The N parameter is used to automatically convert 16-bit
 /// formats to 8-bit.
 template <std::size_t N>
@@ -88,8 +188,12 @@ static void ReceiveData(Memory::MemorySystem& memory, u8* output, ConversionBuff
     ASSERT(amount_of_data % output_unit == 0);
 
     while (amount_of_data > 0) {
-        for (std::size_t i = 0; i < output_unit; ++i) {
-            output[i] = input[i * N];
+        if constexpr (N == 1) {
+            std::memcpy(output, input, output_unit);
+        } else {
+            for (std::size_t i = 0; i < output_unit; ++i) {
+                output[i] = input[i * N];
+            }
         }
 
         output += output_unit;
@@ -101,6 +205,58 @@ static void ReceiveData(Memory::MemorySystem& memory, u8* output, ConversionBuff
     }
 }
 
+#if defined(__ARM_NEON)
+/// 'count' pixeles del formato intermedio al de salida, ocho a ocho con NEON y el
+/// resto como SendData. Comprobado en el PC contra Encode* para los cuatro.
+template <OutputFormat output_format>
+static void EncodePixels(const u32* input, u8* output, int count, u8 alpha) {
+    int i = 0;
+    if constexpr (output_format == OutputFormat::RGBA8) {
+        const uint32x4_t a = vdupq_n_u32(alpha);
+        for (; i + 4 <= count; i += 4) {
+            vst1q_u8(output + i * 4, vreinterpretq_u8_u32(vorrq_u32(vld1q_u32(input + i), a)));
+        }
+    } else {
+        for (; i + 8 <= count; i += 8) {
+            // Carriles 0, B, G, R (ver ConvertEight).
+            const uint8x8x4_t px = vld4_u8(reinterpret_cast<const u8*>(input + i));
+            if constexpr (output_format == OutputFormat::RGB8) {
+                uint8x8x3_t bgr;
+                bgr.val[0] = px.val[1];
+                bgr.val[1] = px.val[2];
+                bgr.val[2] = px.val[3];
+                vst3_u8(output + i * 3, bgr);
+            } else if constexpr (output_format == OutputFormat::RGB565) {
+                uint16x8_t x = vshll_n_u8(px.val[3], 8);
+                x = vsriq_n_u16(x, vshll_n_u8(px.val[2], 8), 5);
+                x = vsriq_n_u16(x, vshll_n_u8(px.val[1], 8), 11);
+                vst1q_u8(output + i * 2, vreinterpretq_u8_u16(x));
+            } else {
+                uint16x8_t x = vshll_n_u8(px.val[3], 8);
+                x = vsriq_n_u16(x, vshll_n_u8(px.val[2], 8), 5);
+                x = vsriq_n_u16(x, vshll_n_u8(px.val[1], 8), 10);
+                x = vsriq_n_u16(x, vshll_n_u8(vdup_n_u8(alpha), 8), 15);
+                vst1q_u8(output + i * 2, vreinterpretq_u8_u16(x));
+            }
+        }
+    }
+    for (; i < count; ++i) {
+        const u32 color = input[i];
+        const Common::Vec4<u8> col_vec{(u8)(color >> 24), (u8)(color >> 16), (u8)(color >> 8),
+                                       alpha};
+        if constexpr (output_format == OutputFormat::RGBA8) {
+            Common::Color::EncodeRGBA8(col_vec, output + i * 4);
+        } else if constexpr (output_format == OutputFormat::RGB8) {
+            Common::Color::EncodeRGB8(col_vec, output + i * 3);
+        } else if constexpr (output_format == OutputFormat::RGB5A1) {
+            Common::Color::EncodeRGB5A1(col_vec, output + i * 2);
+        } else {
+            Common::Color::EncodeRGB565(col_vec, output + i * 2);
+        }
+    }
+}
+#endif
+
 /// Convert intermediate RGB32 format to the final output format while simulating an outgoing CDMA
 /// transfer.
 template <OutputFormat output_format>
@@ -108,6 +264,28 @@ static void SendData(Memory::MemorySystem& memory, const u32* input, ConversionB
                      int amount_of_data, u8 alpha) {
 
     u8* output = memory.GetPointer(buf.address);
+#if defined(__ARM_NEON)
+    /**
+     * Con unidades de transferencia de pixeles enteros que reparten la franja
+     * justa, el bucle de abajo escribe unit_pixels pixeles por unidad y salta
+     * el hueco: lo mismo, de ocho en ocho. Si no, como siempre.
+     */
+    constexpr int bpp = output_format == OutputFormat::RGBA8  ? 4
+                        : output_format == OutputFormat::RGB8 ? 3
+                                                              : 2;
+    const int unit_pixels = buf.transfer_unit / bpp;
+    if (buf.transfer_unit % bpp == 0 && unit_pixels > 0 && amount_of_data % unit_pixels == 0) {
+        while (amount_of_data > 0) {
+            EncodePixels<output_format>(input, output, unit_pixels, alpha);
+            input += unit_pixels;
+            output += buf.transfer_unit + buf.gap;
+            buf.address += buf.transfer_unit + buf.gap;
+            buf.image_size -= buf.transfer_unit;
+            amount_of_data -= unit_pixels;
+        }
+        return;
+    }
+#endif
 
     while (amount_of_data > 0) {
         u8* unit_end = output + buf.transfer_unit;
@@ -303,41 +481,41 @@ void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt
             ReceiveData<1>(memory, input_Y, cvt.src_Y, row_data_size);
             ReceiveData<1>(memory, input_U, cvt.src_U, row_data_size / 2);
             ReceiveData<1>(memory, input_V, cvt.src_V, row_data_size / 2);
-            ConvertYUVToRGB<InputFormat::YUV422_Indiv8>(input_Y, input_U, input_V, tiles.get(),
-                                                        cvt.input_line_width, row_height,
-                                                        cvt.coefficients);
+            ConvertYUV<InputFormat::YUV422_Indiv8>(input_Y, input_U, input_V, tiles.get(),
+                                                   cvt.input_line_width, row_height,
+                                                   cvt.coefficients);
             break;
         case InputFormat::YUV420_Indiv8:
             ReceiveData<1>(memory, input_Y, cvt.src_Y, row_data_size);
             ReceiveData<1>(memory, input_U, cvt.src_U, row_data_size / 4);
             ReceiveData<1>(memory, input_V, cvt.src_V, row_data_size / 4);
-            ConvertYUVToRGB<InputFormat::YUV420_Indiv8>(input_Y, input_U, input_V, tiles.get(),
-                                                        cvt.input_line_width, row_height,
-                                                        cvt.coefficients);
+            ConvertYUV<InputFormat::YUV420_Indiv8>(input_Y, input_U, input_V, tiles.get(),
+                                                   cvt.input_line_width, row_height,
+                                                   cvt.coefficients);
             break;
         case InputFormat::YUV422_Indiv16:
             ReceiveData<2>(memory, input_Y, cvt.src_Y, row_data_size);
             ReceiveData<2>(memory, input_U, cvt.src_U, row_data_size / 2);
             ReceiveData<2>(memory, input_V, cvt.src_V, row_data_size / 2);
-            ConvertYUVToRGB<InputFormat::YUV422_Indiv16>(input_Y, input_U, input_V, tiles.get(),
-                                                         cvt.input_line_width, row_height,
-                                                         cvt.coefficients);
+            ConvertYUV<InputFormat::YUV422_Indiv16>(input_Y, input_U, input_V, tiles.get(),
+                                                    cvt.input_line_width, row_height,
+                                                    cvt.coefficients);
             break;
         case InputFormat::YUV420_Indiv16:
             ReceiveData<2>(memory, input_Y, cvt.src_Y, row_data_size);
             ReceiveData<2>(memory, input_U, cvt.src_U, row_data_size / 4);
             ReceiveData<2>(memory, input_V, cvt.src_V, row_data_size / 4);
-            ConvertYUVToRGB<InputFormat::YUV420_Indiv16>(input_Y, input_U, input_V, tiles.get(),
-                                                         cvt.input_line_width, row_height,
-                                                         cvt.coefficients);
+            ConvertYUV<InputFormat::YUV420_Indiv16>(input_Y, input_U, input_V, tiles.get(),
+                                                    cvt.input_line_width, row_height,
+                                                    cvt.coefficients);
             break;
         case InputFormat::YUYV422_Interleaved:
             input_U = nullptr;
             input_V = nullptr;
             ReceiveData<1>(memory, input_Y, cvt.src_YUYV, row_data_size * 2);
-            ConvertYUVToRGB<InputFormat::YUYV422_Interleaved>(input_Y, input_U, input_V,
-                                                              tiles.get(), cvt.input_line_width,
-                                                              row_height, cvt.coefficients);
+            ConvertYUV<InputFormat::YUYV422_Interleaved>(input_Y, input_U, input_V, tiles.get(),
+                                                         cvt.input_line_width, row_height,
+                                                         cvt.coefficients);
             break;
         default:
             UNREACHABLE_MSG("Unknown Y2R input format {}", cvt.input_format);
@@ -346,7 +524,15 @@ void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt
 
         u32* output_buffer = reinterpret_cast<u32*>(data_buffer.get());
 
-        for (std::size_t i = 0; i < num_tiles; ++i) {
+        // Sin rotacion y en lineal, RotateTile0 con linear_lut es una copia
+        // tal cual: la fila del mosaico va directa a la salida.
+        const bool direct =
+            cvt.rotation == Rotation::None && cvt.block_alignment == BlockAlignment::Linear;
+        for (std::size_t i = 0; direct && i < num_tiles; ++i) {
+            WriteTileToOutput(output_buffer, tiles[i], row_height, cvt.input_line_width);
+            output_buffer += 8;
+        }
+        for (std::size_t i = 0; !direct && i < num_tiles; ++i) {
             int image_strip_width = 0;
             int output_stride = 0;
 

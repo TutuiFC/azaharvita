@@ -624,6 +624,13 @@ set_source_files_properties(
     hle/kernel/svc.cpp
     PROPERTIES COMPILE_OPTIONS "-O3;-flto"
 )
+# La conversion YUV a RGB de Y2R (0.3.3.0): Yo-kai Watch e Inazuma Eleven GO
+# convierten unas diez imagenes por segundo en el hilo de emulacion (8-14 % de
+# su tiempo en crash.txt de 0.3.2.6), y estaba a -Os.
+set_source_files_properties(
+    hw/y2r.cpp
+    PROPERTIES COMPILE_OPTIONS "-O3"
+)
 set_source_files_properties(
     hle/kernel/thread.cpp
     hle/kernel/kernel.cpp
