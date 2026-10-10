@@ -4280,7 +4280,10 @@ bool RasterizerGXM::FillGuestMemory(const Pica::MemoryFillConfig& config) {
     std::erase_if(lazy_fills, [start, end](const LazyFill& fill) {
         return fill.start >= start && fill.start + fill.bytes <= end;
     });
+    invalidating_fill_texel = texel;
+    invalidating_fill_bpp = bpp;
     InvalidateRegion(start, bytes);
+    invalidating_fill_bpp = 0;
     u8* const guest = memory.GetPhysicalPointer(start);
     // El primer pixel siempre: es de donde saca ClearDepthIfNeeded el valor.
     // 192 es multiplo de 2, 3 y 4, asi que el patron sigue en fase despues.
@@ -4452,7 +4455,7 @@ bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
     // Lo demas que pudiera tener esa memoria, como en el relleno por software.
     DropCopies(start, end - start);
     if (textures != nullptr) {
-        texture_marks[3].fetch_add(textures->InvalidateRange(start, end - start),
+        texture_marks[3].fetch_add(textures->InvalidateFill(start, end - start, texel, target->bpp),
                                    std::memory_order_relaxed);
     }
     software.InvalidateRegion(start, end - start);
@@ -6113,8 +6116,11 @@ void RasterizerGXM::InvalidateRegion(PAddr addr, u32 size) {
         }
     }
     if (textures != nullptr) {
-        texture_marks[1].fetch_add(textures->InvalidateRange(addr, size),
-                                   std::memory_order_relaxed);
+        const u32 marked = invalidating_fill_bpp != 0
+                               ? textures->InvalidateFill(addr, size, invalidating_fill_texel,
+                                                          invalidating_fill_bpp)
+                               : textures->InvalidateRange(addr, size);
+        texture_marks[1].fetch_add(marked, std::memory_order_relaxed);
     }
     software.InvalidateRegion(addr, size);
 }

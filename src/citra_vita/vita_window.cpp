@@ -1422,6 +1422,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 Common::VitaNote(
                     "texturas",
                     fmt::format("decodificadas {} ({:.1f} ms/fot, por filas {}) | revisadas iguales {} "
+                                "(sin revisar tras un relleno igual {}) "
                                 "cambiadas {} expulsadas {} (hash {:.1f} ms y {:.0f} KB por fot) "
                                 "| escenas cerradas por vertices {} por tablas de luz {} | "
                                 "espera a la gpu {:.1f} ms/fot",
@@ -1429,6 +1430,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 Gxm::TextureCache::partial_decodes.exchange(
                                     0, std::memory_order_relaxed),
                                 stats_texreuses,
+                                Gxm::TextureCache::fill_skips.exchange(
+                                    0, std::memory_order_relaxed),
                                 stats_texchanged, stats_texevictions, stats_texrehash_ms,
                                 stats_texrehash_kb, stats_close_full, stats_close_lut,
                                 stats_finish_ms)

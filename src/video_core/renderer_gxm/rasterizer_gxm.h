@@ -506,6 +506,10 @@ private:
     };
     std::vector<LazyFill> lazy_fills;
     void ApplyLazyFills(PAddr addr, u32 size);
+    /// El relleno por software que esta invalidando su tramo (bpp 0 si
+    /// ninguno): sus texturas van por TextureCache::InvalidateFill (0.3.2.6).
+    u32 invalidating_fill_texel = 0;
+    u32 invalidating_fill_bpp = 0;
     bool BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip,
                     u32 in_width, u32 in_height);
     /// Rellenos pendientes (ver AccelerateFill): el quad del color dentro de la

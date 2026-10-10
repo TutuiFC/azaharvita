@@ -126,10 +126,23 @@ public:
     static std::array<std::atomic<u32>, kRejectCount> rejects;
     /// Decodificados por filas (RedecodeBands) desde la ultima lectura.
     static std::atomic<u32> partial_decodes;
+    /// Entradas que un relleno no marca porque ya tenian su patron (0.3.2.6).
+    static std::atomic<u32> fill_skips;
 
     /// Tira las texturas que solapen el rango.
     /// Devuelve cuantas entradas pasan a sospechosas (para crash.txt).
     u32 InvalidateRange(PAddr addr, u32 size);
+
+    /**
+     * LO MISMO PARA UN RELLENO DE MEMORIA (0.3.2.6). Una entrada que el relleno
+     * cubre entera queda con el patron repetido, sea lo que sea lo que hubiera.
+     * Si ya se valido con ese mismo patron y nada la ha tocado desde entonces,
+     * sus bytes no cambian y no se marca: Pokemon Sol borra cada fotograma la
+     * memoria de unas texturas con el mismo valor, y revisarlas (512 KB de
+     * hash por fotograma, "revisadas iguales") costaba 2,5-2,8 ms en el hilo
+     * de la GPU para dar siempre lo mismo.
+     */
+    u32 InvalidateFill(PAddr addr, u32 size, u32 texel, u32 bpp);
 
     /// El filtro y el repetido de la unidad en una textura que no es de la
     /// cache (0.2.2.4, ver RasterizerGXM::TextureFromCopy). false si GXM no
@@ -195,6 +208,10 @@ private:
         u32 dirty_end = 0;
         u32 stride = 0;
         std::vector<u64> band_hashes;
+        /// El patron de relleno que tienen sus bytes, si se sabe (0 si no), y
+        /// el del relleno que la marco, hasta revalidarla (ver InvalidateFill).
+        u64 fill_tag = 0;
+        u64 pending_fill_tag = 0;
         /// La imagen ya decodificada y volteada, en RAM, de las que han
         /// cambiado alguna vez: la CPU no puede releer la CDRAM a buen ritmo, y
         /// sin esto una fila nueva obligaba a decodificar las demas.
@@ -213,6 +230,9 @@ private:
 
     /// Manda la memoria de la entrada a la lista de espera y la deja libre.
     void Retire(Entry& entry);
+
+    /// La marca como sospechosa en [addr, end); true si no lo estaba ya.
+    static bool MarkStale(Entry& entry, PAddr addr, PAddr end);
 
     /// Hueco donde meter una entrada nueva de 'needed' bytes, expulsando por
     /// LRU lo que haga falta. Nunca devuelve nullptr (siempre hay algo que

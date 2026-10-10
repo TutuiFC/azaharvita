@@ -309,6 +309,7 @@ void DecodeTileRow(const u8* row_source, const Pica::Texture::TextureInfo& info,
 
 std::array<std::atomic<u32>, TextureCache::kRejectCount> TextureCache::rejects{};
 std::atomic<u32> TextureCache::partial_decodes{0};
+std::atomic<u32> TextureCache::fill_skips{0};
 
 TextureCache::TextureCache() = default;
 TextureCache::~TextureCache() = default;
@@ -326,6 +327,8 @@ void TextureCache::Retire(Entry& entry) {
     entry.stale = false;
     entry.dirty_begin = 0;
     entry.dirty_end = 0;
+    entry.fill_tag = 0;
+    entry.pending_fill_tag = 0;
     entry.band_hashes.clear();
     shadow_bytes -= static_cast<u32>(entry.shadow.size() * sizeof(u32));
     std::vector<u32>().swap(entry.shadow);
@@ -425,20 +428,50 @@ u32 TextureCache::InvalidateRange(PAddr addr, u32 size) {
      */
     for (auto& entry : entries) {
         if (entry.valid && entry.address < end && addr < entry.address + entry.span) {
-            const u32 lo = addr > entry.address ? addr - entry.address : 0;
-            const u32 hi = std::min<u32>(end - entry.address, entry.span);
-            if (entry.stale) {
-                entry.dirty_begin = std::min(entry.dirty_begin, lo);
-                entry.dirty_end = std::max(entry.dirty_end, hi);
-            } else {
-                entry.dirty_begin = lo;
-                entry.dirty_end = hi;
-            }
-            marked += entry.stale ? 0u : 1u;
-            entry.stale = true;
+            marked += MarkStale(entry, addr, end) ? 1u : 0u;
+            entry.fill_tag = 0;
+            entry.pending_fill_tag = 0;
         }
     }
     return marked;
+}
+
+u32 TextureCache::InvalidateFill(PAddr addr, u32 size, u32 texel, u32 bpp) {
+    const PAddr end = addr + size;
+    const u32 mask = bpp >= 4 ? 0xFFFFFFFFu : (1u << (bpp * 8u)) - 1u;
+    u32 marked = 0;
+    for (auto& entry : entries) {
+        if (!entry.valid || entry.address >= end || addr >= entry.address + entry.span) {
+            continue;
+        }
+        const bool covered = entry.address >= addr && entry.address + entry.span <= end;
+        // Los bytes del patron y su fase al principio de la entrada.
+        const u64 tag = covered ? (1ull << 63) | (static_cast<u64>(texel & mask) << 8) |
+                                      (static_cast<u64>(bpp) << 4) | ((entry.address - addr) % bpp)
+                                : 0;
+        if (covered && !entry.stale && entry.fill_tag == tag) {
+            fill_skips.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        marked += MarkStale(entry, addr, end) ? 1u : 0u;
+        entry.fill_tag = 0;
+        entry.pending_fill_tag = tag;
+    }
+    return marked;
+}
+
+bool TextureCache::MarkStale(Entry& entry, PAddr addr, PAddr end) {
+    const u32 lo = addr > entry.address ? addr - entry.address : 0;
+    const u32 hi = std::min<u32>(end - entry.address, entry.span);
+    if (entry.stale) {
+        entry.dirty_begin = std::min(entry.dirty_begin, lo);
+        entry.dirty_end = std::max(entry.dirty_end, hi);
+        return false;
+    }
+    entry.dirty_begin = lo;
+    entry.dirty_end = hi;
+    entry.stale = true;
+    return true;
 }
 
 TextureCache::Entry& TextureCache::MakeRoom(u32 needed) {
@@ -690,6 +723,12 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
                     Retire(entry);
                 }
             }
+            // Revalidada: si la marco un relleno que la cubria entera, sus
+            // bytes son ahora ese patron.
+            if (entry.valid && !entry.stale) {
+                entry.fill_tag = entry.pending_fill_tag;
+            }
+            entry.pending_fill_tag = 0;
         }
         if (entry.valid) {
             entry.last_use = clock;

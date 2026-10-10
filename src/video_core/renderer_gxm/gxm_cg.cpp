@@ -5,6 +5,7 @@
 #include "video_core/renderer_gxm/gxm_cg.h"
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -144,6 +145,52 @@ constexpr std::size_t kQuarantineBytes = 2u * 1024u * 1024u;
 /// Reservas de la compilacion en curso: cuantas y cuanto (ver CompileCg).
 u32 g_alloc_calls = 0;
 u64 g_alloc_total = 0;
+/// Las que salieron de g_small_free, sin pasar por newlib.
+u32 g_alloc_reused = 0;
+
+/**
+ * BLOQUES PEQUENOS SIN PASAR POR NEWLIB (0.3.2.6). Un shader de vertices de
+ * Pokemon Sol son ~700.000 reservas y otras tantas liberaciones (memalign, que
+ * por dentro es un malloc y hasta dos free), y el malloc de newlib tiene UN
+ * cerrojo para todo el proceso, sin herencia de prioridad: el compilador es el
+ * hilo de menos prioridad del nucleo 2, y si le quitan la CPU con el cerrojo
+ * cogido, el hilo de emulacion y el de la GPU esperan a que vuelva. Durante
+ * una compilacion, lo que sale de la cuarentena va a una lista por tamano (de
+ * 16 en 16 bytes, hasta kSmallBytes, como mucho kSmallFreeBytes en total) y
+ * las reservas de ese tamano salen de ahi. Al acabar la compilacion se
+ * devuelve todo a newlib. Todo esto, como el resto, con g_cg_mutex cogido.
+ */
+constexpr std::size_t kSmallBytes = 512;
+constexpr std::size_t kSmallFreeBytes = 1024u * 1024u;
+std::array<void*, kSmallBytes / 16> g_small_free{};
+std::size_t g_small_free_bytes = 0;
+
+/// Un bloque que ya no usa nadie: a su lista si cabe, si no a newlib.
+void ReleaseBlock(void* pointer, std::size_t usable) {
+    const std::size_t slot = usable / 16;
+    if (g_tracking && slot >= 1 && slot <= g_small_free.size() &&
+        g_small_free_bytes + usable <= kSmallFreeBytes) {
+        // La lista va dentro de los propios bloques (al menos 16 bytes).
+        *static_cast<void**>(pointer) = g_small_free[slot - 1];
+        g_small_free[slot - 1] = pointer;
+        g_small_free_bytes += usable;
+        return;
+    }
+    std::free(pointer);
+}
+
+/// Devuelve a newlib todo lo de g_small_free.
+void FlushSmallFree() {
+    for (void*& head : g_small_free) {
+        while (head != nullptr) {
+            void* const next = *static_cast<void**>(head);
+            std::free(head);
+            head = next;
+        }
+    }
+    g_small_free_bytes = 0;
+}
+
 /**
  * LA CUENTA SIN UN CONJUNTO DE PUNTEROS, Y LA COLA EN UN ANILLO (0.3.1.4). Cada
  * reserva del compilador entraba en un unordered_set (un malloc de nodo, y
@@ -180,9 +227,19 @@ void* CgAlloc(unsigned int size) {
      * lo que encaja con accesos NEON de 16 bytes que exigen esa alineacion.
      */
     const std::size_t rounded = (size + 15u) & ~15u;
-    void* pointer = memalign(16, rounded);
-    if (pointer == nullptr) {
-        return nullptr;
+    // Un bloque de la lista 'slot' tiene al menos slot * 16 bytes utiles.
+    const std::size_t slot = rounded / 16;
+    void* pointer = nullptr;
+    if (slot >= 1 && slot <= g_small_free.size() && g_small_free[slot - 1] != nullptr) {
+        pointer = g_small_free[slot - 1];
+        g_small_free[slot - 1] = *static_cast<void**>(pointer);
+        g_small_free_bytes -= malloc_usable_size(pointer);
+        g_alloc_reused++;
+    } else {
+        pointer = memalign(16, rounded);
+        if (pointer == nullptr) {
+            return nullptr;
+        }
     }
     std::memset(pointer, 0, rounded);
     if (g_tracking) {
@@ -219,7 +276,7 @@ void CgFree(void* pointer) {
     }
     const auto free_oldest = [] {
         auto& oldest = g_quarantine[g_quarantine_head];
-        std::free(oldest.first);
+        ReleaseBlock(oldest.first, oldest.second);
         g_quarantine_bytes -= oldest.second;
         oldest = {};
         g_quarantine_head = (g_quarantine_head + 1) % kQuarantineSlots;
@@ -1287,6 +1344,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     const bool have_info = sceKernelGetThreadInfo(sceKernelGetThreadId(), &info_before) >= 0;
     g_alloc_calls = 0;
     g_alloc_total = 0;
+    g_alloc_reused = 0;
     g_source.fileName = name;
     g_source.text = source;
     g_source.size = static_cast<SceUInt32>(std::strlen(source));
@@ -1361,6 +1419,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
     }
     g_tracking = false;
+    FlushSmallFree();
     g_compile_budget = static_cast<std::size_t>(-1);
     if (g_compile_over_budget) {
         static u32 budget_notes = 0;
@@ -1479,9 +1538,9 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
                                   info_after.threadPreemptCount - info_before.threadPreemptCount);
             }
             Common::VitaNote("gxm compila",
-                             fmt::format("{}: compilado en {} ms (CPU {}; {} reservas, {} MB "
-                                         "pedidos; tarjeta antes {} ms)",
-                                         name, compile_ms, cpu, g_alloc_calls,
+                             fmt::format("{}: compilado en {} ms (CPU {}; {} reservas, {} sin "
+                                         "newlib, {} MB pedidos; tarjeta antes {} ms)",
+                                         name, compile_ms, cpu, g_alloc_calls, g_alloc_reused,
                                          g_alloc_total >> 20, card_us / 1000)
                                  .c_str());
         }
