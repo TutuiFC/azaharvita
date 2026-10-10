@@ -161,8 +161,10 @@ u32 g_alloc_reused = 0;
  * las reservas de ese tamano salen de ahi. Al acabar la compilacion se
  * devuelve todo a newlib. Todo esto, como el resto, con g_cg_mutex cogido.
  */
-constexpr std::size_t kSmallBytes = 512;
-constexpr std::size_t kSmallFreeBytes = 1024u * 1024u;
+// 1 KB y 2 MB desde 0.3.2.9: con 512 bytes y 1 MB solo salian de la lista el
+// 33-40 % de las reservas ("sin newlib" en crash.txt de 0.3.2.6).
+constexpr std::size_t kSmallBytes = 1024;
+constexpr std::size_t kSmallFreeBytes = 2u * 1024u * 1024u;
 std::array<void*, kSmallBytes / 16> g_small_free{};
 std::size_t g_small_free_bytes = 0;
 

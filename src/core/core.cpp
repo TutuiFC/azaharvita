@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include <stdexcept>
 #include <utility>
 #include <boost/serialization/array.hpp>
@@ -133,6 +134,12 @@ std::string TakeLoopProfile() {
 
 /*static*/ System System::s_instance;
 
+namespace {
+/// Hay una senal pendiente (0.3.2.9): RunLoop cogia signal_mutex en cada vuelta
+/// (1.500-3.500 por segundo) para encontrarla casi siempre vacia.
+std::atomic<bool> g_signal_pending{false};
+} // Anonymous namespace
+
 template <>
 Core::System& Global() {
     return System::GetInstance();
@@ -173,8 +180,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
 
     Signal signal{Signal::None};
     u32 param{};
-    {
+    if (g_signal_pending.load(std::memory_order_acquire)) {
         std::scoped_lock lock{signal_mutex};
+        g_signal_pending.store(false, std::memory_order_relaxed);
         if (current_signal != Signal::None) {
             signal = current_signal;
             param = signal_param;
@@ -415,6 +423,7 @@ bool System::SendSignal(System::Signal signal, u32 param) {
     }
     current_signal = signal;
     signal_param = param;
+    g_signal_pending.store(true, std::memory_order_release);
     return true;
 }
 

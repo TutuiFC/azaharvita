@@ -76,7 +76,10 @@ std::atomic<bool> g_log_dirs_ready{false};
  * como antes. Una caida pierde, como mucho, lo de ese ultimo intervalo.
  */
 constexpr std::size_t kRingBytes = 64 * 1024;
-constexpr unsigned int kNoteFlushUs = 50 * 1000;
+// 500 ms desde 0.3.2.9 (eran 50): "notas: 257 lineas en 48 escrituras, 3667 ms
+// de tarjeta". Cada escritura cuesta casi lo mismo sea del tamano que sea, y la
+// tarjeta es la misma de la que lee la RomFS.
+constexpr unsigned int kNoteFlushUs = 500 * 1000;
 char g_ring[kRingBytes];
 std::size_t g_ring_used = 0;
 std::atomic_flag g_ring_lock = ATOMIC_FLAG_INIT;

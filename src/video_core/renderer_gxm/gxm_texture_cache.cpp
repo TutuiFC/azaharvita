@@ -345,6 +345,8 @@ void TextureCache::ReleaseRetired() {
     // con su capacidad para no volver a pedir memoria en cada escena.
     retired.clear();
     sealed.clear();
+    spare.clear();
+    spare_bytes = 0;
 }
 
 void TextureCache::SealRetired(u32 fence) {
@@ -355,9 +357,50 @@ void TextureCache::SealRetired(u32 fence) {
 }
 
 void TextureCache::ReleaseUpTo(u32 completed_fence) {
-    std::erase_if(sealed, [completed_fence](const auto& item) {
-        return static_cast<s32>(completed_fence - item.first) >= 0;
+    std::erase_if(sealed, [this, completed_fence](auto& item) {
+        if (static_cast<s32>(completed_fence - item.first) < 0) {
+            return false;
+        }
+        KeepSpare(std::move(item.second));
+        return true;
     });
+}
+
+void TextureCache::KeepSpare(Allocation&& buffer) {
+    if (buffer.Size() < kSpareMinBytes || buffer.Size() > kMaxSpareBytes) {
+        return;
+    }
+    while (!spare.empty() &&
+           (spare.size() >= kMaxSpares || spare_bytes + buffer.Size() > kMaxSpareBytes)) {
+        spare_bytes -= spare.front().Size();
+        spare.erase(spare.begin());
+    }
+    spare_bytes += buffer.Size();
+    spare.push_back(std::move(buffer));
+}
+
+Allocation TextureCache::TakeBuffer(u32 needed) {
+    const Pool first = needed <= kSmallTexture ? Pool::Host : Pool::Cdram;
+    for (auto it = spare.begin(); it != spare.end(); ++it) {
+        // El mismo pool y sin desperdiciar mas de un grano de CDRAM.
+        if (it->Where() == first && it->Size() >= needed && it->Size() - needed < kSpareMinBytes) {
+            Allocation buffer = std::move(*it);
+            spare_bytes -= buffer.Size();
+            spare.erase(it);
+            return buffer;
+        }
+    }
+    Allocation buffer = Allocate(first, needed);
+    if (!buffer.Valid() && !spare.empty()) {
+        // Lo guardado puede ser justo lo que falta.
+        spare.clear();
+        spare_bytes = 0;
+        buffer = Allocate(first, needed);
+    }
+    if (!buffer.Valid()) {
+        buffer = Allocate(first == Pool::Host ? Pool::Cdram : Pool::Host, needed);
+    }
+    return buffer;
 }
 
 void TextureCache::Clear() {
@@ -772,11 +815,7 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     // CDRAM primero: la CPU la escribe una vez y la GPU la lee en cada
     // dibujado, que es justo el caso que pide memoria dedicada. Las pequenas,
     // a memoria normal (ver kSmallTexture).
-    const Pool first = needed <= kSmallTexture ? Pool::Host : Pool::Cdram;
-    Allocation buffer = Allocate(first, needed);
-    if (!buffer.Valid()) {
-        buffer = Allocate(first == Pool::Host ? Pool::Cdram : Pool::Host, needed);
-    }
+    Allocation buffer = TakeBuffer(needed);
     if (!buffer.Valid()) {
         LOG_ERROR(Render, "GXM: sin memoria para decodificar una textura de {}x{}", width, height);
         rejects[kRejectGpuMemory].fetch_add(1, std::memory_order_relaxed);
@@ -950,11 +989,7 @@ bool TextureCache::RedecodeBands(Entry& entry, const u8* source,
     if (entry.shadow.size() * sizeof(u32) != needed || entry.buffer.Size() < needed) {
         return false;
     }
-    const Pool first = needed <= kSmallTexture ? Pool::Host : Pool::Cdram;
-    Allocation buffer = Allocate(first, needed);
-    if (!buffer.Valid()) {
-        buffer = Allocate(first == Pool::Host ? Pool::Cdram : Pool::Host, needed);
-    }
+    Allocation buffer = TakeBuffer(needed);
     if (!buffer.Valid()) {
         return false;
     }

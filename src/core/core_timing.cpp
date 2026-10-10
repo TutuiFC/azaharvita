@@ -183,7 +183,7 @@ void Timing::UnscheduleEvent(const TimingEventType* event_type, std::uintptr_t u
     if (event_queue_locked) {
         return;
     }
-    for (auto timer : timers) {
+    for (const auto& timer : timers) {
         auto itr = std::remove_if(
             timer->event_queue.begin(), timer->event_queue.end(),
             [&](const Event& e) { return e.type == event_type && e.user_data == user_data; });
@@ -201,7 +201,7 @@ void Timing::RemoveEvent(const TimingEventType* event_type) {
     if (event_queue_locked) {
         return;
     }
-    for (auto timer : timers) {
+    for (const auto& timer : timers) {
         auto itr = std::remove_if(timer->event_queue.begin(), timer->event_queue.end(),
                                   [&](const Event& e) { return e.type == event_type; });
 

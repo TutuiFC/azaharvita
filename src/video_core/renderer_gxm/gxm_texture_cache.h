@@ -264,10 +264,31 @@ private:
     std::vector<u32> band;
     /// Filas cambiadas en la revalidacion en curso (ver Get).
     std::vector<u32> changed_bands;
-    /// Lo que suman las copias en RAM (Entry::shadow), con tope.
+    /**
+     * Lo que suman las copias en RAM (Entry::shadow), con tope. 4 MB por
+     * textura desde 0.3.2.9 (era 1 MB): la que cambia en New Super Mario Bros.
+     * 2 es de 1024x1024, 4 MB decodificada, y con el tope de 1 MB no tenia
+     * copia y cada cambio de unos cientos de bytes la decodificaba entera
+     * (~110-145 ms; "tx" 70-120 ms por fotograma y "por filas 0").
+     */
     u32 shadow_bytes = 0;
-    static constexpr u32 kMaxShadowBytes = 8 * 1024 * 1024;
-    static constexpr u32 kMaxShadowTexture = 1024 * 1024;
+    static constexpr u32 kMaxShadowBytes = 16 * 1024 * 1024;
+    static constexpr u32 kMaxShadowTexture = 4 * 1024 * 1024;
+    /**
+     * BLOQUES GRANDES PARA REUTILIZAR (0.3.2.9). Un bloque retirado de al menos
+     * kSpareMinBytes cuya valla ya ha pasado se guarda aqui en vez de soltarse:
+     * una textura que cambia a menudo pedia y mapeaba para la GPU uno nuevo en
+     * cada cambio y desmapeaba el viejo. Como mucho kMaxSpares y kMaxSpareBytes;
+     * al llenarse sale el mas antiguo.
+     */
+    std::vector<Allocation> spare;
+    u32 spare_bytes = 0;
+    static constexpr u32 kSpareMinBytes = 256 * 1024;
+    static constexpr u32 kMaxSpareBytes = 12 * 1024 * 1024;
+    static constexpr std::size_t kMaxSpares = 4;
+    void KeepSpare(Allocation&& buffer);
+    /// Un bloque para 'needed' bytes: uno de 'spare' de ese tamano o uno nuevo.
+    Allocation TakeBuffer(u32 needed);
     /// Texturas de un solo color: (0,0,0,0) y (0,0,0,255). Ver Get.
     const SceGxmTexture* ConstantTexture(bool opaque);
     std::array<SceGxmTexture, 2> constant_textures{};

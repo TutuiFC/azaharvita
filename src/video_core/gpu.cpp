@@ -137,6 +137,8 @@ struct GPU::AsyncWorker {
     std::atomic<u32> command_work{0};
     u32 presents = 0;
     bool executing = false;
+    /// Esperando en work_ready (0.3.2.9): solo entonces hace falta avisarle.
+    bool sleeping = false;
     bool stop = false;
     bool failed = false;
     std::string error;
@@ -872,8 +874,10 @@ void GPU::AsyncLoop() {
 #ifdef __PSVITA__
             Common::vita_gpu_stage.store("gpu: sin trabajo", std::memory_order_relaxed);
 #endif
+            worker.sleeping = true;
             worker.work_ready.wait(lock,
                                    [&worker] { return worker.stop || !worker.queue.empty(); });
+            worker.sleeping = false;
             if (worker.stop) {
                 break;
             }
@@ -1013,13 +1017,17 @@ void GPU::QueueCommand(const Service::GSP::Command& command) {
         item.process = impl->system.Kernel().GetCurrentProcess();
     }
     u32 depth = 0;
+    bool wake = false;
     {
         std::lock_guard lock{async->mutex};
         async->queue.push_back(std::move(item));
         async->command_work.fetch_add(1, std::memory_order_relaxed);
         depth = static_cast<u32>(async->queue.size());
+        wake = async->sleeping;
     }
-    async->work_ready.notify_one();
+    if (wake) {
+        async->work_ready.notify_one();
+    }
     u32 seen = GxStats::queue_max.load(std::memory_order_relaxed);
     while (depth > seen &&
            !GxStats::queue_max.compare_exchange_weak(seen, depth, std::memory_order_relaxed)) {
@@ -1031,17 +1039,22 @@ void GPU::QueueBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& in
     item.type = AsyncWorker::Type::BufferSwap;
     item.screen_id = screen_id;
     item.info = info;
+    bool wake = false;
     {
         std::lock_guard lock{async->mutex};
         async->queue.push_back(std::move(item));
+        wake = async->sleeping;
     }
-    async->work_ready.notify_one();
+    if (wake) {
+        async->work_ready.notify_one();
+    }
 }
 
 void GPU::QueuePresent() {
     AsyncWorker::Item item;
     item.type = AsyncWorker::Type::Present;
     item.time_us = impl->timing.GetGlobalTimeUs();
+    bool wake = false;
     {
         std::unique_lock lock{async->mutex};
         if (async->presents >= AsyncWorker::kMaxPresents) {
@@ -1058,8 +1071,11 @@ void GPU::QueuePresent() {
         }
         async->presents++;
         async->queue.push_back(std::move(item));
+        wake = async->sleeping;
     }
-    async->work_ready.notify_one();
+    if (wake) {
+        async->work_ready.notify_one();
+    }
 }
 
 template <class Archive>
