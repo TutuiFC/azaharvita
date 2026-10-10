@@ -83,6 +83,8 @@ unsigned long long g_state_copy_us = 0;
  * y no habia forma de saber en que.
  */
 std::atomic<u32> g_vs_builds{0};
+/// Programas de vertices leidos de la cache por el indice, sin traducir (0.3.2.8).
+std::atomic<u32> g_vs_index_hits{0};
 std::atomic<unsigned long long> g_vs_build_us{0};
 std::atomic<unsigned long long> g_vs_generate_us{0};
 std::atomic<unsigned long long> g_vs_build_max_us{0};
@@ -1994,8 +1996,18 @@ struct RasterizerGXM::HwShaderCache {
                 }
                 const SceShaccCgCompileOutput* output = found.job->output;
                 const u32 variant = found.job->used_variant;
+                std::string used_source;
+                for (std::size_t i = 0; output != nullptr && i < found.job->variants.size(); i++) {
+                    if (found.job->variants[i] == variant) {
+                        used_source = std::move(found.job->sources[i]);
+                        break;
+                    }
+                }
                 found.job.reset();
                 Finish(found, output, variant);
+                if (found.usable && !used_source.empty()) {
+                    AddVsIndex(IndexKey(key), used_source, variant);
+                }
             }
             if (!found.usable) {
                 *out_reason = found.reason;
@@ -2008,7 +2020,7 @@ struct RasterizerGXM::HwShaderCache {
             return nullptr;
         }
         auto program = std::make_unique<Program>();
-        Build(*program, setup, config, inputs, write_lighting, write_w);
+        Build(*program, key, setup, config, inputs, write_lighting, write_w);
         const Program* result = program->usable ? program.get() : nullptr;
         if (program->job != nullptr) {
             program->reason = "vs compilando";
@@ -2082,7 +2094,16 @@ struct RasterizerGXM::HwShaderCache {
     }
 
 private:
-    void Build(Program& program, const Pica::ShaderSetup& setup,
+    /// La clave del indice de la cache (AddVsIndex): la traduccion depende
+    /// tambien de los saltos de escape, que son un ajuste.
+    static u64 IndexKey(u64 key) {
+        return Common::HashCombine(
+            key, Pica::Shader::Generator::GXM::g_allow_vs_escapes.load(std::memory_order_relaxed)
+                     ? 0xE5C0E5C1ull
+                     : 0xE5C0E5C0ull);
+    }
+
+    void Build(Program& program, u64 key, const Pica::ShaderSetup& setup,
                const Pica::Shader::Generator::PicaVSConfig& config,
                const Pica::Shader::Generator::GXM::VSInputs& inputs, bool write_lighting,
                bool write_w) {
@@ -2150,6 +2171,14 @@ private:
          */
         static constexpr const char* kName = "azahar_gxm_vs.cg";
         static constexpr const char* kSharedName = "azahar_gxm_vsc.cg";
+        {
+            u32 variant = 0;
+            if (const SceShaccCgCompileOutput* cached = LoadCgCacheIndexed(IndexKey(key), &variant)) {
+                g_vs_index_hits.fetch_add(1, std::memory_order_relaxed);
+                Finish(program, cached, variant);
+                return;
+            }
+        }
         std::optional<std::string> first = generate(kCgFloatAddress);
         if (!first.has_value()) {
             // Sin subrutinas en linea el analisis es el mismo en todas las
@@ -2161,6 +2190,9 @@ private:
             if (const SceShaccCgCompileOutput* cached =
                     LoadCgCache(SCE_SHACCCG_PROFILE_VP, kName, first->c_str(), from_card)) {
                 Finish(program, cached, kCgFloatAddress);
+                if (program.usable) {
+                    AddVsIndex(IndexKey(key), *first, kCgFloatAddress);
+                }
                 return;
             }
         }
@@ -2213,6 +2245,9 @@ private:
                 if (const SceShaccCgCompileOutput* cached = LoadCgCache(
                         SCE_SHACCCG_PROFILE_VP, kSharedName, shared->c_str(), from_card)) {
                     Finish(program, cached, kCgFloatAddress | kCgRelCache);
+                    if (program.usable) {
+                        AddVsIndex(IndexKey(key), *shared, kCgFloatAddress | kCgRelCache);
+                    }
                     return;
                 }
             }
@@ -7176,7 +7211,7 @@ std::string RasterizerGXM::TakeBatchProfile() {
         "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
         "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
         "muestras) | texturas a revisar por: vaciado {} invalidar {} ambos {} relleno {} "
-        "copia {} | vs nuevos {} ({} ms, traducir {} ms, el peor {} ms)",
+        "copia {} | vs nuevos {} (del indice {}, {} ms, traducir {} ms, el peor {} ms)",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
         avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples,
@@ -7186,6 +7221,7 @@ std::string RasterizerGXM::TakeBatchProfile() {
         texture_marks[3].exchange(0, std::memory_order_relaxed),
         texture_marks[4].exchange(0, std::memory_order_relaxed),
         g_vs_builds.exchange(0, std::memory_order_relaxed),
+        g_vs_index_hits.exchange(0, std::memory_order_relaxed),
         g_vs_build_us.exchange(0, std::memory_order_relaxed) / 1000,
         g_vs_generate_us.exchange(0, std::memory_order_relaxed) / 1000,
         g_vs_build_max_us.exchange(0, std::memory_order_relaxed) / 1000);

@@ -44,6 +44,10 @@ constexpr u32 kCgFlat = 2;
 constexpr u32 kCgRelCache = 4;
 extern std::atomic<u32> g_cg_variant;
 
+/// La compilacion de este traductor (fecha y hora de su .cpp): el indice de
+/// programas de vertices de la cache (Gxm::AddVsIndex) solo vale con la misma.
+[[nodiscard]] const char* VsGeneratorTag();
+
 /**
  * Uniforms booleanos como CONSTANTES (0.1.7.4). Con kCgBoolsKnown puesto, los
  * bits 0-15 son los valores de vs_b en el lote que se va a dibujar: JMPU, IFU

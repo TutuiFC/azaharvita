@@ -29,6 +29,7 @@
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/vita_diag.h"
+#include "video_core/shader/generator/cg_vs_shader_gen.h"
 
 /// Tamano del heap de libc, definido en citra_vita/main.cpp (AZAHAR_HEAP_MB).
 extern unsigned int _newlib_heap_size_user;
@@ -382,6 +383,74 @@ std::string g_game_list_path;
  */
 std::unordered_set<std::string> g_card_files;
 bool g_card_index_ready = false;
+
+/// Ver AddVsIndex. Tambien con g_preload_mutex.
+constexpr u32 kVsIndexMagic = 0x49565A41u; // "AZVI"
+struct VsIndexHeader {
+    u32 magic;
+    u32 version;
+    char tag[40];
+};
+struct VsIndexRecord {
+    u64 key;
+    u64 hash_city;
+    u64 hash_fnv;
+    u32 source_size;
+    u32 variant;
+};
+static_assert(sizeof(VsIndexRecord) == 32, "registro del indice de vertices");
+std::unordered_map<u64, VsIndexRecord> g_vs_index;
+std::string g_vs_index_path;
+/// El fichero ya tiene la cabecera de esta compilacion del traductor.
+bool g_vs_index_valid = false;
+/// Abierto para anadir al final desde el primer registro de la partida.
+SceUID g_vs_index_fd = -1;
+
+VsIndexHeader CurrentVsIndexHeader() {
+    VsIndexHeader header{};
+    header.magic = kVsIndexMagic;
+    header.version = 1;
+    std::strncpy(header.tag, Pica::Shader::Generator::GXM::VsGeneratorTag(),
+                 sizeof(header.tag) - 1);
+    return header;
+}
+
+/// El indice del juego que arranca (desde PreloadCgCache).
+void LoadVsIndex(u64 program_id) {
+    const std::string path = fmt::format("{}/vs_{:016x}.idx", kCacheDir, program_id);
+    std::unordered_map<u64, VsIndexRecord> records;
+    bool valid = false;
+    const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+    if (fd >= 0) {
+        const VsIndexHeader want = CurrentVsIndexHeader();
+        VsIndexHeader have{};
+        if (sceIoRead(fd, &have, sizeof(have)) == static_cast<int>(sizeof(have)) &&
+            std::memcmp(&have, &want, sizeof(have)) == 0) {
+            valid = true;
+            VsIndexRecord record{};
+            // Uno posterior con la misma clave sustituye al anterior.
+            while (sceIoRead(fd, &record, sizeof(record)) == static_cast<int>(sizeof(record))) {
+                records[record.key] = record;
+            }
+        }
+        sceIoClose(fd);
+    }
+    const std::size_t count = records.size();
+    {
+        const std::lock_guard lock{g_preload_mutex};
+        if (g_vs_index_fd >= 0) {
+            sceIoClose(g_vs_index_fd);
+            g_vs_index_fd = -1;
+        }
+        g_vs_index = std::move(records);
+        g_vs_index_path = path;
+        g_vs_index_valid = valid;
+    }
+    Common::VitaNote("gxm cache",
+                     fmt::format("indice de vertices: {} programas{}", count,
+                                 valid ? "" : " (de otra compilacion del traductor: de cero)")
+                         .c_str());
+}
 
 /// Apunta el fichero en la lista del juego, una vez.
 void RememberForGame(const std::string& path) {
@@ -1204,6 +1273,7 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
     Common::VitaNote("gxm cache", fmt::format("precarga: {} de {} shaders, {} KB", loaded, total,
                                               total_bytes / 1024)
                                       .c_str());
+    LoadVsIndex(program_id);
     {
         const unsigned long long list_begin = Common::VitaMicros();
         std::unordered_set<std::string> files;
@@ -1255,6 +1325,70 @@ const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, cons
                               Common::VitaMicros() - begin_us));
     }
     return cached;
+}
+
+const SceShaccCgCompileOutput* LoadCgCacheIndexed(u64 key, u32* variant) {
+    VsIndexRecord record{};
+    {
+        const std::lock_guard lock{g_preload_mutex};
+        const auto it = g_vs_index.find(key);
+        if (it == g_vs_index.end()) {
+            return nullptr;
+        }
+        record = it->second;
+    }
+    CacheHeader want{};
+    want.magic = kCacheMagic;
+    want.version = kCacheVersion;
+    want.profile = static_cast<u32>(SCE_SHACCCG_PROFILE_VP);
+    want.source_size = record.source_size;
+    want.hash_city = record.hash_city;
+    want.hash_fnv = record.hash_fnv;
+    const SceShaccCgCompileOutput* output =
+        LoadCached(want, CachePath(record.hash_city, SCE_SHACCCG_PROFILE_VP));
+    if (output != nullptr) {
+        *variant = record.variant;
+    }
+    return output;
+}
+
+void AddVsIndex(u64 key, const std::string& source, u32 variant) {
+    VsIndexRecord record{};
+    record.key = key;
+    record.hash_city = Common::ComputeHash64(source.data(), source.size());
+    record.hash_fnv = Fnv1a64(source.data(), source.size());
+    record.source_size = static_cast<u32>(source.size());
+    record.variant = variant;
+    const std::lock_guard lock{g_preload_mutex};
+    if (g_vs_index_path.empty()) {
+        return;
+    }
+    const auto it = g_vs_index.find(key);
+    if (it != g_vs_index.end() && std::memcmp(&it->second, &record, sizeof(record)) == 0) {
+        return;
+    }
+    g_vs_index[key] = record;
+    if (g_vs_index_fd < 0) {
+        // Con otra cabecera (u otra compilacion del traductor) se empieza de cero.
+        g_vs_index_fd = sceIoOpen(g_vs_index_path.c_str(),
+                                  SCE_O_WRONLY | SCE_O_CREAT |
+                                      (g_vs_index_valid ? SCE_O_APPEND : SCE_O_TRUNC),
+                                  0777);
+        if (g_vs_index_fd < 0) {
+            return;
+        }
+        if (!g_vs_index_valid) {
+            const VsIndexHeader header = CurrentVsIndexHeader();
+            if (sceIoWrite(g_vs_index_fd, &header, sizeof(header)) !=
+                static_cast<int>(sizeof(header))) {
+                sceIoClose(g_vs_index_fd);
+                g_vs_index_fd = -1;
+                return;
+            }
+            g_vs_index_valid = true;
+        }
+    }
+    sceIoWrite(g_vs_index_fd, &record, sizeof(record));
 }
 
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,

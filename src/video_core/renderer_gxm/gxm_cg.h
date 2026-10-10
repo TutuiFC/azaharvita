@@ -67,6 +67,19 @@ u32 CgGeneration();
 const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, const char* name,
                                            const char* source, bool from_card = true);
 
+/**
+ * EL INDICE DE PROGRAMAS DE VERTICES (0.3.2.8). Por juego
+ * (shadercache/vs_<id>.idx), la clave de cada programa de vertices de
+ * HwShaderCache y la fuente de Cg con la que esta en la cache de la tarjeta.
+ * Con eso se lee de la cache sin traducirlo otra vez a Cg, que son 4-36 ms por
+ * programa en el hilo de la GPU ("traducir" en crash.txt: ~600 ms en cada
+ * cambio de zona de Pokemon Sol). Solo vale para la misma compilacion del
+ * traductor (VsGeneratorTag); con otra se empieza de cero. 'variant' dice que
+ * variante de traduccion era.
+ */
+const SceShaccCgCompileOutput* LoadCgCacheIndexed(u64 key, u32* variant);
+void AddVsIndex(u64 key, const std::string& source, u32 variant);
+
 /// Compila un shader. El resultado vive hasta ReleaseCgOutput.
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
                                          const char* source);

@@ -1593,6 +1593,10 @@ u32 UsedBoolUniforms(const Pica::ShaderSetup& setup) {
     return mask;
 }
 
+const char* VsGeneratorTag() {
+    return __DATE__ " " __TIME__;
+}
+
 std::optional<std::string> GenerateVertexShader(const Pica::ShaderSetup& setup,
                                                 const PicaVSConfig& config,
                                                 const ExtraVSConfig& extra,
