@@ -2467,6 +2467,15 @@ constexpr std::array<u64, 12> RegListMask(std::initializer_list<u16> regs) {
 /// (0.3.1.2; MemoMask no sirve, estan entre los ignorados).
 constexpr std::array<u64, 12> kVsBoolMask = RegListMask({0x2B0});
 
+/**
+ * Los de kFsMemoMask que lee PicaVSConfig (0.3.2.7): el numero y el mapa de
+ * las salidas del shader de vertices (vs_output_total y vs_output_attributes)
+ * y lighting.disable. Lo demas del rango de fragmentos no cambia el programa de
+ * vertices; de los fragmentos solo cuentan lit y proj (ver AccelerateDrawBatch).
+ */
+constexpr std::array<u64, 12> kVsFromFsMask =
+    RegListMask({0x04F, 0x050, 0x051, 0x052, 0x053, 0x054, 0x055, 0x056, 0x1C6});
+
 constexpr std::array<u64, 12> RegRangeMask(u32 first, u32 end) {
     std::array<u64, 12> mask{};
     for (u32 reg = first; reg < end; reg++) {
@@ -2540,6 +2549,10 @@ struct RasterizerGXM::BatchMemo {
         u32 converted_stride = 0;
         /// El programa es un especializado: su clave depende de los booleanos.
         bool specialized = false;
+        /// Las salidas (luz, proyeccion) del programa de fragmentos con el que
+        /// se hizo: el de vertices escribe las de esa variante.
+        bool lit = false;
+        bool proj = false;
     };
     const PipelineCache::Entry* pipeline = nullptr;
     /// Motivo del ultimo fallo de pipeline con estos registros, y en que
@@ -6444,7 +6457,17 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         if (memo.layout.specialized && AnyDirty(pica.dirty_regs, kVsBoolMask)) {
             vs_dirty = true;
         }
-        if (fs_dirty || vs_dirty) {
+        /**
+         * UN MATERIAL NUEVO YA NO REHACE EL PROGRAMA DE VERTICES (0.3.2.7). Antes
+         * cualquier registro de fragmentos lo tiraba, y en un juego 2D cada
+         * lote cambia de combinador ("vs" 10-45 us por lote en Kirby, ~270
+         * lotes por fotograma). Del rango de fragmentos solo cuentan los de
+         * kVsFromFsMask, y lit y proj del pipeline, que se miran al tenerlo.
+         */
+        if (AnyDirty(pica.dirty_regs, kVsFromFsMask)) {
+            vs_dirty = true;
+        }
+        if (vs_dirty) {
             memo.vs_valid = false;
         }
         memo.lights_dirty = memo.lights_dirty || AnyDirty(pica.dirty_regs, kLightsMask);
@@ -6459,7 +6482,6 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         return HwVsReject(memo.pipeline_fail);
     }
     if (pipeline == nullptr) {
-        memo.vs_valid = false;
         pipeline = pipelines->Get(regs, &fs_reason);
         // Su shader de fragmentos se esta compilando: el lote se salta (0.1.9.8).
         if (pipeline == nullptr && fs_reason != nullptr &&
@@ -6486,6 +6508,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         // El motivo real (0.3.1.8): antes solo "fragmentos", y en Pokemon X no
         // habia forma de saber por que no se aceleraba nada.
         return HwVsReject(FsRejectName(fs_reason != nullptr ? fs_reason : "pipeline nulo"));
+    }
+    if (memo.vs_valid && (memo.layout.lit != pipeline->lit || memo.layout.proj != pipeline->proj)) {
+        memo.vs_valid = false;
     }
     phase(0);
 
@@ -6840,6 +6865,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             NoteSkip(5, "vs enlazar atributos");
             return HwVsReject("vs enlazar atributos");
         }
+        layout.lit = pipeline->lit;
+        layout.proj = pipeline->proj;
         memo.vs_valid = true;
     } else {
         phase(1);
