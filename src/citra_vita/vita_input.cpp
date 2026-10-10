@@ -5,6 +5,7 @@
 #include <cmath>
 #include <memory>
 #include <psp2/ctrl.h>
+#include <psp2/kernel/processmgr.h>
 #include "citra_vita/vita_input.h"
 #include "common/param_package.h"
 #include "common/settings.h"
@@ -33,10 +34,25 @@ constexpr int kStickCenter = 128;
  */
 constexpr float kDeadzone = 0.15f;
 
+/**
+ * UNA LECTURA POR ACTUALIZACION (0.3.2.1). Cada boton y cada stick leia el
+ * mando por su cuenta: 13 sceCtrlPeekBufferPositive en cada actualizacion del
+ * HID del 3DS, que son 234 por segundo emulado. crash.txt de 0.3.2.0, Pokemon
+ * Sol: "HID::UpdatePadCallback" 14-47 ms por segundo en el hilo de emulacion
+ * (0,13-0,18 ms por llamada). Las 13 llegan seguidas, en microsegundos: con la
+ * lectura de hace menos de kPadFreshUs, el estado es el mismo. Solo las llama
+ * el hilo de emulacion.
+ */
 SceCtrlData ReadPad() {
-    SceCtrlData pad{};
-    sceCtrlPeekBufferPositive(0, &pad, 1);
-    return pad;
+    constexpr SceUInt64 kPadFreshUs = 2000;
+    static SceCtrlData cached{};
+    static SceUInt64 cached_at = 0;
+    const SceUInt64 now = sceKernelGetProcessTimeWide();
+    if (cached_at == 0 || now - cached_at >= kPadFreshUs) {
+        sceCtrlPeekBufferPositive(0, &cached, 1);
+        cached_at = now;
+    }
+    return cached;
 }
 
 class VitaButton final : public ::Input::ButtonDevice {

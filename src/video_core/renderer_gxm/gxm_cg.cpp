@@ -647,6 +647,23 @@ std::unordered_set<BadSource, BadSourceHash> g_bad_sources;
 std::unordered_set<BadSource, BadSourceHash> g_no_opt_sources;
 bool g_bad_loaded = false;
 /**
+ * UNA SEGUNDA OPORTUNIDAD A LOS DE FRAGMENTOS (0.3.2.1). crash.txt de 0.3.2.0,
+ * Pokemon X: "fs: compilar shader" en los 1000 rechazos de cada ventana y
+ * ningun "gxm compila" de fragmentos en toda la sesion: su shader estaba en la
+ * lista negra y CompileCg lo devolvia nulo sin decir nada. El 44 % de sus
+ * triangulos, por el rasterizador de software, y el juego a 4,5 fps esperando
+ * a la GPU el 85 % del tiempo. Un error interno con el compilador recien
+ * cargado (lo que llevaba ahi a los de fragmentos) se da en un nivel de
+ * optimizacion: sin optimizar suele compilar. Cada uno de fragmentos de la
+ * lista se reintenta UNA vez en O0, apuntado en kRetriedPath ANTES de compilar
+ * para que, si colgara el compilador, no se repita en otra sesion. No se
+ * reintenta el que consta que tumbo el proceso (kDiedPath, o su cg_murio_*.cg).
+ */
+constexpr char kRetriedPath[] = "ux0:/data/azahar/shadercache/cg_reintentado.bin";
+constexpr char kDiedPath[] = "ux0:/data/azahar/shadercache/cg_murio.bin";
+std::unordered_set<BadSource, BadSourceHash> g_retried_sources;
+std::unordered_set<BadSource, BadSourceHash> g_died_sources;
+/**
  * SOSPECHOSO (0.2.3.5). Sin volcado no se culpa al shader que se estaba
  * compilando (0.2.1.6), pero entonces uno que tumba el compilador sin dejar
  * volcado -- Pokemon Sol, al entrar en combate en 0.2.3.3: la sesion acaba
@@ -774,6 +791,8 @@ void LoadBadSources() {
     g_bad_loaded = true;
     ReadRecords(kBadListPath, g_bad_sources);
     ReadRecords(kNoOptListPath, g_no_opt_sources);
+    ReadRecords(kRetriedPath, g_retried_sources);
+    ReadRecords(kDiedPath, g_died_sources);
     SceIoStat marker_stat{};
     const bool marker_dated = sceIoGetstat(kCompilingPath, &marker_stat) >= 0;
     SceUID crashed_fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
@@ -804,6 +823,9 @@ void LoadBadSources() {
         sceIoRemove(kCompilingPath);
         if (g_has_suspect && g_suspect == interrupted.source) {
             StoreBadSource(interrupted.source);
+            if (g_died_sources.insert(interrupted.source).second) {
+                AppendRecord(kDiedPath, interrupted.source);
+            }
             sceIoRemove(kSuspectPath);
             g_has_suspect = false;
             sceIoRename(kCompilingSourcePath,
@@ -854,6 +876,9 @@ void LoadBadSources() {
             } else {
                 StoreBadSource(crashed.source);
             }
+            if (g_died_sources.insert(crashed.source).second) {
+                AppendRecord(kDiedPath, crashed.source);
+            }
             // El codigo, guardado con su hash para estudiarlo desde el PC.
             sceIoRename(kCompilingSourcePath,
                         fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir, crashed.source.hash_city)
@@ -891,6 +916,17 @@ void StoreBadSource(const BadSource& bad) {
     }
     sceIoWrite(fd, &bad, sizeof(bad));
     sceIoClose(fd);
+}
+
+/// Ver g_retried_sources. Con g_cg_mutex cogido.
+bool FragmentRetryAllowed(const BadSource& source) {
+    if (g_retried_sources.count(source) != 0 || g_died_sources.count(source) != 0) {
+        return false;
+    }
+    SceIoStat stat{};
+    const std::string died_source =
+        fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir, source.hash_city);
+    return sceIoGetstat(died_source.c_str(), &stat) < 0;
 }
 
 /// Ver g_tracking: descarga el compilador roto y devuelve lo que perdio.
@@ -1188,8 +1224,21 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     }
     const std::lock_guard lock{g_cg_mutex};
     LoadBadSources();
-    if (g_bad_sources.count(BadSource{key.hash_city, key.hash_fnv}) != 0) {
-        return nullptr; // ya rompio el compilador una vez: ni se intenta
+    const BadSource this_source{key.hash_city, key.hash_fnv};
+    bool blacklist_retry = false;
+    if (g_bad_sources.count(this_source) != 0) {
+        if (profile == SCE_SHACCCG_PROFILE_VP || !FragmentRetryAllowed(this_source)) {
+            static u32 blacklisted_notes = 0;
+            if (blacklisted_notes < 8) {
+                blacklisted_notes++;
+                Common::VitaNote("gxm shader",
+                                 fmt::format("{}: en la lista negra, no se compila ({} bytes)",
+                                             name, source_size)
+                                     .c_str());
+            }
+            return nullptr;
+        }
+        blacklist_retry = true;
     }
     /**
      * NO EMPEZAR SIN MEMORIA DE SOBRA (0.1.8.1). Una compilacion puede pedir
@@ -1213,6 +1262,17 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     }
     if (!EnsureCgReady()) {
         return nullptr;
+    }
+    if (blacklist_retry) {
+        // Apuntado justo antes de compilar: si no se llega a intentar (sin
+        // heap, sin compilador), la oportunidad sigue ahi.
+        g_retried_sources.insert(this_source);
+        AppendRecord(kRetriedPath, this_source);
+        Common::VitaNote("gxm shader",
+                         fmt::format("{}: en la lista negra; se reintenta una vez sin optimizar "
+                                     "({} bytes)",
+                                     name, source_size)
+                             .c_str());
     }
     const unsigned long long compile_begin_us = Common::VitaMicros();
     /**
@@ -1250,7 +1310,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     // Los de vertices nunca en O0 (0.2.1.6), aunque esten en la lista de antes:
     // uno de ellos colgo la GPU en 0.2.1.3.
     if (profile != SCE_SHACCCG_PROFILE_VP &&
-        g_no_opt_sources.count(BadSource{key.hash_city, key.hash_fnv}) != 0) {
+        (blacklist_retry || g_no_opt_sources.count(this_source) != 0)) {
         options.optimizationLevel = 0;
     }
 
@@ -1371,12 +1431,21 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         }
         ClearCompilingMarker();
         if (internal) {
-            // Ese codigo no se vuelve a mandar (ni en otra sesion) y el
-            // compilador se recarga limpio para el siguiente.
-            if (fresh_compiler) {
-                StoreBadSource(BadSource{key.hash_city, key.hash_fnv});
+            /**
+             * Ese codigo no se vuelve a mandar (ni en otra sesion) y el
+             * compilador se recarga limpio para el siguiente. Uno de fragmentos
+             * optimizado, en cambio, se reintenta sin optimizar (0.3.2.1): el
+             * error interno es del optimizador, y en la lista negra todos sus
+             * lotes iban por software para siempre.
+             */
+            if (profile != SCE_SHACCCG_PROFILE_VP && options.optimizationLevel != 0) {
+                if (g_no_opt_sources.insert(this_source).second && fresh_compiler) {
+                    AppendRecord(kNoOptListPath, this_source);
+                }
+            } else if (fresh_compiler) {
+                StoreBadSource(this_source);
             } else {
-                g_bad_sources.insert(BadSource{key.hash_city, key.hash_fnv});
+                g_bad_sources.insert(this_source);
             }
             RecoverFromInternalError();
         } else if (g_compile_over_budget) {

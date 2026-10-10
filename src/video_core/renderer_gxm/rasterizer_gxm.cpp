@@ -1185,6 +1185,9 @@ struct RasterizerGXM::PipelineCache {
      */
     static constexpr unsigned long long kAsyncFsStuckUs = 10000000;
     static constexpr unsigned long long kAsyncFsQueuedUs = 60000000;
+    /// Pasado esto desde que se pidio, "fs atascado": sus lotes ya no se
+    /// saltan, van todos por la CPU (ver LongCompileCpuAllowed).
+    static constexpr unsigned long long kAsyncFsSkipLimitUs = 30000000;
 
     struct Entry {
         /**
@@ -1472,7 +1475,9 @@ struct RasterizerGXM::PipelineCache {
                 if ((started != 0 && now - started > kAsyncFsStuckUs) ||
                     (started == 0 && now - pending.job->submitted_us > kAsyncFsQueuedUs)) {
                     CgMarkStarved();
-                    return fail("fs compilando largo");
+                    return fail(now - pending.job->submitted_us > kAsyncFsSkipLimitUs
+                                    ? "fs atascado"
+                                    : "fs compilando largo");
                 }
                 return fail("fs compilando");
             }
@@ -1886,6 +1891,8 @@ struct RasterizerGXM::HwShaderCache {
     };
 
     static constexpr unsigned long long kAsyncVsWindowUs = 1000000;
+    /// Como kAsyncFsSkipLimitUs, para los de vertices: "vs atascado".
+    static constexpr unsigned long long kAsyncVsSkipLimitUs = 20000000;
 
     /// Tope de programas traducidos. Un juego usa decenas; pasado esto se deja
     /// de traducir y los nuevos se quedan en la CPU, que es correcto.
@@ -1926,9 +1933,12 @@ struct RasterizerGXM::HwShaderCache {
                      * "saltados por compilar"). Pasado kAsyncVsWindowUs el
                      * lote se dibuja por la CPU: lento, pero se ve.
                      */
-                    const bool young = Common::VitaMicros() - found.job->submitted_us <
-                                       kAsyncVsWindowUs;
-                    *out_reason = young ? "vs compilando" : "vs compilando largo";
+                    const unsigned long long age =
+                        Common::VitaMicros() - found.job->submitted_us;
+                    const bool young = age < kAsyncVsWindowUs;
+                    *out_reason = young                          ? "vs compilando"
+                                  : age > kAsyncVsSkipLimitUs ? "vs atascado"
+                                                              : "vs compilando largo";
                     if (!young) {
                         CgMarkStarved();
                     }
@@ -6113,6 +6123,9 @@ void RasterizerGXM::ClearAll(bool flush) {
  * fps durante segundos (Pokemon X, Super Mario 3D Land, Smash) y la CPU que
  * ocupan es la que necesita el compilador. Ahora solo los primeros
  * kMaxCpuBatches de cada fotograma; el resto se salta, como en la ventana corta.
+ * Con limite (0.3.2.1): pasados kAsyncVsSkipLimitUs / kAsyncFsSkipLimitUs
+ * ("atascado") van todos por la CPU, o un compilador colgado dejaria esa
+ * geometria sin dibujar toda la partida.
  */
 static bool LongCompileCpuAllowed(u32 frame) {
     constexpr u32 kMaxCpuBatches = 6;
@@ -6128,9 +6141,10 @@ static bool LongCompileCpuAllowed(u32 frame) {
 /// "fs: <motivo>" como literal propio, para que reject_counts (que compara
 /// punteros) los cuente aparte de los rechazos de vertices.
 static const char* FsRejectName(const char* reason) {
-    static constexpr std::array<std::pair<const char*, const char*>, 10> kNames{{
+    static constexpr std::array<std::pair<const char*, const char*>, 11> kNames{{
         {"mezcla", "fs: mezcla"},
         {"fs compilando largo", "fs: compilando largo"},
+        {"fs atascado", "fs: atascado"},
         {"fs compilando", "fs: compilando"},
         {"compilar shader", "fs: compilar shader"},
         {"registrar shader", "fs: registrar shader"},
@@ -6400,7 +6414,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             return true;
         }
         if (pipeline == nullptr && fs_reason != nullptr &&
-            std::strcmp(fs_reason, "fs compilando largo") != 0) {
+            std::strcmp(fs_reason, "fs compilando largo") != 0 &&
+            std::strcmp(fs_reason, "fs atascado") != 0) {
             memo.pipeline_fail = FsRejectName(fs_reason);
             memo.pipeline_fail_frame = presents_seen;
         }
@@ -6554,6 +6569,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             std::strcmp(reason, "vs compilador roto") != 0 &&
             std::strcmp(reason, "vs compilando") != 0 &&
             std::strcmp(reason, "vs compilando largo") != 0 &&
+            std::strcmp(reason, "vs atascado") != 0 &&
             std::strcmp(reason, "vs con geometria") != 0) {
             using namespace Pica::Shader::Generator::GXM;
             auto used = hw_shaders->used_bools.find(program_key);

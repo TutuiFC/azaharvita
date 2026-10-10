@@ -50,28 +50,78 @@ PerfStats::~PerfStats() {
     file.WriteString(stream.str());
 }
 
+#ifdef __PSVITA__
+namespace {
+/**
+ * UNO DE CADA OCHO CON RELOJ (0.3.2.1). Cada SVC leia el reloj dos veces, y
+ * cada IPC dos mas, solo para el reparto del overlay: miles de llamadas al
+ * kernel por segundo en el hilo de emulacion. Se mide un SVC de cada
+ * kSvcSample, por kSvcSample, y lo de dentro (IPC, GPU) sigue la decision de
+ * su SVC para que las restas de GetAndResetStats cuadren. Solo el hilo de
+ * emulacion entra aqui.
+ */
+constexpr u32 kSvcSample = 8;
+u32 g_svc_tick = 0;
+bool g_svc_timed = true;
+} // Anonymous namespace
+#endif
+
 void PerfStats::BeginSVCProcessing() {
+#ifdef __PSVITA__
+    g_svc_timed = (++g_svc_tick % kSvcSample) == 0;
+    if (!g_svc_timed) {
+        return;
+    }
+#endif
     start_svc_time = Clock::now();
 }
 
 void PerfStats::EndSVCProcessing() {
+#ifdef __PSVITA__
+    if (g_svc_timed) {
+        accumulated_svc_time += (Clock::now() - start_svc_time) * kSvcSample;
+    }
+#else
     accumulated_svc_time += (Clock::now() - start_svc_time);
+#endif
 }
 
 void PerfStats::BeginIPCProcessing() {
+#ifdef __PSVITA__
+    if (!g_svc_timed) {
+        return;
+    }
+#endif
     start_ipc_time = Clock::now();
 }
 
 void PerfStats::EndIPCProcessing() {
+#ifdef __PSVITA__
+    if (g_svc_timed) {
+        accumulated_ipc_time += (Clock::now() - start_ipc_time) * kSvcSample;
+    }
+#else
     accumulated_ipc_time += (Clock::now() - start_ipc_time);
+#endif
 }
 
 void PerfStats::BeginGPUProcessing() {
+#ifdef __PSVITA__
+    if (!g_svc_timed) {
+        return;
+    }
+#endif
     start_gpu_time = Clock::now();
 }
 
 void PerfStats::EndGPUProcessing() {
+#ifdef __PSVITA__
+    if (g_svc_timed) {
+        accumulated_gpu_time += (Clock::now() - start_gpu_time) * kSvcSample;
+    }
+#else
     accumulated_gpu_time += (Clock::now() - start_gpu_time);
+#endif
 }
 
 void PerfStats::StartSwap() {

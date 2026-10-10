@@ -832,6 +832,9 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 stats_dsp_worker_ms = static_cast<double>(DspStats::worker_us.exchange(
                                           0, std::memory_order_relaxed)) /
                                       n / 1000.0;
+                stats_dsp_wait_ms = static_cast<double>(DspStats::wait_us.exchange(
+                                        0, std::memory_order_relaxed)) /
+                                    n / 1000.0;
                 const unsigned long long ticks = DspStats::ticks.exchange(0, std::memory_order_relaxed);
                 const unsigned long long active = DspStats::active.exchange(0, std::memory_order_relaxed);
                 stats_dsp_sources =
@@ -1380,12 +1383,13 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                     "fotograma",
                     fmt::format("fps {:.1f} vel {:.0f}% | ms {:.1f} cpu {:.1f} gx {:.1f} svc {:.1f} "
                                 "vtx {:.1f} lote {:.1f} dsp {:.1f} (aac {:.1f} decodificar {:.1f}, "
-                                "{:.1f} fuentes, otro nucleo {:.1f}) | conv {:.1f} sub {:.1f} "
+                                "{:.1f} fuentes, otro nucleo {:.1f}, esperandolo {:.1f}) | conv {:.1f} sub {:.1f} "
                                 "dib {:.1f} ovl {:.1f} esp {:.1f} | sh {:.1f} fin {:.1f} tx {:.1f}",
                                 stats_game_fps, stats_speed_percent, stats_frame_ms, stats_cpu_ms,
                                 stats_gx_ms, stats_svc_ms, stats_vertices_ms, stats_batch_ms,
                                 stats_dsp_ms, stats_aac_ms, stats_dsp_decode_ms, stats_dsp_sources,
-                                stats_dsp_worker_ms, stats_convert_ms, stats_upload_ms, stats_draw_ms,
+                                stats_dsp_worker_ms, stats_dsp_wait_ms, stats_convert_ms,
+                                stats_upload_ms, stats_draw_ms,
                                 stats_overlay_ms, stats_swapwait_ms, stats_shade_ms,
                                 stats_finish_ms, stats_texdecode_ms)
                         .c_str());

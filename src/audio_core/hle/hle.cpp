@@ -591,6 +591,13 @@ void DspHle::Impl::WaitMixer() {
     if (!mixer_busy) {
         return;
     }
+    struct WaitTimer {
+        unsigned long long begin = Common::VitaMicros();
+        ~WaitTimer() {
+            HLE::Stats::wait_us.fetch_add(Common::VitaMicros() - begin,
+                                          std::memory_order_relaxed);
+        }
+    } const wait_timer;
     /**
      * Una mezcla son 0,1-3 ms. Si el hilo no la ha COGIDO en kClaimUs, no ha
      * tocado nada todavia: la coge este (mixer_request bajo el cerrojo es la
