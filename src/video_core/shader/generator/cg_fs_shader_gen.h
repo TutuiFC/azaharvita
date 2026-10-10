@@ -78,8 +78,11 @@ namespace Pica::Shader::Generator::GXM {
 /// mezcla (uniform blend_const_alpha) y no el calculado. Lo pide el
 /// rasterizador cuando lleva en el alfa de la fuente un factor de mezcla
 /// constante, que GXM no tiene (ver BuildBlend en rasterizer_gxm.cpp).
+/// 'color_from_blend_const' (0.3.2.3): igual con el color, uniform
+/// blend_const_color; ver el portador de color en BuildBlend.
 std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
                                                   const char** out_reason = nullptr,
-                                                  bool alpha_from_blend_const = false);
+                                                  bool alpha_from_blend_const = false,
+                                                  bool color_from_blend_const = false);
 
 } // namespace Pica::Shader::Generator::GXM

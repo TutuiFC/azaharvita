@@ -1214,6 +1214,10 @@ struct RasterizerGXM::PipelineCache {
         const SceGxmProgramParameter* alphatest_ref = nullptr;
         /// La constante de mezcla en el alfa de salida (0.2.0.1, MapCarrierFactor).
         const SceGxmProgramParameter* blend_const_alpha = nullptr;
+        /// La constante (o uno menos ella) en el color de salida (0.3.2.3).
+        const SceGxmProgramParameter* blend_const_color = nullptr;
+        /// 0: sin portador de color; 1: la constante; 2: uno menos la constante.
+        u8 color_carrier = 0;
         const SceGxmProgramParameter* samplers[3] = {nullptr, nullptr, nullptr};
         u8 sampler_units[3] = {0, 0, 0};
         const SceGxmProgramParameter* fog_lut = nullptr;
@@ -1452,7 +1456,8 @@ struct RasterizerGXM::PipelineCache {
         SceGxmBlendInfo blend{};
         u32 blend_bits = 0;
         bool alpha_carrier = false;
-        if (!BuildBlend(regs, blend, blend_bits, alpha_carrier)) {
+        u8 color_carrier = 0;
+        if (!BuildBlend(regs, blend, blend_bits, alpha_carrier, color_carrier)) {
             return fail("mezcla");
         }
 
@@ -1513,6 +1518,7 @@ struct RasterizerGXM::PipelineCache {
         entry->cg_generation = CgGeneration();
         entry->retries = retries;
         const char* reason = nullptr;
+        entry->color_carrier = color_carrier;
         if (!Build(entry.get(), config, blend, alpha_carrier, &reason)) {
             entry->usable = false;
             entry->reason = reason != nullptr ? reason : "shader";
@@ -1546,7 +1552,7 @@ struct RasterizerGXM::PipelineCache {
 
         const char* generator_reason = nullptr;
         const auto source = Pica::Shader::Generator::GXM::GenerateFragmentShader(
-            config, &generator_reason, alpha_carrier);
+            config, &generator_reason, alpha_carrier, entry->color_carrier != 0);
         if (!source.has_value()) {
             return fail(generator_reason != nullptr ? generator_reason : "shader");
         }
@@ -1641,6 +1647,7 @@ struct RasterizerGXM::PipelineCache {
             sceGxmProgramFindParameterByName(gxp, "tev_combiner_buffer_color");
         entry->alphatest_ref = sceGxmProgramFindParameterByName(gxp, "alphatest_ref");
         entry->blend_const_alpha = sceGxmProgramFindParameterByName(gxp, "blend_const_alpha");
+        entry->blend_const_color = sceGxmProgramFindParameterByName(gxp, "blend_const_color");
         entry->samplers[0] = sceGxmProgramFindParameterByName(gxp, "tex0");
         entry->samplers[1] = sceGxmProgramFindParameterByName(gxp, "tex1");
         entry->samplers[2] = sceGxmProgramFindParameterByName(gxp, "tex2");
@@ -1673,8 +1680,9 @@ struct RasterizerGXM::PipelineCache {
     }
 
     bool BuildBlend(const Pica::RegsInternal& regs, SceGxmBlendInfo& blend, u32& bits,
-                    bool& alpha_carrier) {
+                    bool& alpha_carrier, u8& color_carrier) {
         alpha_carrier = false;
+        color_carrier = 0;
         const auto& merger = regs.framebuffer.output_merger;
         if (merger.fragment_operation_mode !=
             FramebufferRegs::FragmentOperationMode::Default) {
@@ -1712,8 +1720,26 @@ struct RasterizerGXM::PipelineCache {
          * como se hacia aqui, mandaba a software TODO lo que llevara mezcla.
          * GXM no tiene logic op, asi que cuando de verdad se usa, a software.
          */
+        /**
+         * NOOP Y CLEAR CON LA MEZCLA (0.3.2.3). Super Mario 3D Land dibuja con
+         * "logic op 6" (NoOp: el color se queda como estaba; la profundidad y
+         * la plantilla si se escriben) y esos lotes iban a software. NoOp es no
+         * escribir el color, y Clear es cero por los dos lados: exactos. Los
+         * demas necesitan el color de destino como bits y siguen en software.
+         */
         if (!merger.alphablend_enable &&
-            merger.logic_op.Value() != FramebufferRegs::LogicOp::Copy) {
+            merger.logic_op.Value() == FramebufferRegs::LogicOp::NoOp) {
+            blend.colorMask = SCE_GXM_COLOR_MASK_NONE;
+        } else if (!merger.alphablend_enable &&
+                   merger.logic_op.Value() == FramebufferRegs::LogicOp::Clear) {
+            blend.colorFunc = SCE_GXM_BLEND_FUNC_ADD;
+            blend.alphaFunc = SCE_GXM_BLEND_FUNC_ADD;
+            blend.colorSrc = SCE_GXM_BLEND_FACTOR_ZERO;
+            blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
+            blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ZERO;
+            blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+        } else if (!merger.alphablend_enable &&
+                   merger.logic_op.Value() != FramebufferRegs::LogicOp::Copy) {
             NoteOnce(noted[2], "gxm mezcla", "logic op {}",
                      static_cast<u32>(merger.logic_op.Value()));
             return false;
@@ -1773,8 +1799,29 @@ struct RasterizerGXM::PipelineCache {
             const auto src_a = exact(factors.factor_source_a.Value(), true);
             const auto dst_a = exact(factors.factor_dest_a.Value(), true);
             bool mapped = false;
-            if (!IsConstantFactor(src_rgb) && !IsConstantFactor(dst_rgb) &&
-                !IsConstantFactor(src_a) && !IsConstantFactor(dst_a)) {
+            using Factor = FramebufferRegs::BlendFactor;
+            /**
+             * EL PORTADOR DE COLOR (0.3.2.3). Super Mario 3D Land oscurece con
+             * "fac 0/11": nada de la fuente y el destino por uno menos un
+             * color constante con los canales distintos, que GXM no tiene.
+             * Con la fuente por cero, su color no se usa: el shader saca ahi
+             * la constante (o uno menos ella) y el destino se multiplica por
+             * SRC_COLOR. El alfa de salida sigue siendo el calculado, asi que
+             * el alfa se mezcla como siempre. Solo con la suma.
+             */
+            const bool rgb_constant =
+                dst_rgb == Factor::ConstantColor || dst_rgb == Factor::OneMinusConstantColor;
+            if (src_rgb == Factor::Zero && rgb_constant && !IsConstantFactor(src_a) &&
+                !IsConstantFactor(dst_a) &&
+                factors.blend_equation_rgb.Value() == FramebufferRegs::BlendEquation::Add) {
+                color_src = SCE_GXM_BLEND_FACTOR_ZERO;
+                color_dst = SCE_GXM_BLEND_FACTOR_SRC_COLOR;
+                mapped = MapBlendFactor(src_a, &alpha_src) && MapBlendFactor(dst_a, &alpha_dst);
+                if (mapped) {
+                    color_carrier = dst_rgb == Factor::ConstantColor ? 1 : 2;
+                }
+            } else if (!IsConstantFactor(src_rgb) && !IsConstantFactor(dst_rgb) &&
+                       !IsConstantFactor(src_a) && !IsConstantFactor(dst_a)) {
                 mapped = MapBlendFactor(src_rgb, &color_src) &&
                          MapBlendFactor(dst_rgb, &color_dst) &&
                          MapBlendFactor(src_a, &alpha_src) && MapBlendFactor(dst_a, &alpha_dst);
@@ -1822,6 +1869,7 @@ struct RasterizerGXM::PipelineCache {
         // El bit 4 esta libre (la mascara ocupa 0-3): el shader con la
         // constante en el alfa es otro, aunque la mezcla de GXM coincida.
         bits = static_cast<u32>(blend.colorMask) | (alpha_carrier ? 1u << 4 : 0u) |
+               (static_cast<u32>(color_carrier) << 5) |
                (static_cast<u32>(blend.colorFunc) << 8) |
                (static_cast<u32>(blend.alphaFunc) << 12) |
                (static_cast<u32>(blend.colorSrc) << 16) |
@@ -5813,6 +5861,15 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         if (pipeline->blend_const_alpha != nullptr) {
             const f32 constant = static_cast<f32>(merger.blend_const.a) / 255.0f;
             sceGxmSetUniformDataF(uniform_buffer, pipeline->blend_const_alpha, 0, 1, &constant);
+        }
+        if (pipeline->blend_const_color != nullptr) {
+            const auto& constant = merger.blend_const;
+            const bool inverted = pipeline->color_carrier == 2;
+            const auto channel = [inverted](u32 value) {
+                return static_cast<f32>(inverted ? 255u - value : value) / 255.0f;
+            };
+            const f32 color[3] = {channel(constant.r), channel(constant.g), channel(constant.b)};
+            sceGxmSetUniformDataF(uniform_buffer, pipeline->blend_const_color, 0, 3, color);
         }
         if (pipeline->fog_lut != nullptr) {
             // 128 entradas de dos floats: valor y pendiente (misma LUT que usa

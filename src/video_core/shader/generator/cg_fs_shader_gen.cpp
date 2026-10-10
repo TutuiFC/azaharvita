@@ -100,8 +100,9 @@ bool IsSupported(const FSConfig& config, const char** out_reason) {
 class FragmentWriter {
 public:
     explicit FragmentWriter(const FSConfig& config_, const char** reason_,
-                            bool alpha_from_blend_const_)
-        : config{config_}, reason{reason_}, alpha_from_blend_const{alpha_from_blend_const_} {}
+                            bool alpha_from_blend_const_, bool color_from_blend_const_)
+        : config{config_}, reason{reason_}, alpha_from_blend_const{alpha_from_blend_const_},
+          color_from_blend_const{color_from_blend_const_} {}
 
     std::optional<std::string> Generate() {
         if (!IsSupported(config, reason)) {
@@ -223,6 +224,9 @@ public:
         // Despues de la prueba de alfa, que sigue usando el alfa calculado.
         if (alpha_from_blend_const) {
             out += "    gl_FragColor.a = blend_const_alpha;\n";
+        }
+        if (color_from_blend_const) {
+            out += "    gl_FragColor.rgb = blend_const_color;\n";
         }
         out += "}\n";
         return out;
@@ -417,6 +421,9 @@ private:
         out += "uniform float4 tev_combiner_buffer_color;\n";
         if (alpha_from_blend_const) {
             out += "uniform float blend_const_alpha;\n";
+        }
+        if (color_from_blend_const) {
+            out += "uniform float3 blend_const_color;\n";
         }
         if (config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always) {
             out += "uniform float alphatest_ref;\n";
@@ -1108,6 +1115,7 @@ private:
     const FSConfig& config;
     const char** reason = nullptr;
     bool alpha_from_blend_const = false;
+    bool color_from_blend_const = false;
     std::string out;
     bool uses_tex0 = false;
     bool uses_tex1 = false;
@@ -1120,8 +1128,9 @@ private:
 
 std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
                                                   const char** out_reason,
-                                                  bool alpha_from_blend_const) {
-    FragmentWriter writer{config, out_reason, alpha_from_blend_const};
+                                                  bool alpha_from_blend_const,
+                                                  bool color_from_blend_const) {
+    FragmentWriter writer{config, out_reason, alpha_from_blend_const, color_from_blend_const};
     return writer.Generate();
 }
 
